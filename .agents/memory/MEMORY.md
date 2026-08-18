@@ -1,0 +1,1 @@
+- [Monopoly Arena architecture](monopoly-arena.md) — single-file SPA in artifacts/monopoly-arena/src/App.tsx, all state localStorage, no backend

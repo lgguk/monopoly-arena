@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Monopoly Arena"
+description = "Локальная социальная игровая платформа Monopoly Arena с hot-seat матчами, лобби, друзьями, магазином и защищённой админ-панелью. Данные хранятся в LocalStorage для автономной работы без бэкенда."
+version = "1.0.0"
+id = "artifacts/monopoly-arena"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 21558
+
+[services.development]
+run = "pnpm --filter @workspace/monopoly-arena run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/monopoly-arena", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/monopoly-arena/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "21558"
+BASE_PATH = "/"

@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -5,8 +6,14 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
+const { Pool } = require('pg');
 
 const BCRYPT_ROUNDS = 10;
+
+// Пул подключений к PostgreSQL. Держит несколько коннектов
+// и переиспользует их — стандарт для Node.js.
+const db = new Pool({ connectionString: process.env.DATABASE_URL });
+db.on('error', (err) => console.error('❌ PostgreSQL pool error:', err));
 
 // ---- ГЛОБАЛЬНОЕ ХРАНИЛИЩЕ НАСТРОЕК И ДИЗАЙНОВ ----
 let adminSettings = {
@@ -31,18 +38,68 @@ let adminSettings = {
 let cardDesigns = [];
 let marketItems = [];
 let adminCases = [];
-try { if (fs.existsSync('admin-cases.json')) adminCases = JSON.parse(fs.readFileSync('admin-cases.json')); } catch (e) {}
+// Загружаем admin_cases из БД. JSON — fallback.
+async function loadAdminCases() {
+  try {
+    const res = await db.query('SELECT id, data FROM admin_cases ORDER BY id');
+    if (res.rows.length > 0) {
+      adminCases = res.rows.map((r) => r.data);
+      console.log(`✅ Кейсы загружены из БД: ${adminCases.length}`);
+      return;
+    }
+  } catch (err) {
+    console.error('Ошибка загрузки кейсов из БД:', err.message);
+  }
+  try {
+    if (fs.existsSync('admin-cases.json')) {
+      adminCases = JSON.parse(fs.readFileSync('admin-cases.json'));
+      console.log(`✅ Кейсы загружены из JSON (fallback): ${adminCases.length}`);
+    }
+  } catch (e) {}
+}
+async function loadMarketItems() {
+  try {
+    const res = await db.query('SELECT id, data FROM market_items ORDER BY id');
+    if (res.rows.length > 0) {
+      marketItems = res.rows.map((r) => r.data);
+      console.log(`✅ Товары загружены из БД: ${marketItems.length}`);
+      return;
+    }
+  } catch (err) {
+    console.error('Ошибка загрузки товаров из БД:', err.message);
+  }
+  try {
+    if (fs.existsSync('market-items.json')) {
+      marketItems = JSON.parse(fs.readFileSync('market-items.json'));
+      console.log(`✅ Товары загружены из JSON (fallback): ${marketItems.length}`);
+    }
+  } catch (e) {}
+}
 let marketListings = [];
-try { if (fs.existsSync('market-listings.json')) marketListings = JSON.parse(fs.readFileSync('market-listings.json')); } catch (e) {}
-function saveMarketListings() {
-  try { fs.writeFileSync('market-listings.json', JSON.stringify(marketListings, null, 2)); } catch (err) { console.error('Ошибка сохранения объявлений:', err); }
+async function loadMarketListings() {
+  try {
+    const res = await db.query('SELECT id, seller_id, item_data, price, created_at FROM market_listings ORDER BY created_at');
+    if (res.rows.length > 0) {
+      marketListings = res.rows.map((r) => ({
+        id: r.id,
+        sellerId: r.seller_id,
+        item: r.item_data,
+        price: Number(r.price),
+        createdAt: Number(r.created_at),
+      }));
+      console.log(`✅ Объявления загружены из БД: ${marketListings.length}`);
+      return;
+    }
+  } catch (err) {
+    console.error('Ошибка загрузки объявлений из БД:', err.message);
+  }
+  try {
+    if (fs.existsSync('market-listings.json')) {
+      marketListings = JSON.parse(fs.readFileSync('market-listings.json'));
+      console.log(`✅ Объявления загружены из JSON (fallback): ${marketListings.length}`);
+    }
+  } catch (e) {}
 }
-function saveMarketItems() {
-  try { fs.writeFileSync('market-items.json', JSON.stringify(marketItems, null, 2)); } catch (err) { console.error('Ошибка сохранения товаров:', err); }
-}
-
-// Загрузка из файлов (добавь в try/catch в начале, как для cardDesigns)
-try { if (fs.existsSync('market-items.json')) marketItems = JSON.parse(fs.readFileSync('market-items.json')); } catch (e) {}
 
 const SETTINGS_FILE = path.join(__dirname, 'admin-settings.json');
 const DESIGNS_FILE = path.join(__dirname, 'card-designs.json');
@@ -89,40 +146,186 @@ try {
   console.error('Ошибка загрузки данных пользователей:', err);
 }
 
-// Функция сохранения в файлы (вызывается после изменения)
-function saveUsers() {
+// Сохранение users в БД. Всё, что было в памяти, синхронизируется через UPSERT.
+// JSON-файл больше не трогаем — оставляем его как резервную копию на случай отката.
+async function saveUsers() {
   try {
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+    for (const u of users) {
+      await db.query(
+        `INSERT INTO users (id, login, password, name, initials, color, guest, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (id) DO UPDATE SET
+           login = EXCLUDED.login,
+           password = EXCLUDED.password,
+           name = EXCLUDED.name,
+           initials = EXCLUDED.initials,
+           color = EXCLUDED.color,
+           guest = EXCLUDED.guest`,
+        [
+          u.id,
+          u.login || null,
+          u.password || null,
+          u.name || "Игрок",
+          u.initials || null,
+          u.color || null,
+          !!u.guest,
+          u.createdAt || Date.now(),
+        ]
+      );
+    }
   } catch (err) {
-    console.error('Ошибка сохранения пользователей:', err);
+    console.error('❌ Ошибка сохранения users в БД:', err);
   }
 }
 
-function saveUserData() {
+// Сохраняем user_data + все связанные сущности в БД.
+// Если userId не задан — сохраняем всех. Если задан — только одного
+// (быстрее и безопаснее, когда меняем данные одного игрока).
+async function saveUserData(userId = null) {
+  const ids = userId ? [userId] : Object.keys(userData);
+  for (const uid of ids) {
+    const d = userData[uid];
+    if (!d) continue;
+    try {
+      // ===== user_data (плоские поля) =====
+      await db.query(
+        `INSERT INTO user_data (user_id, coins, stats, vip_until, minutes_online)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (user_id) DO UPDATE SET
+           coins = EXCLUDED.coins,
+           stats = EXCLUDED.stats,
+           vip_until = EXCLUDED.vip_until,
+           minutes_online = EXCLUDED.minutes_online,
+           updated_at = NOW()`,
+        [
+          uid,
+          Number(d.coins) || 0,
+          JSON.stringify(d.stats || { games: 0, wins: 0, xp: 0, level: 0 }),
+          d.vipUntil ? new Date(d.vipUntil) : null,
+          Number(d.minutesOnline) || 0,
+        ]
+      );
+
+      // ===== inventory (delete + insert) =====
+      await db.query('DELETE FROM inventory WHERE user_id = $1', [uid]);
+      const inv = Array.isArray(d.inventory) ? d.inventory : [];
+      for (const item of inv) {
+        const mId = item.marketItemId || null;
+        const inShop = mId && marketItems.find((m) => m.id === mId);
+        const itemData = { ...item };
+        if (inShop && itemData.imageDataUrl) delete itemData.imageDataUrl;
+        await db.query(
+          `INSERT INTO inventory (user_id, market_item_id, item_data, owned_at)
+           VALUES ($1,$2,$3,$4)`,
+          [
+            uid,
+            mId,
+            JSON.stringify(itemData),
+            item.ownedAt ? new Date(item.ownedAt) : new Date(),
+          ]
+        );
+      }
+
+      // ===== active_skins =====
+      await db.query('DELETE FROM active_skins WHERE user_id = $1', [uid]);
+      const skins = d.activeSkins || {};
+      for (const slotKey of Object.keys(skins)) {
+        const slot = Number(slotKey);
+        if (Number.isNaN(slot)) continue;
+        await db.query(
+          `INSERT INTO active_skins (user_id, slot_index, market_item_id)
+           VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+          [uid, slot, String(skins[slotKey])]
+        );
+      }
+
+      // ===== friendships (только accepted) =====
+      await db.query(
+        `DELETE FROM friendships WHERE user_id = $1 AND status = 'accepted'`,
+        [uid]
+      );
+      const friends = Array.isArray(d.friends) ? d.friends : [];
+      for (const fid of friends) {
+        await db.query(
+          `INSERT INTO friendships (user_id, friend_id, status)
+           VALUES ($1,$2,'accepted') ON CONFLICT DO NOTHING`,
+          [uid, fid]
+        );
+      }
+
+      // ===== quest_progress =====
+      if (d.quests && d.quests.dayKey && d.quests.items) {
+        await db.query('DELETE FROM quest_progress WHERE user_id = $1', [uid]);
+        for (const qid of Object.keys(d.quests.items)) {
+          const it = d.quests.items[qid] || {};
+          await db.query(
+            `INSERT INTO quest_progress (user_id, day_key, quest_id, done, claimed)
+             VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
+            [uid, d.quests.dayKey, qid, !!it.done, !!it.claimed]
+          );
+        }
+      }
+
+      // ===== notifications (delete + insert) =====
+      await db.query('DELETE FROM notifications WHERE user_id = $1', [uid]);
+      const notifs = Array.isArray(d.notifications) ? d.notifications : [];
+      for (const n of notifs) {
+        if (!n || !n.text) continue;
+        await db.query(
+          `INSERT INTO notifications (user_id, text, read, created_at)
+           VALUES ($1,$2,$3,$4)`,
+          [uid, n.text, !!n.read, n.timestamp ? new Date(n.timestamp) : new Date()]
+        );
+      }
+    } catch (err) {
+      console.error(`❌ Ошибка сохранения user_data для ${uid}:`, err);
+    }
+  }
+}
+
+// Загрузка admin_settings из БД. JSON остаётся fallback'ом, если БД недоступна.
+async function loadAdminSettings() {
   try {
-    fs.writeFileSync(USER_DATA_FILE, JSON.stringify(userData, null, 2));
+    const res = await db.query('SELECT data FROM admin_settings WHERE id = 1');
+    if (res.rows.length > 0) {
+      adminSettings = res.rows[0].data;
+      console.log('✅ Настройки загружены из БД');
+      return;
+    }
   } catch (err) {
-    console.error('Ошибка сохранения данных пользователей:', err);
+    console.error('Ошибка загрузки настроек из БД:', err.message);
+  }
+  // Fallback — из JSON
+  try {
+    if (fs.existsSync(SETTINGS_FILE)) {
+      adminSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+      console.log('✅ Настройки загружены из JSON (fallback)');
+    }
+  } catch (err) {
+    console.error('Ошибка загрузки настроек из JSON:', err);
   }
 }
 
-// Загрузка при старте
-try {
-  if (fs.existsSync(SETTINGS_FILE)) {
-    adminSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
-    console.log('✅ Настройки администратора загружены');
-  }
-} catch (err) {
-  console.error('Ошибка загрузки настроек:', err);
-}
 
-try {
-  if (fs.existsSync(DESIGNS_FILE)) {
-    cardDesigns = JSON.parse(fs.readFileSync(DESIGNS_FILE, 'utf8'));
-    console.log(`✅ Дизайнов карточек: ${cardDesigns.length}`);
+async function loadCardDesigns() {
+  try {
+    const res = await db.query('SELECT id, slot_index, data FROM card_designs ORDER BY slot_index');
+    if (res.rows.length > 0) {
+      cardDesigns = res.rows.map((r) => r.data);
+      console.log(`✅ Дизайны загружены из БД: ${cardDesigns.length}`);
+      return;
+    }
+  } catch (err) {
+    console.error('Ошибка загрузки дизайнов из БД:', err.message);
   }
-} catch (err) {
-  console.error('Ошибка загрузки дизайнов:', err);
+  try {
+    if (fs.existsSync(DESIGNS_FILE)) {
+      cardDesigns = JSON.parse(fs.readFileSync(DESIGNS_FILE, 'utf8'));
+      console.log(`✅ Дизайны загружены из JSON (fallback): ${cardDesigns.length}`);
+    }
+  } catch (err) {
+    console.error('Ошибка загрузки дизайнов из JSON:', err);
+  }
 }
 
 const app = express();
@@ -405,26 +608,36 @@ socket.on('get-user-data', (userId, callback) => {
   socket.emit('card-designs', cardDesigns);
 
   // Обработчик: админ меняет настройки
-  socket.on('admin-update-settings', (newSettings) => {
+  socket.on('admin-update-settings', async (newSettings) => {
     if (!newSettings || typeof newSettings !== 'object') return;
     adminSettings = newSettings;
     try {
-      fs.writeFileSync(SETTINGS_FILE, JSON.stringify(adminSettings, null, 2));
+      await db.query(
+        `INSERT INTO admin_settings (id, data) VALUES (1, $1)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`,
+        [JSON.stringify(adminSettings)]
+      );
     } catch (err) {
-      console.error('Ошибка сохранения настроек:', err);
+      console.error('Ошибка сохранения настроек в БД:', err);
     }
     io.emit('admin-settings-updated', adminSettings);
     console.log('⚙️ Админ обновил настройки партии');
   });
 
   // Обработчик: админ меняет дизайны карточек
-  socket.on('admin-update-card-designs', (newDesigns) => {
+  socket.on('admin-update-card-designs', async (newDesigns) => {
     if (!Array.isArray(newDesigns)) return;
     cardDesigns = newDesigns;
     try {
-      fs.writeFileSync(DESIGNS_FILE, JSON.stringify(cardDesigns, null, 2));
+      await db.query('DELETE FROM card_designs');
+      for (const d of cardDesigns) {
+        await db.query(
+          'INSERT INTO card_designs (id, slot_index, data) VALUES ($1, $2, $3)',
+          [d.id, Number(d.slotIndex) || 0, JSON.stringify(d)]
+        );
+      }
     } catch (err) {
-      console.error('Ошибка сохранения дизайнов:', err);
+      console.error('Ошибка сохранения дизайнов в БД:', err);
     }
     io.emit('card-designs-updated', cardDesigns);
     console.log(`🎨 Админ обновил дизайны (${cardDesigns.length})`);
@@ -440,17 +653,29 @@ socket.on('get-user-data', (userId, callback) => {
   });
 
   socket.on('get-custom-items', () => socket.emit('custom-items-updated', marketItems));
-  socket.on('save-custom-items', (newItems) => {
-  marketItems = newItems;
-  saveMarketItems();
-  io.emit('custom-items-updated', marketItems);
-});
+  socket.on('save-custom-items', async (newItems) => {
+    if (!Array.isArray(newItems)) return;
+    marketItems = newItems;
+    try {
+      await db.query('DELETE FROM market_items');
+      for (const it of marketItems) {
+        await db.query(
+          'INSERT INTO market_items (id, data) VALUES ($1, $2)',
+          [it.id, JSON.stringify(it)]
+        );
+      }
+    } catch (err) {
+      console.error('Ошибка сохранения товаров в БД:', err);
+    }
+    io.emit('custom-items-updated', marketItems);
+    console.log(`🛍  Админ обновил товары (${marketItems.length})`);
+  });
   // --- РЫНОК / ОБЪЯВЛЕНИЯ ---
 socket.on('get-market-listings', () => {
   socket.emit('market-listings', marketListings);
 });
 
-socket.on('add-market-listing', (data, callback) => {
+socket.on('add-market-listing', async (data, callback) => {
   if (!data || !data.item || !data.price) return;
   // data: { item, price, seller, sellerId }
   const newListing = {
@@ -462,12 +687,20 @@ socket.on('add-market-listing', (data, callback) => {
     createdAt: Date.now()
   };
   marketListings.push(newListing);
-  saveMarketListings();
+  try {
+    await db.query(
+      `INSERT INTO market_listings (id, seller_id, item_data, price, created_at)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [newListing.id, newListing.sellerId || null, JSON.stringify(newListing.item), newListing.price, newListing.createdAt]
+    );
+  } catch (err) {
+    console.error('Ошибка сохранения объявления в БД:', err);
+  }
   io.emit('market-listings-updated', marketListings);
   if (callback) callback({ success: true, listing: newListing });
 });
 
-socket.on('remove-market-listing', (data, callback) => {
+socket.on('remove-market-listing', async (data, callback) => {
   const { listingId, userId } = data;
   const idx = marketListings.findIndex(l => l.id === listingId);
   if (idx === -1) return;
@@ -488,13 +721,17 @@ socket.on('remove-market-listing', (data, callback) => {
       io.to(tSocket).emit('user-data-updated', userData[userId]);
     }
   }
-    marketListings.splice(idx, 1);
-  saveMarketListings();
+  marketListings.splice(idx, 1);
+  try {
+    await db.query('DELETE FROM market_listings WHERE id = $1', [listingId]);
+  } catch (err) {
+    console.error('Ошибка удаления объявления из БД:', err);
+  }
   io.emit('market-listings-updated', marketListings);
   if (callback) callback({ success: true, inventory: userData[userId]?.inventory || [] });
 });
 
-socket.on('buy-market-listing', (data, callback) => {
+socket.on('buy-market-listing', async (data, callback) => {
   // data: { listingId, buyerId }
   const listing = marketListings.find(l => l.id === data.listingId);
   if (!listing) return callback?.({ success: false, error: 'Объявление не найдено' });
@@ -536,7 +773,11 @@ socket.on('buy-market-listing', (data, callback) => {
 
   // Удаляем объявление
   marketListings = marketListings.filter(l => l.id !== data.listingId);
-  saveMarketListings();
+  try {
+    await db.query('DELETE FROM market_listings WHERE id = $1', [data.listingId]);
+  } catch (err) {
+    console.error('Ошибка удаления объявления из БД:', err);
+  }
   io.emit('market-listings-updated', marketListings);
 
   // Уведомляем покупателя и продавца об обновлении их данных
@@ -546,10 +787,24 @@ socket.on('buy-market-listing', (data, callback) => {
   if (callback) callback({ success: true, item: listing.item });
 });
 
-socket.on('admin-save-cases', (newCases) => {
+socket.on('admin-save-cases', async (newCases) => {
+    if (!Array.isArray(newCases)) return;
     adminCases = newCases;
-    fs.writeFileSync('admin-cases.json', JSON.stringify(adminCases));
+    try {
+      // Полная замена: удаляем всё, вставляем заново.
+      // Кейсов мало (единицы), это дёшево и безопасно.
+      await db.query('DELETE FROM admin_cases');
+      for (const c of adminCases) {
+        await db.query(
+          'INSERT INTO admin_cases (id, data) VALUES ($1, $2)',
+          [c.id, JSON.stringify(c)]
+        );
+      }
+    } catch (err) {
+      console.error('Ошибка сохранения кейсов в БД:', err);
+    }
     io.emit('admin-cases-updated', adminCases);
+    console.log(`📦 Админ обновил кейсы (${adminCases.length})`);
 });
 socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases));
 
@@ -1068,4 +1323,39 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
 });
 
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, '0.0.0.0', () => console.log('Сервер запущен на порту ' + PORT));
+
+// Загружаем users из БД. Если БД недоступна или пуста — fallback на JSON,
+// который уже загружен выше. Сервер начинает слушать порт только
+// после завершения загрузки, чтобы клиенты не пришли раньше данных.
+(async () => {
+  await loadAdminSettings();
+  await loadAdminCases();
+  await loadMarketItems();
+  await loadCardDesigns();
+  await loadMarketListings();
+
+  try {
+    const res = await db.query('SELECT * FROM users ORDER BY created_at');
+    if (res.rows.length > 0) {
+      users = res.rows.map((r) => ({
+        id: r.id,
+        login: r.login,
+        password: r.password,
+        name: r.name,
+        initials: r.initials,
+        color: r.color,
+        guest: r.guest,
+        createdAt: Number(r.created_at),
+      }));
+      console.log(`✅ Пользователи загружены из БД: ${users.length}`);
+    } else {
+      console.log('⚠️  БД пуста — используем JSON-данные');
+    }
+  } catch (err) {
+    console.error('❌ Ошибка загрузки users из БД, использую JSON:', err.message);
+  }
+
+  server.listen(PORT, '0.0.0.0', () =>
+    console.log('Сервер запущен на порту ' + PORT),
+  );
+})();

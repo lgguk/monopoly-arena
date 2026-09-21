@@ -413,6 +413,142 @@ async function changeBalance(userId, type, amount, metadata = {}) {
   return { success: true, newBalance: next };
 }
 
+// ============ ФИНАЛИЗАЦИЯ ПАРТИИ ============
+const PLACE_REWARDS = [
+  { coins: 300, xp: 450 },
+  { coins: 200, xp: 300 },
+  { coins: 120, xp: 180 },
+  { coins: 100, xp: 150 },
+  { coins: 80,  xp: 120 },
+];
+
+// Начисляет награды по итогам партии. Вызывается один раз на комнату.
+// Правила мест:
+//  - 1 живой → place 1
+//  - Остальные банкроты → по порядку выбывания (последний выбывший — следующий после победителя)
+//  - leftAlive → place 0 (без награды)
+//  - 0 живых, все leftAlive → всем place 0
+async function finalizeGame(roomId) {
+  const room = gameRooms[roomId];
+  if (!room || room.finalized) return;
+
+  const players = room.filter(p => p && p.id);
+  if (players.length === 0) return;
+
+  const aliveCount = players.filter(p => !p.bankrupt).length;
+  if (aliveCount > 1) return;
+
+  room.finalized = true;
+  console.log(`🏁 Финализация партии ${roomId}. Живых: ${aliveCount}`);
+
+  const eliminationOrder = Array.isArray(room.eliminationOrder) ? room.eliminationOrder : [];
+  const alive = players.filter(p => !p.bankrupt);
+  const placeMap = {};
+
+  // Живой победитель (или последний живой)
+  if (alive.length === 1) {
+    placeMap[alive[0].id] = 1;
+  }
+
+  // Банкроты: последний в eliminationOrder получает место (alive?2:1),
+  // предпоследний — на одно больше и т.д.
+  const reversed = [...eliminationOrder].reverse();
+  const basePlace = alive.length === 1 ? 2 : 1;
+  reversed.forEach((pid, idx) => {
+    placeMap[pid] = basePlace + idx;
+  });
+
+  // Считаем награды для каждого
+  const results = [];
+  for (const p of players) {
+    const place = placeMap[p.id] || 0;
+
+    if (place === 0) {
+      results.push({ userId: p.id, place: 0, coins: 0, xp: 0, dropName: null, leftAlive: !!p.leftAlive });
+      continue;
+    }
+
+    const reward = PLACE_REWARDS[Math.min(place - 1, PLACE_REWARDS.length - 1)] || { coins: 0, xp: 0 };
+
+    // VIP × 2 к XP
+    const isVip = p.vipUntil ? new Date(p.vipUntil) > new Date() : false;
+    const xp = isVip ? reward.xp * 2 : reward.xp;
+    const coins = reward.coins;
+
+    // Дроп предмета (25%)
+    let dropName = null;
+    const realItems = marketItems.filter(i => i.isActive !== false);
+    if (Math.random() < 0.25 && realItems.length > 0) {
+      const drop = realItems[Math.floor(Math.random() * realItems.length)];
+      if (drop.category === 'vip') {
+        const days = Number(drop.vipDuration) || 7;
+        const now = Date.now();
+        const currentUntil = userData[p.id]?.vipUntil ? new Date(userData[p.id].vipUntil).getTime() : 0;
+        const baseTime = currentUntil > now ? currentUntil : now;
+        const vipEnd = new Date(baseTime + days * 24 * 60 * 60 * 1000);
+        if (userData[p.id]) userData[p.id].vipUntil = vipEnd.toISOString();
+        dropName = `${drop.name} (VIP +${days} дн.)`;
+      } else {
+        const ownedItem = {
+          id: `${drop.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          name: drop.name,
+          type: drop.category === 'dice' ? 'dice' : 'board',
+          rarity: drop.rarity,
+          color: '#29233e',
+          price: drop.price,
+          description: drop.description || (drop.category === 'dice' ? 'Скин кубиков' : 'Карточка поля'),
+          ownedAt: new Date().toISOString(),
+          slotIndex: drop.slotIndex,
+          imageDataUrl: drop.imageDataUrl,
+          marketItemId: drop.id,
+          cardWidth: drop.cardWidth,
+          cardHeight: drop.cardHeight,
+          imageHeight: drop.imageHeight,
+          shopScale: drop.shopScale,
+        };
+        if (userData[p.id]) {
+          if (!userData[p.id].inventory) userData[p.id].inventory = [];
+          userData[p.id].inventory.push(ownedItem);
+        }
+        dropName = drop.name;
+      }
+    }
+
+    // Начисляем Coins
+    const change = await changeBalance(p.id, 'game_reward', coins, { place, dropName });
+    if (change.success) {
+      const d = userData[p.id];
+      if (d) {
+        if (!d.stats) d.stats = { games: 0, wins: 0, xp: 0, level: 0 };
+        d.stats.games = (d.stats.games || 0) + 1;
+        if (place === 1) d.stats.wins = (d.stats.wins || 0) + 1;
+        d.stats.xp = (d.stats.xp || 0) + xp;
+        d.stats.level = Math.floor(d.stats.xp / 1000);
+      }
+      // Квесты: сыграл партию — всем, кто не leftAlive (place > 0).
+      // Победил — только place === 1.
+      markQuestDone(p.id, 'playGame');
+      if (place === 1) markQuestDone(p.id, 'winGame');
+      await saveUserData(p.id);
+    }
+
+    results.push({ userId: p.id, place, coins, xp, dropName, leftAlive: false });
+    console.log(`🏆 ${p.id} → place ${place}, +${coins} Coins, +${xp} XP${dropName ? ', дроп: ' + dropName : ''}`);
+  }
+
+  io.to(roomId).emit('game-rewards', { roomId, results });
+}
+
+// Проверяем: если живых ≤ 1, запускаем финализацию
+function maybeFinalize(roomId) {
+  const room = gameRooms[roomId];
+  if (!room || room.finalized) return;
+  const players = room.filter(p => p && p.id);
+  if (players.length === 0) return;
+  const aliveCount = players.filter(p => !p.bankrupt).length;
+  if (aliveCount <= 1) finalizeGame(roomId);
+}
+
 // Загрузка admin_settings из БД. JSON остаётся fallback'ом, если БД недоступна.
 async function loadAdminSettings() {
   try {
@@ -1187,17 +1323,40 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     // это нужно, чтобы при переподключении игрок получил свежие позиции,
     // а не те, что были при первом входе.
     if (data.roomId && Array.isArray(data.players) && gameRooms[data.roomId]) {
+      const room = gameRooms[data.roomId];
+      if (!Array.isArray(room.eliminationOrder)) room.eliminationOrder = [];
+
       data.players.forEach((p) => {
         if (!p || !p.id) return;
-        const existing = gameRooms[data.roomId].find(x => x.id === p.id);
+        const existing = room.find(x => x.id === p.id);
         if (existing) {
+          const wasBankrupt = !!existing.bankrupt;
+          const wasLeftAlive = !!existing.leftAlive;
+
           existing.position = p.position ?? existing.position;
           existing.money = p.money ?? existing.money;
           existing.bankrupt = p.bankrupt ?? existing.bankrupt;
+          existing.leftAlive = p.leftAlive ?? existing.leftAlive;
           existing.jailTurns = p.jailTurns ?? existing.jailTurns;
           existing.jailAttempts = p.jailAttempts ?? existing.jailAttempts;
+
+          // Детект нового выбывания: false → true
+          if (!wasBankrupt && existing.bankrupt) {
+            // leftAlive (вышел живым) не попадает в eliminationOrder — без награды
+            if (existing.leftAlive) {
+              console.log(`🚪 ${existing.name} вышел живым — без награды`);
+            } else {
+              if (!room.eliminationOrder.includes(p.id)) {
+                room.eliminationOrder.push(p.id);
+                console.log(`💀 ${existing.name} обанкротился — запись #${room.eliminationOrder.length} в порядке выбывания`);
+              }
+            }
+          }
         }
       });
+
+      // Может, партия уже закончилась?
+      maybeFinalize(data.roomId);
     }
     socket.to(data.roomId).emit('update-remote-state', data);
   });
@@ -1246,7 +1405,12 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
   // --- НОВЫЕ ОБРАБОТЧИКИ ДЛЯ ИГРОВОГО СТОЛА ---
     socket.on('enter-game-room', ({ roomId, playerData }) => {
     socket.join(roomId);
-    if (!gameRooms[roomId]) gameRooms[roomId] = [];
+    if (!gameRooms[roomId]) {
+      gameRooms[roomId] = [];
+      // Мета-данные игровой сессии (не массив игроков, а объект рядом).
+      gameRooms[roomId].eliminationOrder = [];
+      gameRooms[roomId].finalized = false;
+    }
 
     // Сначала ищем игрока по УНИКАЛЬНОМУ id (не по socketId!) — это нужно для переподключения
     const existing = gameRooms[roomId].find(p => p.id === playerData.id);
@@ -1350,7 +1514,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     socket.to(data.roomId).emit('sync-timer-broadcast', data.timeLeft);
   });
 
-  socket.on('leave-game', (data) => {
+  socket.on('leave-game', async (data) => {
     // Поддерживаем оба формата: старый (строка) и новый ({ roomId, userId })
     const roomId = typeof data === 'string' ? data : data?.roomId;
     const userId = typeof data === 'object' && data ? data.userId : null;
@@ -1395,6 +1559,8 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
 
     const remainingAlive = gameRooms[roomId].filter(p => !p.bankrupt).length;
     if (remainingAlive <= 1) {
+      // Финализируем — начислим награды победителю
+      await maybeFinalize(roomId);
       io.to(roomId).emit('game-ended');
       // Планируем удаление комнаты, чтобы не висел баннер переподключения
       setTimeout(() => {
@@ -1607,7 +1773,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     }
 });
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     console.log('Игрок отключился:', socket.id);
 
     // НЕ удаляем игрока — помечаем как disconnected и запускаем таймер на 2 минуты
@@ -1644,8 +1810,14 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
         io.to(roomId).emit('player-left', player.id);
         console.log(`⏰ ${player.name} не переподключился — авто-банкрот`);
 
+        // Записываем в eliminationOrder, если ещё нет
+        if (Array.isArray(room.eliminationOrder) && !room.eliminationOrder.includes(player.id)) {
+          room.eliminationOrder.push(player.id);
+        }
+
         const remainingAlive = room.filter(x => !x.bankrupt).length;
         if (remainingAlive <= 1) {
+          maybeFinalize(roomId);
           io.to(roomId).emit('game-ended');
           delete roomTurnStart[roomId];
           setTimeout(() => {

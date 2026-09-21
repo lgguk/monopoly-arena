@@ -4235,6 +4235,48 @@ resolveGameDesigns(cleanPlayers);
       setTimeLeft(newTime);
     });
 
+    // Финальный экран с наградами приходит ТОЛЬКО с сервера.
+    // Клиент ничего не начисляет сам.
+    socket.on('game-rewards', (data: { roomId: string; results: any[] }) => {
+      if (data.roomId !== initialRoomId) return;
+      const myId = currentUser?.id || "you";
+      const myResult = data.results.find((r) => r.userId === myId);
+
+      let rewardText = "";
+      if (!myResult || myResult.place === 0) {
+        if (myResult?.leftAlive) {
+          rewardText = "Вы покинули игру досрочно — без награды.";
+        } else {
+          rewardText = "Награда не начислена.";
+        }
+      } else {
+        const dropInfo = myResult.dropName ? ` · Дроп: «${myResult.dropName}»` : "";
+        rewardText = `Вы заняли ${myResult.place} место: +${myResult.xp} XP и +${myResult.coins} Coins.${dropInfo}`;
+      }
+
+      // Обновляем локальные данные (coins, inventory, stats, vip)
+      if (typeof myResult?.coins === "number") {
+        const cur = Number(localStorage.getItem("arena-coins") || "0");
+        localStorage.setItem("arena-coins", String(cur + myResult.coins));
+      }
+
+      setReward(rewardText);
+      setGameOver(true);
+
+      // Дёргаем сервер за свежими данными — они точно правильные
+      if (currentUser?.id) {
+        socket.emit('get-user-data', currentUser.id, (res: any) => {
+          if (res?.success && res.data) {
+            localStorage.setItem("arena-user-data-" + currentUser.id, JSON.stringify(res.data));
+            localStorage.setItem("arena-coins", String(res.data.coins || 0));
+            localStorage.setItem("arena-inventory", JSON.stringify(res.data.inventory || []));
+            localStorage.setItem("arena-stats", JSON.stringify(res.data.stats || {}));
+            if (res.data.vipUntil) localStorage.setItem("arena-vip-until", res.data.vipUntil);
+          }
+        });
+      }
+    });
+
             socket.on('server-roll-result', ({ d1, d2, playerId }) => {
       const steps = d1 + d2;
       const activePlayerIdx = playersRef.current.findIndex(p => p.id === playerId); 
@@ -5917,171 +5959,20 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       playerId: player.id 
     });
   };
-  
-
-  // Таблица наград по месту (1-е — максимум, далее по убыванию)
-  const PLACE_REWARDS = [
-    { coins: 300, xp: 450 }, // 1 место
-    { coins: 200, xp: 300 }, // 2
-    { coins: 120, xp: 180 }, // 3
-    { coins: 100, xp: 150 }, // 4
-    { coins: 80,  xp: 120 }, // 5
-  ];
-
-  // Определяем место игрока и его награду
-  const computePlaceAndReward = (playerId: string): { place: number; coins: number; xp: number } => {
-    const allPlayers = playersRef.current;
-    const p = allPlayers.find(x => x.id === playerId);
-    if (!p) return { place: 0, coins: 0, xp: 0 };
-    // Вышел живым — награда не полагается
-    if (p.leftAlive) return { place: 0, coins: 0, xp: 0 };
-
-    const aliveCount = allPlayers.filter(x => !x.bankrupt).length;
-    const eliminationOrder = eliminationOrderRef.current;
-    const reversed = [...eliminationOrder].reverse();
-    const revIdx = reversed.indexOf(playerId);
-
-    let place = 0;
-    if (!p.bankrupt) {
-      // Игрок ещё жив — место по богатству
-      const allOwners = ownersRef.current;
-      const getWealth = (pl: Player) =>
-        pl.money + Object.entries(allOwners)
-          .filter(([, oid]) => oid === pl.id)
-          .reduce((s, [ci]) => s + (boardCells[Number(ci)].price ?? 0), 0);
-      const aliveSorted = [...allPlayers.filter(x => !x.bankrupt)]
-        .sort((a, b) => getWealth(b) - getWealth(a));
-      place = aliveSorted.findIndex(x => x.id === playerId) + 1;
-    } else if (revIdx !== -1) {
-      place = aliveCount + revIdx + 1;
-    } else {
-      return { place: 0, coins: 0, xp: 0 };
-    }
-
-    const reward = PLACE_REWARDS[Math.min(place - 1, PLACE_REWARDS.length - 1)] || { coins: 0, xp: 0 };
-    return { place, coins: reward.coins, xp: reward.xp };
-  };
-
-  // Начисление награды локальному игроку (один раз)
-  const grantRewardToLocalPlayer = (place: number, coins: number, xpBase: number) => {
-    if (!currentUser?.id) return null;
-    if (rewardGivenRef.current) return null;
-    rewardGivenRef.current = true;
-
-    let currentStats = { games: 0, wins: 0, xp: 0, level: 0 };
-    const savedStats = localStorage.getItem("arena-stats");
-    if (savedStats) currentStats = JSON.parse(savedStats);
-
-    const isWinner = place === 1;
-    let addXP = xpBase;
-
-    // VIP может храниться и в объекте игрока, и в localStorage — учитываем оба источника
-    const meInGame = playersRef.current.find(p => p.id === currentUser.id);
-    const vipUntil = meInGame?.vipUntil || localStorage.getItem("arena-vip-until");
-    const isVip = vipUntil ? new Date(vipUntil) > new Date() : false;
-    if (isVip) addXP *= 2;
-
-    currentStats.games += 1;
-    if (isWinner) currentStats.wins += 1;
-    currentStats.xp += addXP;
-    currentStats.level = Math.floor(currentStats.xp / 1000);
-
-    localStorage.setItem("arena-stats", JSON.stringify(currentStats));
-
-    const userDataKey = "arena-user-data-" + currentUser.id;
-    const existingUserData = JSON.parse(localStorage.getItem(userDataKey) || "{}");
-    const newCoins = Number(localStorage.getItem("arena-coins") || 2400) + coins;
-    localStorage.setItem("arena-coins", String(newCoins));
-
-    const updatedUserData: any = { ...existingUserData, stats: currentStats, coins: newCoins };
-
-    // Дроп предмета — только из реальных товаров, созданных админом в магазине
-    const realItems = marketItems.filter(i => i.isActive !== false);
-    const drop = Math.random() < 0.25 && realItems.length > 0
-      ? realItems[Math.floor(Math.random() * realItems.length)]
-      : null;
-    let droppedName: string | null = null;
-    if (drop) {
-      const ex = JSON.parse(localStorage.getItem("arena-inventory") || "[]") as OwnedItem[];
-
-      // Если это VIP — продлеваем, в инвентарь не кладём
-      if (drop.category === "vip") {
-        const days = drop.vipDuration || 7;
-        const currentVipUntil = localStorage.getItem("arena-vip-until");
-        const now = Date.now();
-        let baseTime = now;
-        if (currentVipUntil && new Date(currentVipUntil) > new Date(now)) {
-          baseTime = new Date(currentVipUntil).getTime();
-        }
-        const vipEnd = new Date(baseTime + days * 24 * 60 * 60 * 1000);
-        localStorage.setItem("arena-vip-until", vipEnd.toISOString());
-        updatedUserData.vipUntil = vipEnd.toISOString();
-        droppedName = `${drop.name} (VIP +${days} дн.)`;
-      } else {
-        // Обычный предмет — кладём в инвентарь
-        const ownedItem: OwnedItem = {
-          id: `${drop.id}-${Date.now()}`,
-          name: drop.name,
-          type: drop.category === "dice" ? "dice" : "board",
-          rarity: drop.rarity,
-          color: "#29233e",
-          price: drop.price,
-          description: drop.description || (drop.category === "dice" ? "Скин кубиков" : "Карточка поля"),
-          ownedAt: new Date().toISOString(),
-          slotIndex: drop.slotIndex,
-          imageDataUrl: drop.imageDataUrl,
-          marketItemId: drop.id,
-        };
-        const newInv = [...ex, ownedItem];
-        localStorage.setItem("arena-inventory", JSON.stringify(newInv));
-        updatedUserData.inventory = newInv;
-        droppedName = drop.name;
-      }
-    }
-
-    localStorage.setItem(userDataKey, JSON.stringify(updatedUserData));
-
-    socket.emit('update-user-xp', { userId: currentUser.id, stats: currentStats });
-    socket.emit('save-user-data', { userId: currentUser.id, newData: updatedUserData });
-
-    return { addXP, coins, drop, droppedName };
-  };
 
   const finishGame = () => {
+    // Награды теперь начисляет ТОЛЬКО сервер через game-rewards.
+    // Клиент просто ждёт ответа и показывает финальный экран.
     if (rewardGivenRef.current) return;
+    rewardGivenRef.current = true;
 
-    const allPlayers = playersRef.current;
-    const myId = currentUser?.id || "you";
-    const me = allPlayers.find(p => p.id === myId);
-    const alive = allPlayers.filter(p => !p.bankrupt);
-    const winner = alive.length === 1 ? alive[0] : null;
-    const winnerReason = alive.length <= 1 ? "🏆 Победитель по выживанию!" : "🏆 Лидер по богатству!";
-
-    // Если игрок вышел живым — просто сообщаем, без начисления
-    if (me?.leftAlive) {
-      rewardGivenRef.current = true;
-      setReward(`${winnerReason} Победил ${winner?.name || "Никто"}. Вы покинули игру досрочно — без награды.`);
-      setGameOver(true);
-      return;
-    }
-
-    const { place, coins, xp } = computePlaceAndReward(myId);
-    if (place === 0) {
-      rewardGivenRef.current = true;
-      setReward(`${winnerReason} Победил ${winner?.name || "Никто"}.`);
-      setGameOver(true);
-      return;
-    }
-
-    // Ежедневный квест "Победи в партии" — только за полноценное 1-е место
-    if (place === 1) {
-      emitQuestEvent("winGame");
-    }
-
-    const grant = grantRewardToLocalPlayer(place, coins, xp);
-    const dropInfo = grant?.droppedName ? ` · Предмет: ${grant.droppedName} добавлен в инвентарь!` : "";
-    setReward(`${winnerReason} Победил ${winner?.name || "Никто"}. Вы заняли ${place} место: +${xp} XP и +${coins} Coins.${dropInfo}`);
-    setGameOver(true);
+    // Если сервер не прислал game-rewards за 5 секунд — показываем заглушку
+    setTimeout(() => {
+      if (!rewardRef.current) {
+        setReward("Партия завершена. Ожидаем начисления наград с сервера…");
+        setGameOver(true);
+      }
+    }, 5000);
   };
 
   const cellGridPos = (index: number) => ({
@@ -7793,19 +7684,9 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 // Игрок УЖЕ выбыл (банкрот) — показываем модалку с наградой, потом выходим
                 if (me.bankrupt && !me.leftAlive) {
                   if (initialRoomId) socket.emit('leave-game', { roomId: initialRoomId, userId: myId });
-                  // Начисляем и показываем награду (если ещё не выдана)
-                  if (!rewardGivenRef.current) {
-                    const { place, coins, xp } = computePlaceAndReward(myId);
-                    if (place > 0) {
-                    const grant = grantRewardToLocalPlayer(place, coins, xp);
-                    const dropInfo = grant?.droppedName ? ` · Предмет: ${grant.droppedName} добавлен в инвентарь!` : "";
-                    setReward(`Вы заняли ${place} место: +${xp} XP и +${coins} Coins.${dropInfo}`);
-                    } else {
-                      rewardGivenRef.current = true;
-                      setReward("Вы покинули игру.");
-                    }
-                  }
-                  return; // модалка сама вызовет onExit по кнопке
+                  // Награды начисляет сервер. Клиент просто ждёт game-rewards
+                  // и покажет модалку через подписку socket.on('game-rewards').
+                  return;
                 }
 
                 // Игрок ЖИВОЙ — выходим без награды

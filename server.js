@@ -283,6 +283,20 @@ async function saveUserData(userId = null) {
   }
 }
 
+// Запись в журнал транзакций. Вызываем при каждом изменении баланса Coins.
+// amount > 0 — начисление, amount < 0 — списание.
+async function logTransaction(userId, type, amount, metadata = {}) {
+  try {
+    await db.query(
+      `INSERT INTO transactions (user_id, type, amount, metadata)
+       VALUES ($1, $2, $3, $4)`,
+      [userId, type, Math.round(amount), JSON.stringify(metadata)]
+    );
+  } catch (err) {
+    console.error(`❌ Ошибка записи транзакции (${type} для ${userId}):`, err);
+  }
+}
+
 // Загрузка admin_settings из БД. JSON остаётся fallback'ом, если БД недоступна.
 async function loadAdminSettings() {
   try {
@@ -756,6 +770,10 @@ socket.on('buy-market-listing', async (data, callback) => {
   buyer.coins -= listing.price;
   seller.coins += listing.price;
 
+  // Пишем транзакции: у покупателя списание, у продавца начисление
+  logTransaction(buyerId, 'market_buy', -listing.price, { listingId: listing.id, itemName: listing.item?.name });
+  logTransaction(sellerId, 'market_sell', listing.price, { listingId: listing.id, itemName: listing.item?.name });
+
   // Если это VIP-товар, продлеваем VIP, иначе добавляем в инвентарь
   if (listing.item.category === "vip") {
     // Определяем текущую дату окончания VIP или текущее время
@@ -1204,6 +1222,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     item.claimed = true;
     userData[userId].coins = (userData[userId].coins || 0) + def.reward;
     saveUserData();
+    logTransaction(userId, 'quest_claim', def.reward, { questId });
     console.log(`💰 ${userId} забрал ${def.reward} Coins за "${questId}" (баланс: ${userData[userId].coins})`);
 
     // Уведомляем клиента об обновлении данных и квестов

@@ -2895,11 +2895,25 @@ const buyVip = (vip: MarketItem) => {
                     <button
                       onClick={() => {
                         if (isGuest) {
-                          setNotice("❌ Гостевой режим не может покупать. Зарегистрируйтесь, чтобы прогресс сохранялся.");
+                          setNotice("❌ Гостевой режим не может покупать. Зарегистрируйтесь.");
                           setTimeout(() => setNotice(""), 10000);
                           return;
                         }
-                        buyCase(product.name, product.price ?? 100);
+                        const userId = getSessionUserId();
+                        if (!userId) {
+                          setNotice("Ошибка: не найден ID игрока");
+                          return;
+                        }
+                        socket.emit('shop-buy-case', { userId, caseId: product.id }, (res: any) => {
+                          if (res?.success) {
+                            localStorage.setItem("arena-coins", String(res.newBalance));
+                            setNotice(`Кейс «${product.name}» добавлен в инвентарь!`);
+                            setTimeout(() => setNotice(""), 4000);
+                          } else {
+                            setNotice(`❌ ${res?.error || 'Не удалось купить'}`);
+                            setTimeout(() => setNotice(""), 6000);
+                          }
+                        });
                       }}
                       className={`rounded-lg px-3.5 py-2 text-xs font-bold ${
                         isGuest
@@ -3208,12 +3222,9 @@ const caseData = safeCasesData.find(c => c.name === caseItem.name);
       const apply = (item: OwnedItem) => {
   const newSkins = { ...active.activeSkins };
   if (item.slotIndex !== undefined) {
-    const marketRef =
-      item.marketItemId ||
-      marketItems.find(m => m.name === item.name && m.slotIndex === item.slotIndex)?.id ||
-      item.id;
-    newSkins[item.slotIndex] = marketRef;
-    // Не трогаем active[type] для слот-предметов — только activeSkins
+    // Храним именно id предмета в инвентаре — это позволяет отличить
+    // два одинаковых скина друг от друга (один активный, второй нет).
+    newSkins[item.slotIndex] = item.id;
     setActive({ ...active, activeSkins: newSkins });
   } else {
     setActive({ ...active, [item.type]: item.id });
@@ -3307,11 +3318,8 @@ const deactivate = (item: OwnedItem) => {
         {inventory.map((item) => {
   const isCase = item.rarity === "Кейс";
   const isVip = item.rarity === "VIP";
-      const currentRef = item.slotIndex !== undefined
-    ? (item.marketItemId || marketItems.find(m => m.name === item.name && m.slotIndex === item.slotIndex)?.id || item.id)
-    : item.id;
   const isActive = item.slotIndex !== undefined
-    ? active.activeSkins?.[item.slotIndex] === currentRef
+    ? active.activeSkins?.[item.slotIndex] === item.id
     : active[item.type] === item.id;
   const sourceMarketItem = findMarketItemForOwned(item, marketItems);
   const sz = getCardSize(sourceMarketItem ?? item);
@@ -11346,7 +11354,32 @@ function App() {
         const u = JSON.parse(raw);
         if (u && u.id) {
           socket.emit('reconnect-session', { userId: u.id }, (res: any) => {
-            if (res?.success) console.log("♻️ Сессия восстановлена на сервере");
+            if (!res?.success) return;
+            console.log("♻️ Сессия восстановлена на сервере");
+
+            // Синхронизируем localStorage свежими данными с сервера.
+            // Иначе инвентарь/кошелёк/скины останутся старыми до следующего логина.
+            const data = res.data || {};
+            localStorage.setItem("arena-user-data-" + u.id, JSON.stringify(data));
+            localStorage.setItem("arena-coins", String(data.coins || 2400));
+            localStorage.setItem("arena-inventory", JSON.stringify(data.inventory || []));
+            localStorage.setItem("arena-stats", JSON.stringify(data.stats || {}));
+            if (data.vipUntil) {
+              localStorage.setItem("arena-vip-until", data.vipUntil);
+            } else {
+              localStorage.removeItem("arena-vip-until");
+            }
+            if (data.activeSkins && typeof data.activeSkins === "object") {
+              try {
+                const current = JSON.parse(localStorage.getItem("arena-active-skins") || "{}");
+                localStorage.setItem("arena-active-skins", JSON.stringify({
+                  dice: current.dice || "none",
+                  token: current.token || "none",
+                  board: current.board || "none",
+                  activeSkins: data.activeSkins,
+                }));
+              } catch {}
+            }
           });
         }
       } catch {}

@@ -158,13 +158,21 @@ async function loadUserDataFromDb() {
         ownedAt: r.owned_at ? new Date(r.owned_at).toISOString() : undefined,
       }));
 
-      // Активные скины
+      // Активные скины. Храним inventory_item_id (уникальный id предмета в инвентаре),
+      // а не market_item_id. Так у двух одинаковых Intel будет только один активный.
       const skinsRes = await db.query(
-        'SELECT slot_index, market_item_id FROM active_skins WHERE user_id = $1',
+        'SELECT slot_index, inventory_item_id FROM active_skins WHERE user_id = $1',
         [uid]
       );
+      const inventoryIds = new Set(
+        inventory.map((it) => String(it.id || '')).filter(Boolean)
+      );
       const activeSkins = {};
-      skinsRes.rows.forEach((r) => { activeSkins[r.slot_index] = r.market_item_id; });
+      skinsRes.rows.forEach((r) => {
+        if (inventoryIds.has(String(r.inventory_item_id))) {
+          activeSkins[r.slot_index] = r.inventory_item_id;
+        }
+      });
 
       // Друзья (accepted)
       const friendsRes = await db.query(
@@ -297,9 +305,7 @@ async function saveUserData(userId = null) {
       const inv = Array.isArray(d.inventory) ? d.inventory : [];
       for (const item of inv) {
         const mId = item.marketItemId || null;
-        const inShop = mId && marketItems.find((m) => m.id === mId);
         const itemData = { ...item };
-        if (inShop && itemData.imageDataUrl) delete itemData.imageDataUrl;
         await db.query(
           `INSERT INTO inventory (user_id, market_item_id, item_data, owned_at)
            VALUES ($1,$2,$3,$4)`,
@@ -315,13 +321,17 @@ async function saveUserData(userId = null) {
       // ===== active_skins =====
       await db.query('DELETE FROM active_skins WHERE user_id = $1', [uid]);
       const skins = d.activeSkins || {};
+      const invIds = new Set((d.inventory || []).map((it) => String(it.id || '')));
       for (const slotKey of Object.keys(skins)) {
         const slot = Number(slotKey);
         if (Number.isNaN(slot)) continue;
+        const itemId = String(skins[slotKey]);
+        // Сохраняем только если предмет реально есть в инвентаре
+        if (!invIds.has(itemId)) continue;
         await db.query(
-          `INSERT INTO active_skins (user_id, slot_index, market_item_id)
+          `INSERT INTO active_skins (user_id, slot_index, inventory_item_id)
            VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
-          [uid, slot, String(skins[slotKey])]
+          [uid, slot, itemId]
         );
       }
 
@@ -472,6 +482,8 @@ const SERVER_START_TOKEN = Date.now().toString() + '-' + Math.random().toString(
 let serverStatus = "online";
 // Онлайн-пользователи: userId -> socketId
 const onlineUsers = new Map();
+// Защита от параллельных покупок одного игрока (двойной клик/React StrictMode).
+const buyLocks = new Set();
 // 5 fixed, maximally-distinct player slot colors
 const PLAYER_COLORS = ["#e63946", "#2ecc71", "#3a86ff", "#9b5de5", "#f77f00"];
 
@@ -696,12 +708,20 @@ socket.on('reconnect-session', ({ userId }, callback) => {
 });
 
 // Событие для сохранения игровых данных (вызывается с клиента при изменении)
+// ВАЖНО: клиент не имеет права менять inventory, coins, activeSkins, vipUntil,
+// quests, friends, notifications — это серверные поля. Из newData берём только
+// безопасные (статистику, минуты онлайн).
 socket.on('save-user-data', (data, callback) => {
   const { userId, newData } = data;
-  if (!userId || !newData) return;
-  // MERGE — сохраняем поля, которых нет в newData (например, activeSkins)
-  userData[userId] = { ...userData[userId], ...newData };
-  saveUserData();
+  if (!userId || !newData || !userData[userId]) return;
+
+  const CLIENT_WRITABLE = ['stats', 'minutesOnline'];
+  for (const key of CLIENT_WRITABLE) {
+    if (newData[key] !== undefined) {
+      userData[userId][key] = newData[key];
+    }
+  }
+  saveUserData(userId);
   // Отправляем обновление всем подключениям этого пользователя (для синхронизации)
   if (onlineUsers.has(userId)) {
     io.to(onlineUsers.get(userId)).emit('user-inventory-updated', userData[userId].inventory || []);
@@ -795,6 +815,9 @@ socket.on('get-user-data', (userId, callback) => {
   socket.on('shop-buy-card', async ({ userId, marketItemId }, callback) => {
     if (!userId || !marketItemId) return callback?.({ success: false, error: 'Некорректный запрос' });
     if (!userData[userId]) return callback?.({ success: false, error: 'Игрок не найден' });
+    if (buyLocks.has(userId)) return callback?.({ success: false, error: 'Подождите, обрабатывается другая покупка' });
+    buyLocks.add(userId);
+    try {
 
     // Проверяем, что товар есть и активен
     const item = marketItems.find((m) => m.id === marketItemId && m.isActive !== false);
@@ -802,14 +825,8 @@ socket.on('get-user-data', (userId, callback) => {
       return callback?.({ success: false, error: 'Товар недоступен' });
     }
 
-    // Проверяем, что слот свободен (нельзя дважды купить одну карточку на один слот)
+    // Слот, который заменяет карточка
     const slot = Number(item.slotIndex);
-    const alreadyOwned = (userData[userId].inventory || []).some(
-      (it) => Number(it.slotIndex) === slot && it.marketItemId === item.id
-    );
-    if (alreadyOwned) {
-      return callback?.({ success: false, error: 'Эта карточка уже есть в инвентаре' });
-    }
 
     // Списываем Coins через changeBalance
     const change = await changeBalance(userId, 'shop_buy', -item.price, {
@@ -859,6 +876,72 @@ socket.on('get-user-data', (userId, callback) => {
       ownedItem,
       userData: userData[userId],
     });
+    } finally {
+      buyLocks.delete(userId);
+    }
+  });
+  
+  // ---- ПОКУПКА КЕЙСА ИЗ МАГАЗИНА ----
+  socket.on('shop-buy-case', async ({ userId, caseId }, callback) => {
+    if (!userId || !caseId) return callback?.({ success: false, error: 'Некорректный запрос' });
+    if (!userData[userId]) return callback?.({ success: false, error: 'Игрок не найден' });
+    if (buyLocks.has(userId)) return callback?.({ success: false, error: 'Подождите, обрабатывается другая покупка' });
+    buyLocks.add(userId);
+    try {
+
+    // Ищем кейс в adminCases по id
+    const caseData = adminCases.find((c) => c.id === caseId && c.isActive !== false);
+    if (!caseData) return callback?.({ success: false, error: 'Кейс недоступен' });
+
+    const price = Number(caseData.price) || 100;
+
+    // Списываем Coins
+    const change = await changeBalance(userId, 'shop_buy', -price, {
+      itemId: caseData.id,
+      itemName: caseData.name,
+      category: 'case',
+    });
+    if (!change.success) {
+      return callback?.({ success: false, error: change.error });
+    }
+
+    // Кладём кейс в инвентарь как предмет
+    const caseItem = {
+      id: `case-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name: caseData.name,
+      type: 'board',
+      rarity: 'Кейс',
+      color: caseData.color || '#29233e',
+      price,
+      description: caseData.desc || 'Кейс с предметами',
+      ownedAt: new Date().toISOString(),
+      imageDataUrl: caseData.imageDataUrl,
+      cardWidth: caseData.cardWidth,
+      cardHeight: caseData.cardHeight,
+      imageHeight: caseData.imageHeight,
+      shopScale: caseData.shopScale,
+    };
+    if (!userData[userId].inventory) userData[userId].inventory = [];
+    userData[userId].inventory.push(caseItem);
+
+    saveUserData(userId);
+
+    console.log(`📦 ${userId} купил кейс «${caseData.name}» за ${price} (баланс: ${change.newBalance})`);
+
+    const sId = onlineUsers.get(userId);
+    if (sId) {
+      io.to(sId).emit('user-data-updated', userData[userId]);
+      io.to(sId).emit('user-inventory-updated', userData[userId].inventory);
+    }
+
+    callback?.({
+      success: true,
+      newBalance: change.newBalance,
+      ownedItem: caseItem,
+    });
+    } finally {
+      buyLocks.delete(userId);
+    }
   });
   // --- РЫНОК / ОБЪЯВЛЕНИЯ ---
 socket.on('get-market-listings', () => {

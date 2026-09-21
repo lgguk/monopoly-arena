@@ -1,3 +1,28 @@
 node_modules/ 
 .config/ 
 .local/ 
+.env
+*.sql
+
+# ==== Monopoly Arena: данные и сборки ====
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Данные игроков (хранятся в Postgres, JSON — только локальный бэкап)
+users.json
+user-data.json
+market-items.json
+market-listings.json
+admin-cases.json
+admin-settings.json
+card-designs.json
+
+# Бэкапы и разовые скрипты
+backups/
+migrate-to-pg.js
+test-pg.js
+check-*.sql
+
+# Переменные окружения
+.env

@@ -36,6 +36,7 @@ import {
   PanelLeft,
   Pencil,
   Plus,
+  RefreshCw,
   Search,
   Send,
   Settings2,
@@ -54,11 +55,23 @@ import {
   WalletCards,
   X,
   Zap,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { io } from 'socket.io-client';
+
+const socket = io('https://api.monopoly-arena.ru', {
+  transports: ['websocket', 'polling']
+});
 
 const queryClient = new QueryClient();
+
+// 🔐 ПАРОЛЬ ДЛЯ ДОСТУПА К САЙТУ ВО ВРЕМЯ ТЕСТИРОВАНИЯ
+// Измени это значение на свой пароль. После ввода пароля он сохранится
+// в localStorage браузера, и модалка больше не будет появляться.
+const SITE_ACCESS_PASSWORD = "Monopoly2026";
 
 type Tab =
   | "dashboard"
@@ -93,13 +106,19 @@ type Player = {
   position: number;
   online?: boolean;
   bankrupt?: boolean;
+  leftAlive?: boolean; // вышел живым — награду не получает
   jailTurns?: number;
   jailAttempts?: number;
+  socketId?: string;
+  activeSkins?: Record<number, string>;
+  isVip?: boolean;
+  vipUntil?: string;
 };
 type ChatMessage = {
   from: string;
   text: string;
   time: string;
+  timestamp?: number;
   recipient?: string;
 };
 type ItemType = "dice" | "token" | "board";
@@ -111,8 +130,20 @@ type GameItem = {
   color: string;
   price: number;
   description: string;
+  imageDataUrl?: string;
+  slotIndex?: number;
+  scale?: number;
 };
-type OwnedItem = GameItem & { ownedAt: string };
+type OwnedItem = GameItem & {
+  ownedAt: string;
+  slotIndex?: number;
+  vipDuration?: number;
+  marketItemId?: string;
+  cardWidth?: number;
+  cardHeight?: number;
+  imageHeight?: number;
+  shopScale?: number;
+};
 type Listing = {
   id: string;
   item: GameItem;
@@ -128,6 +159,7 @@ type AuthUser = {
   initials: string;
   color: string;
   guest?: boolean;
+  vipUntil?: string; // дата окончания VIP (ISO)
 };
 type AdminSettings = {
   startCapital: number;
@@ -164,8 +196,48 @@ type DiceDesign = {
   color: string;
   imageDataUrl?: string;
 };
-type CaseDesign = { id: string; name: string; rarity: string; items: string[] };
-type LobbyMode = "Классический" | "2×2" | "3×3";
+
+type MarketItemCategory = "card" | "dice" | "vip";
+type MarketItemRarity = "common" | "rare" | "epic"; // белый, синий, фиолетовый
+
+type MarketItem = {
+  id: string;
+  name: string;
+  category: MarketItemCategory;
+  slotIndex?: number;
+  diceId?: string;
+  vipDuration?: number;
+  price: number;
+  rarity: MarketItemRarity;
+  imageDataUrl?: string;
+  scale?: number;
+  isActive: boolean;
+  description?: string;
+  bgColor?: string;
+  // ---- Размеры карточки в магазине/инвентаре/рынке ----
+  cardWidth?: number;        // ширина карточки, px (по умолчанию 185)
+  cardHeight?: number;       // общая высота карточки, px (по умолчанию 200)
+  imageHeight?: number;      // высота зоны картинки, px (по умолчанию 116)
+  shopScale?: number;        // масштаб картинки в магазине, % (по умолчанию 90)
+};
+
+// Обновлённый тип кейса (без коллекций, вероятностей, с картинкой)
+type CaseDesign = {
+  id: string;
+  name: string;
+  items: string[];
+  desc?: string;
+  price?: number;
+  color?: string;
+  icon?: React.ElementType;
+  imageDataUrl?: string;
+  isActive?: boolean;
+  cardWidth?: number;
+  cardHeight?: number;
+  imageHeight?: number;
+  shopScale?: number;
+};
+type LobbyMode = "Классический" | "2×2";
 type LobbyRoom = {
   id: string;
   name: string;
@@ -180,6 +252,7 @@ type LobbyRoom = {
   password?: string;
   started?: boolean;
   createdAt?: number;
+  playerNames?: string[];
 };
 type GlobalChatMessage = { nickname: string; text: string; timestamp: string };
 
@@ -239,7 +312,17 @@ type AuctionState = {
   highBidder: string | null;
 };
 
-const RENT_MULTIPLIERS = [1, 5, 10, 15, 25, 40];
+const RENT_MULTIPLIERS = [1, 6, 12, 17, 27, 42];
+
+// Награды по местам (1-е место максимальное, далее по убыванию)
+const REWARDS_BY_PLACE: Record<number, { coins: number; xp: number }> = {
+  1: { coins: 300, xp: 450 },
+  2: { coins: 200, xp: 300 },
+  3: { coins: 120, xp: 180 },
+  4: { coins: 100, xp: 150 },
+  5: { coins: 80, xp: 120 },
+  6: { coins: 60, xp: 100 },
+};
 const IMPROVE_LABELS = [
   "",
   "Филиал ★",
@@ -250,79 +333,93 @@ const IMPROVE_LABELS = [
 ];
 
 const roundTo10 = (val: number) => Math.round(val / 10) * 10;
+const getLevelFromXP = (xp: number) => Math.floor(xp / 1000);
+// Глобальная переменная для актуальных дизайнов карточек (обновляется в компонентах)
+let globalCardDesigns: CardDesign[] = [];
+
+
+// Глобальная функция получения данных карточки с учётом дизайнов админа
+const getCell = (index: number): BoardCell => {
+  const design = globalCardDesigns.find((d) => d.slotIndex === index);
+  if (design) {
+    return {
+      name: design.name ?? boardCells[index].name,
+      type: design.type ?? boardCells[index].type,
+      price: design.price ?? boardCells[index].price,
+      rent: boardCells[index].rent,
+    };
+  }
+  return boardCells[index];
+};
 
 const getMortgage = (cellIdx: number) => {
-  const basePrice = boardCells[cellIdx].price ?? 0;
-  return roundTo10(basePrice * 0.6);
+  const basePrice = getCell(cellIdx).price ?? 0;
+  return roundTo10(basePrice * 0.5); // 50% от стоимости поля
 };
 const getRedeemCost = (cellIdx: number) => {
-  const mortgage = getMortgage(cellIdx);
-  return roundTo10(mortgage * 1.15);
+  const basePrice = getCell(cellIdx).price ?? 0;
+  return roundTo10(basePrice * 0.6); // 60% от стоимости поля
 };
+const IMPROVEMENT_COSTS: Record<number, number> = {
+  1: 500, 2: 500, 3: 500,
+  5: 600, 6: 600, 8: 600, 9: 600,
+  11: 700, 12: 700,
+  13: 800, 14: 800,
+  16: 900, 17: 900,
+  18: 1000, 19: 1000,
+  21: 1200, 23: 1200, 24: 1200,
+  25: 1400, 26: 1400, 27: 1400,
+  28: 1500, 29: 1500, // Добавили Nike и Adidas
+  31: 1550, // Исправили Puma
+  32: 1700, 33: 1700,
+  35: 1750,
+  37: 1900, 39: 1900
+};
+
 const getImproveCost = (cellIdx: number) => {
-  const g = GROUPS.findIndex((gr) =>
-    (gr.cells as readonly number[]).includes(cellIdx),
-  );
-  return g >= 0 ? (g + 1) * 400 : 0;
+  return IMPROVEMENT_COSTS[cellIdx] ?? 0;
 };
-const getGroupIdx = (cellIdx: number) =>
-  GROUPS.findIndex((gr) => (gr.cells as readonly number[]).includes(cellIdx));
+const getGroupIdx = (cellIdx: number) => {
+  const design = globalCardDesigns.find((d) => d.slotIndex === cellIdx);
+  if ((design?.type ?? "property") !== "property") return -1;
+  return getDynamicGroups().findIndex((gr) => (gr.cells as readonly number[]).includes(cellIdx));
+};
 
 const CHANCE_EVENTS_DATA = [
-  {
-    desc: "Все игроки поздравили тебя с днём рождения — по 500 К с каждого!",
-    kind: "birthday" as const,
-    amount: 500,
-  },
-  {
-    desc: "Удачная биржевая сделка! Получи 2 000 К",
-    kind: "gain" as const,
-    amount: 2000,
-  },
-  {
-    desc: "Налоговая проверка — штраф 1 500 К",
-    kind: "lose" as const,
-    amount: 1500,
-  },
-  {
-    desc: "Дивиденды от акций — +1 200 К",
-    kind: "gain" as const,
-    amount: 1200,
-  },
-  {
-    desc: "Авария — ремонт авто обошёлся в 800 К",
-    kind: "lose" as const,
-    amount: 800,
-  },
-  {
-    desc: "Коллеги скинулись — бонус +1 000 К",
-    kind: "gain" as const,
-    amount: 1000,
-  },
-  {
-    desc: "Штраф за нарушение ПДД — 600 К",
-    kind: "lose" as const,
-    amount: 600,
-  },
-  {
-    desc: "Успешный стартап принёс инвесторам прибыль! +2 500 К",
-    kind: "gain" as const,
-    amount: 2500,
-  },
-  {
-    desc: "Игрок должен заплатить за каждый свой филиал и отель по 500 К!",
-    kind: "hotels" as const,
-    amount: 500,
-  },
+  // Положительные
+  { desc: "Игроку {name} одобрили налоговый вычет, он получает +800 К.", kind: "gain" as const, amount: 800 },
+  { desc: "Игрок {name} получил наследство от дальнего родственника, +2 500 К.", kind: "gain" as const, amount: 2500 },
+  { desc: "Стартап игрока {name} привлёк инвестиции, +3 000 К.", kind: "gain" as const, amount: 3000 },
+  { desc: "Игроку {name} пришли дивиденды по акциям, +1 200 К.", kind: "gain" as const, amount: 1200 },
+  { desc: "Игрок {name} удачно сыграл на бирже, +2 000 К.", kind: "gain" as const, amount: 2000 },
+  { desc: "Благотворительный фонд выделил игроку {name} грант, +1 500 К.", kind: "gain" as const, amount: 1500 },
+  { desc: "Игрок {name} выиграл в лотерею, +1 000 К.", kind: "gain" as const, amount: 1000 },
+  { desc: "Игрок {name} заключил спонсорский контракт, +2 200 К.", kind: "gain" as const, amount: 2200 },
+  // Отрицательные
+  { desc: "Игрока {name} оштрафовали за нарушение экологических норм, −1 500 К.", kind: "lose" as const, amount: 1500 },
+  { desc: "На производстве игрока {name} произошла авария, ремонт обошёлся в 1 200 К.", kind: "lose" as const, amount: 1200 },
+  { desc: "Налоговая проверка выявила у игрока {name} недоимку, −2 000 К.", kind: "lose" as const, amount: 2000 },
+  { desc: "Игрок {name} понёс судебные издержки, −800 К.", kind: "lose" as const, amount: 800 },
+  { desc: "Инфляция съела часть сбережений игрока {name}, −500 К.", kind: "lose" as const, amount: 500 },
+  { desc: "Со склада игрока {name} украли товар, −1 000 К.", kind: "lose" as const, amount: 1000 },
+  { desc: "Игроку {name} начислили пени за просрочку кредита, −700 К.", kind: "lose" as const, amount: 700 },
+  // Массовые
+  { desc: "Все игроки скинулись игроку {name} на день рождения, он получает по 500 К с каждого.", kind: "birthday" as const, amount: 500 },
+  { desc: "Игрок {name} устроил корпоратив и заплатил каждому игроку по 300 К.", kind: "pay_each" as const, amount: 300 },
+  { desc: "Игрок {name} оплатил коммунальный сбор: по 500 К за каждый свой филиал/отель.", kind: "hotels" as const, amount: 500 },
+  { desc: "Государство выделило субсидию: каждый игрок получает по 700 К.", kind: "mass_gain" as const, amount: 700 },
+  { desc: "Экономический кризис: все игроки теряют по 1 000 К.", kind: "mass_lose" as const, amount: 1000 },
 ] as const;
 
 const CHALLENGE_EVENTS_DATA = [
-  { desc: "Рывок вперёд! Перемещаешься на 3 поля.", steps: 3, forward: true },
-  { desc: "Неудача — откат на 2 поля.", steps: 2, forward: false },
-  { desc: "Попутный ветер — 5 полей вперёд!", steps: 5, forward: true },
-  { desc: "Задержка в пути — 4 поля назад.", steps: 4, forward: false },
-  { desc: "Скоростной старт — 6 полей вперёд!", steps: 6, forward: true },
-  { desc: "Крюк по городу — 3 поля назад.", steps: 3, forward: false },
+  { desc: "Игрок {name} совершил рывок вперёд на 3 поля.", steps: 3, forward: true },
+  { desc: "Игрок {name} потерпел неудачу и откатился на 2 поля назад.", steps: 2, forward: false },
+  { desc: "Игроку {name} подул попутный ветер, он перемещается на 5 полей вперёд.", steps: 5, forward: true },
+  { desc: "Игрок {name} задержался в пути и откатился на 4 поля назад.", steps: 4, forward: false },
+  { desc: "Игрок {name} взял скоростной старт и переместился на 6 полей вперёд.", steps: 6, forward: true },
+  { desc: "Игрок {name} сделал крюк по городу и откатился на 3 поля назад.", steps: 3, forward: false },
+  { desc: "Игрок {name} отправился в срочную командировку на 4 поля вперёд.", steps: 4, forward: true },
+  { desc: "Игрок {name} попал в пробку и вернулся на 2 поля назад.", steps: 2, forward: false },
 ];
 
 const navItems: { id: Tab; label: string; icon: typeof LayoutDashboard }[] = [
@@ -433,8 +530,119 @@ const GROUPS = [
   { name: "Фармацевтика", color: "#4b5563", cells: [37, 38, 39] },
 ] as const;
 
-const getCellGroup = (idx: number) =>
-  GROUPS.find((g) => (g.cells as readonly number[]).includes(idx)) ?? null;
+// Динамические группы, которые учитывают измененные карточки (убираем поля не типа "property")
+const getDynamicGroups = () =>
+  GROUPS.map((group) => ({
+    ...group,
+    cells: (group.cells as readonly number[]).filter((idx) => {
+      const design = globalCardDesigns.find((d) => d.slotIndex === idx);
+      return (design?.type ?? "property") === "property";
+    }),
+  })).filter((group) => group.cells.length > 0);
+
+const getCellGroup = (idx: number) => {  
+const design = globalCardDesigns.find((d) => d.slotIndex === idx);
+  if ((design?.type ?? "property") !== "property") return null;
+  return getDynamicGroups().find((g) => (g.cells as readonly number[]).includes(idx)) ?? null;
+};
+const getCellDimensions = (slotIndex: number) => {
+  const BOARD_REF = 600;
+  const TOTAL_FR = 12.8;
+  const C = Math.round((1.9 / TOTAL_FR) * BOARD_REF);
+  const R = Math.round((1 / TOTAL_FR) * BOARD_REF);
+  const isCorner = [0, 10, 20, 30].includes(slotIndex);
+  const isTopBottom = (slotIndex >= 1 && slotIndex <= 9) || (slotIndex >= 21 && slotIndex <= 29);
+  const isLeftRight = (slotIndex >= 11 && slotIndex <= 19) || (slotIndex >= 31 && slotIndex <= 39);
+  let wPx = C, hPx = C;
+  if (isTopBottom) { wPx = R; hPx = C; }
+  if (isLeftRight) { wPx = C; hPx = R; }
+  const PX_PER_MM = 3.7795;
+  const wMm = Math.round((wPx / PX_PER_MM) * 10) / 10;
+  const hMm = Math.round((hPx / PX_PER_MM) * 10) / 10;
+  return { wPx, hPx, wMm, hMm, isCorner, isTopBottom, isLeftRight };
+};
+
+const cellBgColor = (type: CellType) => {
+  const map: Record<CellType, string> = {
+    start: "#ffffff",
+    gotojail: "#ffffff",
+    jail: "#ffffff",
+    jackpot: "#ffffff",
+    tax: "#ffffff",
+    chance: "#ffffff",
+    challenge: "#ffffff",
+    property: "#fdfaf5",
+  };
+  return map[type] ?? "#fdfaf5";
+};
+
+const getSessionUserId = (): string | null => {
+  try {
+    const raw = localStorage.getItem("arena-session-user");
+    if (!raw || raw === "null") return null;
+    const u = JSON.parse(raw);
+    return u && u.id ? u.id : null;
+  } catch {
+    return null;
+  }
+};
+const getSessionUserName = (): string => {
+  try {
+    const raw = localStorage.getItem("arena-session-user");
+    if (!raw || raw === "null") return "Игрок";
+    const u = JSON.parse(raw);
+    return u && u.name ? u.name : "Игрок";
+  } catch {
+    return "Игрок";
+  }
+};
+const CARD_SIZE_DEFAULTS = {
+  cardWidth: 185,
+  cardHeight: 200,
+  imageHeight: 116,
+  shopScale: 90,
+};
+const findMarketItemForOwned = (ownedItem: any, marketItemsState?: any[]): any => {
+  if (!ownedItem) return null;
+
+  // Источник данных: state (если не пустой) + fallback на localStorage
+  let items: any[] = [];
+  if (Array.isArray(marketItemsState) && marketItemsState.length > 0) {
+    items = marketItemsState;
+  } else {
+    try {
+      const raw = localStorage.getItem("arena-market-items");
+      items = raw ? JSON.parse(raw) : [];
+    } catch {
+      items = [];
+    }
+  }
+  if (!Array.isArray(items) || items.length === 0) return null;
+
+  // 1. По marketItemId
+  if (ownedItem.marketItemId) {
+    const m = items.find((x) => x.id === ownedItem.marketItemId);
+    if (m) return m;
+  }
+  // 2. По slotIndex (для карточек поля)
+  if (ownedItem.slotIndex !== undefined && ownedItem.slotIndex !== null) {
+    const m = items.find(
+      (x) => x.category === "card" && Number(x.slotIndex) === Number(ownedItem.slotIndex)
+    );
+    if (m) return m;
+  }
+  // 3. По имени
+  const byName = items.find((x) => x.name === ownedItem.name);
+  return byName ?? null;
+};
+const getCardSize = (item: any) => {
+  return {
+    cardWidth: item?.cardWidth ?? CARD_SIZE_DEFAULTS.cardWidth,
+    cardHeight: item?.cardHeight ?? CARD_SIZE_DEFAULTS.cardHeight,
+    imageHeight: item?.imageHeight ?? CARD_SIZE_DEFAULTS.imageHeight,
+    shopScale: item?.shopScale ?? CARD_SIZE_DEFAULTS.shopScale,
+  };
+};
 
 // 5 fixed, maximally-distinct player slot colors
 const PLAYER_COLORS = [
@@ -492,8 +700,8 @@ function brightenHex(hex: string): string {
 const initialPlayers: Player[] = [
   {
     id: "you",
-    name: "Лада Север",
-    initials: "ЛС",
+    name: "Игрок",
+    initials: "ИГ",
     color: PLAYER_COLORS[0],
     money: 15000,
     position: 0,
@@ -502,40 +710,7 @@ const initialPlayers: Player[] = [
   },
   ];
 
-const seedFriends = [
-  {
-    id: "MA-8724",
-    name: "Макс Волков",
-    initials: "МВ",
-    color: "#32786d",
-    online: true,
-    status: "В комнате «Пятничный клуб»",
-  },
-  {
-    id: "MA-1108",
-    name: "Вика Рэй",
-    initials: "ВР",
-    color: "#d3a247",
-    online: true,
-    status: "Свободна для игры",
-  },
-  {
-    id: "MA-3901",
-    name: "Рома К.",
-    initials: "РК",
-    color: "#6b5b93",
-    online: false,
-    status: "Был в сети 24 Кин назад",
-  },
-  {
-    id: "MA-6612",
-    name: "Саша Лис",
-    initials: "СЛ",
-    color: "#aa6850",
-    online: true,
-    status: "В Кагазине",
-  },
-];
+
 
 const shopSkins: GameItem[] = [
   {
@@ -623,73 +798,6 @@ const seedListings: Listing[] = [
   },
 ];
 
-const seedLobbyRooms: LobbyRoom[] = [
-  {
-    id: "#A7F3D",
-    name: "Пятничный клуб",
-    host: "Макс Волков",
-    hostId: "max",
-    players: 3,
-    maxPlayers: 4,
-    mode: "Классический",
-    jackpot: true,
-    teleport: true,
-    noRent: false,
-    createdAt: Date.now(),
-  },
-  {
-    id: "#B2K8Q",
-    name: "Только свои",
-    host: "Лада Север",
-    hostId: "you",
-    players: 2,
-    maxPlayers: 4,
-    mode: "2×2",
-    jackpot: true,
-    teleport: false,
-    noRent: false,
-    password: "club",
-  },
-  {
-    id: "#C9M1R",
-    name: "Большая Косква",
-    host: "Илья Н.",
-    hostId: "ilya",
-    players: 5,
-    maxPlayers: 6,
-    mode: "3×3",
-    jackpot: true,
-    teleport: true,
-    noRent: false,
-  },
-  {
-    id: "#D4V6T",
-    name: "После полуночи",
-    host: "Саша Лис",
-    hostId: "sasha",
-    players: 1,
-    maxPlayers: 4,
-    mode: "Классический",
-    jackpot: false,
-    teleport: true,
-    noRent: true,
-    password: "night",
-  },
-];
-
-const seedGlobalChat: GlobalChatMessage[] = [
-  {
-    nickname: "Макс Волков",
-    text: "Сегодня забираю Арбат. Не обижайся.",
-    timestamp: "2026-08-08T20:41:00.000Z",
-  },
-  {
-    nickname: "Лада Север",
-    text: "Сначала догони.",
-    timestamp: "2026-08-08T20:43:00.000Z",
-  },
-];
-
 function useLocalStorage<T>(key: string, initial: T) {
   const [value, setValue] = useState<T>(() => {
     try {
@@ -710,7 +818,68 @@ function useLocalStorage<T>(key: string, initial: T) {
       );
     }
   }, [key, value]);
-  return [value, setValue] as const;
+    return [value, setValue] as const;
+}
+
+// Новый хук для синхронизации с сервером
+function useServerSync<T>(
+  key: string,
+  initial: T,
+  serverEvents: string[],
+  requestEvent?: string
+) {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const saved = localStorage.getItem(key);
+      return saved ? (JSON.parse(saved) as T) : initial;
+    } catch {
+      return initial;
+    }
+  });
+
+  useEffect(() => {
+    if (requestEvent) {
+      socket.emit(requestEvent);
+    }
+
+    const handleServerUpdate = (newValue: T) => {
+  // Защита: если сервер прислал null или undefined, игнорируем
+  if (newValue === null || newValue === undefined) return;
+  setValue(newValue);
+  try {
+    localStorage.setItem(key, JSON.stringify(newValue));
+  } catch (error) {
+    console.error(`Ошибка сохранения (ключ: ${key}):`, error);
+  }
+};
+
+    serverEvents.forEach((event) => {
+      socket.on(event, handleServerUpdate);
+    });
+
+    return () => {
+      serverEvents.forEach((event) => {
+        socket.off(event, handleServerUpdate);
+      });
+    };
+  }, [key, serverEvents.join('|'), requestEvent]);
+
+  const setValueAndSync = (newValue: T | ((prev: T) => T)) => {
+    setValue((prev) => {
+      const next =
+        typeof newValue === 'function'
+          ? (newValue as (prev: T) => T)(prev)
+          : newValue;
+      try {
+        localStorage.setItem(key, JSON.stringify(next));
+      } catch (error) {
+        console.error(`Ошибка сохранения (ключ: ${key}):`, error);
+      }
+      return next;
+    });
+  };
+
+  return [value, setValueAndSync] as const;
 }
 
 function makeAuthUser(
@@ -831,8 +1000,15 @@ function StatTile({
   );
 }
 
+function isVipActive(): boolean {
+  const vipUntil = localStorage.getItem("arena-vip-until");
+  if (!vipUntil) return false;
+  return new Date(vipUntil) > new Date();
+}
+
 function Dashboard({
   onTab,
+  onOpenFriendChat,
   onJoinGame,
   onRequestCreate,
   onRequestFind,
@@ -841,10 +1017,15 @@ function Dashboard({
   onCloseCreate,
   onCloseFind,
   playerName,
-  isAdmin = false, // <--- Добавить эту строку
+  isAdmin = false,
+  player,
+  activeGame,
+  onReconnectGame,
+  onLeaveActiveGame,
 }: {
   onTab: (tab: Tab) => void;
-  onJoinGame: () => void;
+  onOpenFriendChat?: (friend: { id: string; name: string; online: boolean }) => void;
+  onJoinGame: (roomId?: string) => void;
   onRequestCreate: () => void;
   onRequestFind: () => void;
   createOpen: boolean;
@@ -852,18 +1033,20 @@ function Dashboard({
   onCloseCreate: () => void;
   onCloseFind: () => void;
   playerName?: string;
-  isAdmin?: boolean; // <--- Добавить эту строку
+  isAdmin?: boolean;
+  player?: AuthUser | null;
+  activeGame?: { roomId: string; roomName: string; disconnected: boolean } | null;
+  onReconnectGame?: (roomId: string) => void;
+  onLeaveActiveGame?: () => void;
 }) {
-  const [rooms, setRooms] = useLocalStorage<LobbyRoom[]>(
-    "arena-lobby-rooms",
-    seedLobbyRooms,
-  );
-  const [chat, setChat] = useLocalStorage<GlobalChatMessage[]>(
-    "global_chat_messages",
-    seedGlobalChat,
-  );
+    const [rooms, setRooms] = useState<LobbyRoom[]>([]);
+  const [chat, setChat] = useState<GlobalChatMessage[]>([]);
+    const [friends, setFriends] = useState<{ id: string; name: string; online: boolean }[]>([]);
+  const [friendSearchResults, setFriendSearchResults] = useState<{ id: string; name: string; online: boolean }[]>([]);
   const [isSpinning, setIsSpinning] = useState(false);
   const [jailPaymentPending, setJailPaymentPending] = useState(false);
+    type QuestItem = { id: string; title: string; reward: number; icon: string; done: boolean; claimed: boolean };
+  const [quests, setQuests] = useState<QuestItem[]>([]);
   const [roomQuery, setRoomQuery] = useState("");
   const [roomMode, setRoomMode] = useState<"Все" | LobbyMode>("Все");
   const [friendQuery, setFriendQuery] = useState("");
@@ -881,7 +1064,110 @@ function Dashboard({
   const [findMode, setFindMode] = useState<"Все" | LobbyMode>("Все");
   const [findNotice, setFindNotice] = useState("");
   const [lobbyDeletedNotice, setLobbyDeletedNotice] = useState("");
+  const chatContainerRef = useRef<HTMLDivElement>(null);
+  const [userScrolled, setUserScrolled] = useState(false);
+  const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const joinLockRef = useRef(false);
+
+        useEffect(() => {
+    socket.emit('get-rooms');
+    socket.on('update-rooms', (serverRooms: LobbyRoom[]) => { setRooms(serverRooms); });
+    socket.on('chat-message', (msg: GlobalChatMessage) => {
+  setChat(prev => [...prev, msg].slice(-200));
+});
+    
+    // Обработчик запуска игры (теперь ВНУТРИ основного useEffect)
+    socket.on('start-game', (roomData: LobbyRoom) => {
+        console.log("Игра начинается для всех!", roomData);
+        onJoinGame(roomData.id);
+    });
+
+    // Очистка основного useEffect
+    return () => {
+        socket.off('update-rooms');
+        socket.off('chat-message');
+        socket.off('start-game');
+    };
+  }, [onJoinGame]);
+
+    // Ежедневные квесты
+  useEffect(() => {
+    if (!player?.id || player?.guest) return;
+    const fetchQuests = () => {
+      socket.emit('get-quests', player.id, (res: any) => {
+        if (res?.success) setQuests(res.items || []);
+      });
+    };
+    fetchQuests();
+
+    const handleUpdate = (data: any) => {
+      if (!data?.items) return;
+      const items = Object.entries(data.items).map(([id, v]: any) => {
+        const def = {
+          dailyLogin:      { title: 'Заходи каждый день', reward: 50,  icon: '📅' },
+          playGame:        { title: 'Сыграй 1 партию',    reward: 100, icon: '🎲' },
+          winGame:         { title: 'Победи в партии',    reward: 250, icon: '🏆' },
+          buyProperty:     { title: 'Купи 1 поле',        reward: 50,  icon: '🏠' },
+          improveProperty: { title: 'Улучши 1 поле',      reward: 100, icon: '⭐' },
+        }[id as string] || { title: id, reward: 0, icon: '❓' };
+        return { id, ...def, done: v.done, claimed: v.claimed };
+      });
+      setQuests(items);
+    };
+
+    socket.on('quests-updated', handleUpdate);
+    return () => {
+      socket.off('quests-updated', handleUpdate);
+    };
+  }, [player?.id, player?.guest]);
+
+  const claimQuest = (questId: string) => {
+    if (!player?.id) return;
+    socket.emit('claim-quest', { userId: player.id, questId }, (res: any) => {
+      if (res?.success) {
+        // Синхронизируем баланс с localStorage — иначе Shop/Inventory
+        // читают старую сумму, пока не перезайдут на сервер.
+        if (typeof res.coins === "number") {
+          localStorage.setItem("arena-coins", String(res.coins));
+        }
+        setNotice(`Получено ${res.reward} Coins!`);
+        setTimeout(() => setNotice(""), 2500);
+      } else {
+        setNotice(res?.error || 'Не удалось получить награду');
+        setTimeout(() => setNotice(""), 2500);
+      }
+    });
+  };
+
+    // НОВЫЙ ОТДЕЛЬНЫЙ useEffect для друзей (он остаётся снаружи)
+  useEffect(() => {
+    if (!player?.id || player?.guest) return;
+    socket.emit('get-friends', player.id, (response: any) => {
+      if (response?.success) setFriends(response.friends);
+    });
+    // Реальное время: друг зашёл/вышел
+    const handle = ({ userId, online }: { userId: string; online: boolean }) => {
+      setFriends(prev => prev.map(f => f.id === userId ? { ...f, online } : f));
+      setFriendSearchResults(prev => prev.map(f => f.id === userId ? { ...f, online } : f));
+    };
+    socket.on('friend-status-changed', handle);
+    return () => { socket.off('friend-status-changed', handle); };
+  }, [player?.id]);
+
+  // Поиск игроков через сервер (работает, даже если своих друзей нет)
+  useEffect(() => {
+    if (!friendQuery.trim() || !player?.id || player?.guest) {
+      setFriendSearchResults([]);
+      return;
+    }
+    const timeoutId = setTimeout(() => {
+      socket.emit('search-users', friendQuery, (response: any) => {
+        if (response?.success) setFriendSearchResults(response.results);
+      });
+    }, 250);
+    return () => clearTimeout(timeoutId);
+  }, [friendQuery, player?.id]);
 
   // 2.0 lobby timeout: remove rooms older than 3 min with only 1 player (not started)
   useEffect(() => {
@@ -917,7 +1203,7 @@ function Dashboard({
       .includes(roomQuery.toLowerCase());
     return textMatch && (roomMode === "Все" || room.mode === roomMode);
   });
-  const friends = seedFriends.filter((friend) =>
+    const filteredFriends = friends.filter((friend) =>
     `${friend.name} ${friend.id}`
       .toLowerCase()
       .includes(friendQuery.toLowerCase()),
@@ -958,61 +1244,77 @@ function Dashboard({
     }
   }, [createOpen, playerName]);
 
-  const createRoom = (event: FormEvent) => {
+      const createRoom = (event: FormEvent) => {
     event.preventDefault();
     const mode = createMode;
-    const maxPlayers =
+        const maxPlayers =
       mode === "2×2"
         ? 4
-        : mode === "3×3"
-          ? 6
-          : Math.min(5, Math.max(2, createPlayers));
-    const room: LobbyRoom = {
-      id: `#${Math.random().toString(36).slice(2, 7).toUpperCase()}`,
+        : Math.min(5, Math.max(2, createPlayers));
+    const isVip = (() => {
+  const vipUntil = localStorage.getItem("arena-vip-until");
+  return vipUntil ? new Date(vipUntil) > new Date() : false;
+})();
+
+if (!isVip && (mode !== "Классический" || createPassword.trim() !== "")) {
+  setNotice("❌ Без VIP-статуса можно создавать только классические комнаты (2-5 игроков) без пароля.");
+  return;
+}    
+    const roomData = {
       name: createName.trim() || `Комната ${playerName || "Игрока"}`,
       host: playerName || "Гость клуба",
       hostId: playerName || "guest",
-      players: 1,
       maxPlayers,
       mode,
       jackpot: createJackpot,
       teleport: createTeleport,
       noRent: createNoRent,
       password: createPassword.trim() || undefined,
-      createdAt: Date.now(),
     };
-    setRooms([room, ...rooms]);
-    // Сохраняем выбранное количество игроков в локальное хранилище
-    localStorage.setItem("arena-lobby-maxPlayers", String(maxPlayers));
-    setNotice(`Комната «${room.name}» создана. Код ${room.id}`);
-    onCloseCreate();
-  };
+    
+    console.log("🚀 Отправляем запрос на создание комнаты:", roomData);
+    socket.emit('create-room', roomData);
 
-  const joinRoom = (room: LobbyRoom, password = "") => {
+    // Ожидаем ответа от сервера
+        socket.once('room-created', (newRoom: LobbyRoom) => {
+      console.log("✅ Сервер подтвердил создание комнаты:", newRoom);
+      setNotice(`Комната «${newRoom.name}» создана. Код ${newRoom.id}`);
+      onCloseCreate();
+    });
+
+    // Если сервер не ответил за 5 секунд, выдаём ошибку
+    const timeout = setTimeout(() => {
+      setNotice("❌ Ошибка: Сервер не ответил на запрос создания комнаты. Проверьте, запущен ли бэкенд.");
+    }, 5000);
+
+    // Очищаем таймаут, если ответ всё же придёт
+    socket.once('room-created', () => {
+      clearTimeout(timeout);
+    });
+
+    localStorage.setItem("arena-lobby-maxPlayers", String(maxPlayers));
+  };
+  
+        const joinRoom = (room: LobbyRoom, password = "") => {
+    if (joinLockRef.current) return;
     if (room.password && room.password !== password) {
       setNotice("Неверный пароль комнаты.");
       return;
     }
-    if (room.players >= room.maxPlayers) {
-      setNotice("В этой комнате уже нет свободных Кест.");
-      return;
-    }
-    const newRooms = rooms.map((item) =>
-      item.id === room.id ? { ...item, players: item.players + 1 } : item,
-    );
-    setRooms(newRooms);
-    setJoinTarget(null);
-    setJoinPassword("");
-
-    const updatedRoom = newRooms.find((r) => r.id === room.id);
-    if (updatedRoom && updatedRoom.players >= updatedRoom.maxPlayers) {
-      setNotice(`🚀 Комната заполнена! Игра начинается.`);
-      onJoinGame();
-    } else {
+    joinLockRef.current = true;
+    socket.emit('join-room', { roomId: room.id, password, playerName: playerName || "Гость" });
+    socket.once('joined-room', (updatedRoom: LobbyRoom) => {
+      joinLockRef.current = false;
+      setRooms(prev => prev.map(r => r.id === updatedRoom.id ? updatedRoom : r));
+      setJoinTarget(null);
+      setJoinPassword("");
+      // Игра начнётся по событию start-game от сервера, локально не запускаем!
       setNotice(
-        `Ты присоединился к «${room.name}». Ожидаем игроков... (${updatedRoom?.players}/${updatedRoom?.maxPlayers})`,
+        `Ты присоединился к «${updatedRoom.name}». Ожидаем игроков... (${updatedRoom.players}/${updatedRoom.maxPlayers})`,
       );
-    }
+    });
+    // ВАЖНО: Внизу за функцией УБЕРИ дублирующийся setTimeout (оставь только этот!)
+    setTimeout(() => { joinLockRef.current = false; }, 5000);
   };
 
   const findGame = (event: FormEvent) => {
@@ -1035,18 +1337,21 @@ function Dashboard({
     onCloseFind();
   };
 
-  const sendGlobalChat = (event: FormEvent) => {
+    const sendGlobalChat = (event: FormEvent) => {
     event.preventDefault();
     if (!chatText.trim()) return;
-    setChat([
-      ...chat,
-      {
-        nickname: playerName || "Гость клуба",
-        text: chatText.trim(),
-        timestamp: new Date().toISOString(),
-      },
-    ]);
+    socket.emit('chat-message', {
+      nickname: playerName || "Гость клуба",
+      text: chatText.trim(),
+      timestamp: new Date().toISOString(),
+    });
     setChatText("");
+  };
+
+    const refreshRooms = () => {
+    socket.emit('get-rooms');
+    setNotice("Список комнат обновлён");
+    setTimeout(() => setNotice(""), 1500);
   };
 
   return (
@@ -1103,35 +1408,69 @@ function Dashboard({
           <div className="rounded-2xl border border-card-border bg-card p-5">
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="font-display text-xl font-bold">Комнаты</h2>
+                <h2 className="font-display text-xl font-bold">Задания дня</h2>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  {rooms.length} открытых столов
+                  Обновляются каждую полночь (МСК)
                 </p>
               </div>
-              <ArrowRight size={16} className="text-primary" />
+              <Sparkles size={16} className="text-primary" />
             </div>
-            <div className="mt-4 grid grid-cols-3 gap-2 text-center">
-              <div className="rounded-xl bg-muted p-2.5">
-                <div className="font-mono text-lg font-bold">
-                  {rooms.length}
+            {player?.guest ? (
+              <div className="mt-4 rounded-xl border border-dashed border-card-border bg-muted px-4 py-6 text-center">
+                <Coins size={24} className="mx-auto text-muted-foreground" />
+                <div className="mt-2 text-xs font-bold">
+                  Доступно только с аккаунтом
                 </div>
-                <div className="text-[9px] text-muted-foreground">столов</div>
+                <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+                  Зарегистрируйтесь, чтобы получать 50–250 Coins каждый день за простые действия.
+                </p>
               </div>
-              <div className="rounded-xl bg-muted p-2.5">
-                <div className="font-mono text-lg font-bold">
-                  {rooms.filter((r) => r.players < r.maxPlayers).length}
+            ) : (
+            <div className="mt-4 space-y-2">
+              {quests.map((q) => (
+                <div
+                  key={q.id}
+                  className={`flex items-center gap-2.5 rounded-xl border px-3 py-2.5 transition-colors ${
+                    q.claimed
+                      ? "border-accent/30 bg-[#dceae3]/50 opacity-60"
+                      : q.done
+                        ? "border-primary/40 bg-[#f6dfd7]"
+                        : "border-border bg-muted"
+                  }`}
+                >
+                  <span className="shrink-0 text-base">{q.icon}</span>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[11px] font-bold">
+                      {q.title}
+                    </div>
+                    <div className="text-[10px] text-muted-foreground">
+                      {q.claimed ? (
+                        <span className="text-accent font-bold">✓ Получено</span>
+                      ) : (
+                        <>
+                          <Coins size={10} className="mr-0.5 inline text-[#b18428]" />
+                          {q.reward} Coins
+                        </>
+                      )}
+                    </div>
+                  </div>
+                  {q.done && !q.claimed && (
+                    <button
+                      onClick={() => claimQuest(q.id)}
+                      className="shrink-0 rounded-lg bg-primary px-2.5 py-1.5 text-[10px] font-bold text-primary-foreground hover:brightness-95 transition-all"
+                    >
+                      Забрать
+                    </button>
+                  )}
                 </div>
-                <div className="text-[9px] text-muted-foreground">
-                  с местами
+              ))}
+              {quests.length === 0 && (
+                <div className="py-6 text-center text-[11px] text-muted-foreground">
+                  Загрузка заданий…
                 </div>
-              </div>
-              <div className="rounded-xl bg-muted p-2.5">
-                <div className="font-mono text-lg font-bold">47</div>
-                <div className="text-[9px] text-muted-foreground">
-                  мин партия
-                </div>
-              </div>
+              )}
             </div>
+            )}
           </div>
           <div className="rounded-2xl border border-card-border bg-card p-5">
             <div className="flex items-center gap-2">
@@ -1150,133 +1489,149 @@ function Dashboard({
                 className="w-full rounded-xl border border-input bg-background py-2.5 pl-9 pr-3 text-xs outline-none focus:ring-2 focus:ring-primary/30"
               />
             </div>
-            <div className="mt-3 space-y-1">
-              {friends.slice(0, 4).map((f) => (
-                <div
-                  key={f.id}
-                  className="flex items-center gap-2 rounded-lg p-2 hover:bg-muted"
-                >
-                  <div className="relative">
-                    <Avatar initials={f.initials} color={f.color} size="sm" />
-                    <span
-                      className={`absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-card ${f.online ? "bg-accent" : "bg-muted-foreground/40"}`}
-                    />
-                  </div>
-                  <div className="min-w-0">
-                    <div className="truncate text-xs font-bold">{f.name}</div>
-                    <div className="text-[10px] text-muted-foreground">
-                      {f.online ? "В сети" : "Не в сети"}
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div className="rounded-2xl border border-card-border bg-card p-5">
-            <div className="flex items-center justify-between">
-              <h2 className="font-display text-xl font-bold">
-                Последние события
-              </h2>
-              <Bell size={15} className="text-muted-foreground" />
-            </div>
-            <div className="mt-4 space-y-3">
-              {[
-                ["МВ", "Макс Волков", "отправил приглашение", "#32786d"],
-                ["ВР", "Вика Рэй", "открыла кейс «Классика»", "#d3a247"],
-                ["РК", "Рома К.", "поднялся на 2 уровня", "#6b5b93"],
-              ].map(([initials, name, ev, color]) => (
-                <div key={name} className="flex items-center gap-2">
-                  <Avatar initials={initials} color={color} size="sm" />
-                  <div className="min-w-0 text-[11px]">
-                    <div className="truncate">
-                      <b>{name}</b> {ev}
-                    </div>
-                    <div className="mt-0.5 text-[10px] text-muted-foreground">
-                      недавно
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
+                                    <div className="mt-3 space-y-1 max-h-[300px] overflow-y-auto pr-1">
+              {(friendQuery.trim()
+                ? friendSearchResults.filter(r => !friends.some(fr => fr.id === r.id))
+                : friends
+              ).slice(0, 10).map((f: { id: string; name: string; online: boolean }) => {
+                const initials = f.name
+                  .split(/\s+/)
+                  .slice(0, 2)
+                  .map(part => part[0])
+                  .join('')
+                  .toUpperCase();
+                const colorIndex = f.name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0) % PLAYER_COLORS.length;
+                const color = PLAYER_COLORS[colorIndex];
+                const isSearchMode = friendQuery.trim().length > 0;
 
-          {/* === ПЕРЕНЕСЕННЫЙ ЧАТ === */}
-          <div className="rounded-2xl border border-card-border bg-card p-5">
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-4">
-              <div>
-                <div className="flex items-center gap-2">
-                  <MessageCircle size={17} className="text-primary" />
-                  <h2 className="font-display text-xl font-bold">Чат</h2>
-                </div>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  Общий разговор для всех игроков на главной.
-                </p>
-              </div>
-              <span className="rounded-full bg-muted px-2.5 py-1 font-mono text-[10px]">
-                {chat.length} сообщений
-              </span>
-            </div>
-            <div className="grid max-h-[300px] gap-3 overflow-auto py-4 sm:grid-cols-2">
-              {chat.map((message, index) => (
-                <div
-                  key={`${message.timestamp}-${index}`}
-                  className={`flex gap-2 ${message.nickname === playerName ? "sm:col-start-2 sm:justify-end" : ""}`}
-                >
+                return (
                   <div
-                    className={`max-w-[90%] rounded-2xl px-3.5 py-2.5 ${message.nickname === playerName ? "rounded-br-sm bg-primary text-primary-foreground" : "rounded-bl-sm bg-muted"}`}
+                    key={f.id}
+                    className="flex items-center gap-2 rounded-lg p-2 hover:bg-muted"
                   >
-                    <div className="text-[11px] font-bold">
-                      {message.nickname}
+                    <div className="relative shrink-0">
+                      <Avatar initials={initials} color={color} size="sm" />
+                      <span
+                        className={`absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-card ${f.online ? "bg-accent" : "bg-muted-foreground/40"}`}
+                      />
                     </div>
-                    <div className="mt-1 text-xs">{message.text}</div>
-                    <div
-                      className={`mt-1 text-[9px] ${message.nickname === playerName ? "text-white/60" : "text-muted-foreground"}`}
-                    >
-                      {formatChatTime(message.timestamp)}
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-xs font-bold">{f.name}</div>
+                      <div className="text-[10px] text-muted-foreground">
+                        {f.online ? "В сети" : "Не в сети"}
+                      </div>
                     </div>
+                    {isSearchMode ? (
+                      <button
+                        onClick={() => {
+                          if (!player?.id || player?.guest) return;
+                          socket.emit('send-friend-request', { userId: player.id, friendId: f.id }, (res: any) => {
+                            if (res?.success) {
+                              setNotice("Запрос отправлен!");
+                              socket.emit('get-friends', player.id, (r: any) => {
+                                if (r?.success) setFriends(r.friends);
+                              });
+                            } else {
+                              setNotice(res?.error || "Ошибка");
+                            }
+                            setTimeout(() => setNotice(""), 2500);
+                          });
+                        }}
+                        className="shrink-0 rounded-lg bg-secondary px-2.5 py-1.5 text-[10px] font-bold text-secondary-foreground hover:brightness-95"
+                        title="Добавить в друзья"
+                      >
+                        Добавить
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => onOpenFriendChat?.(f)}
+                        className="shrink-0 rounded-lg p-1.5 text-muted-foreground hover:bg-primary/10 hover:text-primary"
+                        title="Открыть чат"
+                      >
+                        <MessageCircle size={14} />
+                      </button>
+                    )}
                   </div>
+                );
+              })}
+              {((friendQuery.trim()
+                ? friendSearchResults.filter(r => !friends.some(fr => fr.id === r.id))
+                : friends
+              ).length === 0) && (
+                <div className="py-4 text-center text-[11px] text-muted-foreground">
+                  {friendQuery.trim() ? "Ничего не найдено" : "У вас пока нет друзей"}
                 </div>
-              ))}
+              )}
             </div>
-            <form
-              onSubmit={sendGlobalChat}
-              className="flex items-end gap-2 border-t border-border pt-4"
-            >
-              <textarea
-                ref={textareaRef}
-                rows={1}
-                value={chatText}
-                onChange={(event) => {
-                  setChatText(event.target.value);
-                  const target = event.target;
-                  target.style.height = "auto";
-                  target.style.height = target.scrollHeight + "px";
-                }}
-                onKeyDown={(event) => {
-                  // Shift+Enter = перенос строки, Enter = отправка
-                  if (event.key === "Enter" && !event.shiftKey) {
-                    event.preventDefault();
-                    const form = event.currentTarget.closest("form");
-                    if (form)
-                      form.dispatchEvent(
-                        new Event("submit", {
-                          cancelable: true,
-                          bubbles: true,
-                        }),
-                      );
-                  }
-                }}
-                placeholder="Напиши что-нибудь..."
-                className="min-w-0 flex-1 rounded-xl border border-input bg-background px-3 py-2 text-sm outline-none resize-none overflow-hidden focus:ring-2 focus:ring-primary/30 min-h-[44px] max-h-[120px]"
-              />
-              <button
-                type="submit"
-                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:brightness-95"
-              >
-                <Send size={17} />
-              </button>
-            </form>
           </div>
+          
+          {/* === ПЕРЕНЕСЕННЫЙ ЧАТ === */}
+<div className="rounded-2xl border border-card-border bg-card p-5">
+  <div className="flex flex-wrap items-center justify-between gap-3 pb-4">
+    <div>
+      <div className="flex items-center gap-2">
+        <MessageCircle size={17} className="text-primary" />
+        <h2 className="font-display text-xl font-bold">Чат</h2>
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Общий разговор для всех игроков на главной.
+      </p>
+    </div>
+    <span className="rounded-full bg-[#e96852] px-2.5 py-1 font-mono text-[10px] text-white">
+      {chat.length} сообщений
+    </span>
+  </div>
+    <div className="flex flex-col min-h-[250px] max-h-[360px] gap-2 overflow-x-hidden overflow-y-auto rounded-xl bg-[#f1eadc] p-3 [&::-webkit-scrollbar]:hidden" style={{ scrollbarWidth: "none" }}>
+    {chat.map((message, index) => (
+      <div
+        key={`${message.timestamp}-${index}`}
+        className={`flex w-full items-start ${message.nickname === playerName ? "justify-end" : "justify-start"}`}
+      >
+        <div className="group relative max-w-[80%] break-words rounded-2xl bg-[#e96852] px-3.5 py-2.5 text-white">
+          <div className="text-[11px] font-bold">{message.nickname}</div>
+          <div className="mt-1 text-xs">{message.text}</div>
+        </div>
+      </div>
+    ))}
+  </div>
+      <form
+    onSubmit={sendGlobalChat}
+    className="mt-3 flex items-end gap-2"
+  >
+    <textarea
+      ref={textareaRef}
+      rows={1}
+      value={chatText}
+      onChange={(event) => {
+        setChatText(event.target.value);
+        const target = event.target;
+        target.style.height = "auto";
+        target.style.height = target.scrollHeight + "px";
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          const form = event.currentTarget.closest("form");
+          if (form)
+            form.dispatchEvent(
+              new Event("submit", {
+                cancelable: true,
+                bubbles: true,
+              }),
+            );
+        }
+      }}
+      placeholder="Напиши что-нибудь..."
+       className="min-w-0 flex-1 rounded-xl border border-input bg-[#f1eadc] px-3 py-2 text-sm outline-none resize-none overflow-hidden focus:ring-2 focus:ring-primary/30 min-h-[44px] max-h-[120px]"
+    />
+    <button
+      type="submit"
+      className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:brightness-95"
+    >
+      <Send size={17} />
+    </button>
+  </form>
+</div>
           {/* === КОНЕЦ ПЕРЕНЕСЕННОГО ЧАТА === */}
         </div>
 
@@ -1311,18 +1666,30 @@ function Dashboard({
                 className="w-full rounded-xl border border-input bg-card py-2.5 pl-9 pr-3 text-sm outline-none focus:ring-2 focus:ring-primary/30"
               />
             </div>
-            <select
-              value={roomMode}
-              onChange={(ev) =>
-                setRoomMode(ev.target.value as "Все" | LobbyMode)
-              }
-              className="rounded-xl border border-input bg-card px-3 py-2.5 text-sm outline-none"
+                             <div className="relative shrink-0">
+                            <select
+                value={roomMode}
+                onChange={(ev) =>
+                  setRoomMode(ev.target.value as "Все" | LobbyMode)
+                }
+                className="w-fit appearance-none rounded-xl border border-input bg-card py-2.5 pl-3 pr-8 text-sm outline-none"
+              >
+                <option>Все</option>
+                <option>Классический</option>
+                <option>2×2</option>
+              </select>
+              <ChevronDown
+                size={14}
+                className="pointer-events-none absolute right-[11px] top-1/2 -translate-y-1/2 text-muted-foreground"
+              />
+            </div>
+            <button
+              onClick={refreshRooms}
+              className="flex items-center justify-center rounded-xl border border-input bg-card px-3 py-2.5 text-sm hover:bg-muted"
+              title="Обновить список комнат"
             >
-              <option>Все</option>
-              <option>Классический</option>
-              <option>2×2</option>
-              <option>3×3</option>
-            </select>
+              <RefreshCw size={15} />
+            </button>
             <button
               onClick={onRequestCreate}
               className="flex items-center justify-center gap-1.5 rounded-xl bg-primary px-4 py-2.5 text-xs font-bold text-primary-foreground"
@@ -1351,6 +1718,36 @@ function Dashboard({
               </button>
             </div>
           )}
+          {activeGame && (
+            <div className="mb-4 flex flex-wrap items-center gap-3 rounded-2xl border-2 border-primary/40 bg-[#f6dfd7] p-4">
+              <div className="flex-1 min-w-[200px]">
+                <div className="font-mono text-[10px] uppercase tracking-widest text-primary">
+                  Незавершённая партия
+                </div>
+                <div className="mt-1 font-display text-lg font-bold">
+                  {activeGame.roomName}
+                </div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  Вы находитесь за столом. Переподключитесь, чтобы продолжить, или покиньте игру.
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => onReconnectGame?.(activeGame.roomId)}
+                  className="rounded-xl bg-primary px-4 py-2.5 text-xs font-bold text-primary-foreground hover:brightness-95"
+                >
+                  Переподключиться
+                </button>
+                <button
+                  onClick={() => onLeaveActiveGame?.()}
+                  className="rounded-xl border border-input bg-card px-4 py-2.5 text-xs font-bold text-muted-foreground hover:bg-muted"
+                >
+                  Покинуть игру
+                </button>
+              </div>
+            </div>
+          )}
+
           <div className="space-y-3">
             {filteredRooms.map((room, index) => (
               <div
@@ -1386,7 +1783,7 @@ function Dashboard({
                   </span>
                 </div>
                 <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
-                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                                    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                     <span className="flex items-center gap-1">
                       <Users size={13} />
                       {room.players} / {room.maxPlayers}
@@ -1402,50 +1799,66 @@ function Dashboard({
                         {feature}
                       </span>
                     ))}
+                    {(room.playerNames ?? []).map((name, nIdx) => (
+                      <span
+                        key={`${name}-${nIdx}`}
+                        className="rounded-md bg-[#e5def0] px-2 py-1 text-[10px] font-bold text-[#655384]"
+                        title="Игрок в лобби"
+                      >
+                        {name}
+                      </span>
+                    ))}
                   </div>
                   <div className="flex items-center gap-2">
-                    {(isAdmin || room.hostId === playerName) && (
+                    {(isAdmin || room.host === playerName) && (
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
                           if (confirm(`Удалить лобби "${room.name}"?`)) {
-                            setRooms((prev) =>
-                              prev.filter((r) => r.id !== room.id),
-                            );
+                            socket.emit('delete-room', room.id);
                           }
                         }}
-                        className="rounded-lg p-2 text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-500"
-                        title={
-                          isAdmin
-                            ? "Удалить лобби (Админ)"
-                            : "Удалить мое лобби"
-                        }
+                        className="rounded-lg border border-primary/30 bg-[#f6dfd7] p-2 text-primary transition-colors hover:bg-[#efcec2]"
+                        title={isAdmin ? "Удалить лобби (Админ)" : "Удалить моё лобби"}
                       >
                         <Trash2 size={15} />
                       </button>
                     )}
-                    <button
-                      onClick={() =>
-                        room.password ? setJoinTarget(room) : joinRoom(room)
-                      }
-                      disabled={room.players >= room.maxPlayers}
-                      className="rounded-lg bg-secondary px-4 py-2 text-xs font-bold text-secondary-foreground disabled:cursor-not-allowed disabled:opacity-45"
-                    >
-                      {room.players >= room.maxPlayers
-                        ? "Нет мест"
-                        : "Присоединиться"}
-                    </button>
+                    {room.host === playerName ? (
+                      <span className="rounded-lg bg-muted px-4 py-2 text-xs font-bold text-muted-foreground">
+                        Ваше лобби
+                      </span>
+                    ) : (
+                      <button
+                        onClick={() =>
+                          room.password ? setJoinTarget(room) : joinRoom(room)
+                        }
+                        disabled={room.players >= room.maxPlayers}
+                        className="rounded-lg bg-secondary px-4 py-2 text-xs font-bold text-secondary-foreground disabled:cursor-not-allowed disabled:opacity-45"
+                      >
+                        {room.players >= room.maxPlayers
+                          ? "Нет мест"
+                          : "Присоединиться"}
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
             ))}
-            {filteredRooms.length === 0 && (
+                       {filteredRooms.length === 0 && (
               <div className="rounded-2xl border border-dashed border-card-border bg-card p-12 text-center">
                 <DoorOpen size={28} className="mx-auto text-muted-foreground" />
                 <h3 className="mt-3 font-bold">Комнаты не найдены</h3>
                 <p className="mt-1 text-sm text-muted-foreground">
                   Измени фильтр или создай новый стол.
                 </p>
+                <button
+                  onClick={refreshRooms}
+                  className="mx-auto mt-4 flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-xs font-bold text-primary-foreground hover:brightness-95"
+                >
+                  <RefreshCw size={14} />
+                  Обновить список
+                </button>
               </div>
             )}
           </div>
@@ -1488,20 +1901,24 @@ function Dashboard({
               />
             </label>
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
-              <label className="text-xs font-bold">
-                Режим игры
-                <select
-                  value={createMode}
-                  onChange={(event) =>
-                    setCreateMode(event.target.value as LobbyMode)
+              <select
+                value={createMode}
+                onChange={(event) => {
+                  const val = event.target.value as LobbyMode;
+                  if (val === "2×2" && !isVipActive()) {
+                    setNotice("❌ Режим 2×2 доступен только с VIP-статусом.");
+                    setTimeout(() => setNotice(""), 10000);
+                    return;
                   }
-                  className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
-                >
-                  <option>Классический</option>
-                  <option>2×2</option>
-                  <option>3×3</option>
-                </select>
-              </label>
+                  setCreateMode(val);
+                }}
+                className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
+              >
+                <option>Классический</option>
+                <option disabled={!isVipActive()}>
+                  {isVipActive() ? "2×2" : "2×2 (только VIP)"}
+                </option>
+              </select>
               <label className="text-xs font-bold">
                 Количество игроков
                 <select
@@ -1546,18 +1963,29 @@ function Dashboard({
               </div>
             </div>
             <label className="mt-4 block text-xs font-bold">
-              Пароль{" "}
-              <span className="font-normal text-muted-foreground">
-                (опционально)
-              </span>
-              <input
-                type="password"
-                value={createPassword}
-                onChange={(event) => setCreatePassword(event.target.value)}
-                placeholder="Оставь пустым для открытой комнаты"
-                className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
-              />
-            </label>
+  Пароль{" "}
+  <span className="font-normal text-muted-foreground">
+    (опционально)
+  </span>
+  {!isVipActive() ? (
+    <input
+      type="password"
+      value={createPassword}
+      onChange={(event) => setCreatePassword(event.target.value)}
+      placeholder="Доступно только VIP"
+      disabled
+      className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal opacity-50 cursor-not-allowed"
+    />
+  ) : (
+    <input
+      type="password"
+      value={createPassword}
+      onChange={(event) => setCreatePassword(event.target.value)}
+      placeholder="Оставь пустым для открытой комнаты"
+      className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
+    />
+  )}
+</label>
             <div className="mt-6 flex justify-end gap-2">
               <button
                 type="button"
@@ -1600,7 +2028,7 @@ function Dashboard({
               </button>
             </div>
             <div className="mt-5 space-y-2">
-              {(["Все", "Классический", "2×2", "3×3"] as const).map((mode) => (
+               {(["Все", "Классический", "2×2"] as const).map((mode) => (
                 <label
                   key={mode}
                   className={`flex cursor-pointer items-center gap-3 rounded-xl border p-3 text-sm font-bold ${findMode === mode ? "border-primary bg-[#f6dfd7]" : "border-input"}`}
@@ -1728,7 +2156,7 @@ function Rooms({
     },
     {
       title: "Только свои",
-      host: "Лада Север",
+       host: "Игрок",
       players: "2 / 4",
       mode: "2 × 2",
       locked: true,
@@ -1798,7 +2226,6 @@ function Rooms({
           <option>Все режимы</option>
           <option>Классика</option>
           <option>2 × 2</option>
-          <option>3 × 3</option>
         </select>
       </div>
       {created && (
@@ -1885,76 +2312,83 @@ function Rooms({
   );
 }
 
-function ChatPanel({ title = "Чат клуба" }: { title?: string }) {
-  const [friends] = useLocalStorage("arena-friends", seedFriends);
-  const [recipient, setRecipient] = useState("all");
+function ChatPanel({
+  targetFriend,
+  onClose,
+  currentUserName,
+}: {
+  targetFriend: { id: string; name: string; online: boolean };
+  onClose: () => void;
+  currentUserName: string;
+}) {
+    const storageKey = `arena-chat-${targetFriend.id}`;
   const [message, setMessage] = useState("");
-  const [messages, setMessages] = useLocalStorage<ChatMessage[]>("arena-chat", [
-    {
-      from: "Макс Волков",
-      text: "Сегодня забираю Арбат. Не обижайся.",
-      time: "20:41",
-      recipient: "all",
-    },
-    {
-      from: "Лада Север",
-      text: "Сначала догони.",
-      time: "20:43",
-      recipient: "all",
-    },
-  ]);
+  const [messages, setMessages] = useLocalStorage<ChatMessage[]>(storageKey, []);
+
+  // Автоочистка: удаляем сообщения старше 24 часов при открытии чата
+  useEffect(() => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const fresh = messages.filter((m) => !m.timestamp || now - m.timestamp < DAY_MS);
+    if (fresh.length !== messages.length) {
+      setMessages(fresh);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetFriend.id]);
+
   const send = (e: FormEvent) => {
     e.preventDefault();
     if (!message.trim()) return;
-    setMessages([
+        setMessages([
       ...messages,
       {
-        from: "Лада Север",
+        from: currentUserName,
         text: message.trim(),
-        time: new Date().toLocaleTimeString("ru-RU", {
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-        recipient,
+        time: new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }),
+        timestamp: Date.now(),
+        recipient: targetFriend.id,
       },
     ]);
     setMessage("");
   };
+
   return (
     <div className="flex min-h-[440px] flex-col rounded-2xl border border-card-border bg-card p-5">
       <div className="flex items-center justify-between border-b border-border pb-4">
         <div className="flex items-center gap-2">
           <MessageCircle size={17} className="text-primary" />
-          <h2 className="font-display text-xl font-bold">{title}</h2>
+          <div>
+            <h2 className="font-display text-xl font-bold">Чат с {targetFriend.name}</h2>
+            <div className="mt-0.5 text-[11px] text-muted-foreground">
+              {targetFriend.online ? "В сети" : "Не в сети"}
+            </div>
+          </div>
         </div>
-        <select
-          value={recipient}
-          onChange={(e) => setRecipient(e.target.value)}
-          className="max-w-[125px] rounded-lg border border-input bg-background px-2 py-1.5 text-[11px]"
+        <button
+          onClick={onClose}
+          className="rounded-lg p-1.5 text-muted-foreground hover:bg-muted"
+          title="Закрыть чат"
         >
-          <option value="all">Всем игрокам</option>
-          {friends.map((f) => (
-            <option key={f.id} value={f.id}>
-              {f.name}
-            </option>
-          ))}
-        </select>
+          <X size={16} />
+        </button>
       </div>
       <div className="flex-1 space-y-3 overflow-auto py-5">
+        {messages.length === 0 && (
+          <div className="text-center text-sm text-muted-foreground">
+            Нет сообщений. Напиши первым!
+          </div>
+        )}
         {messages.map((m, i) => (
           <div
             key={`${m.time}-${i}`}
-            className={`flex ${m.from === "Лада Север" ? "justify-end" : "justify-start"}`}
+            className={`flex ${m.from === currentUserName ? "justify-end" : "justify-start"}`}
           >
             <div
-              className={`max-w-[75%] rounded-2xl px-3.5 py-2.5 text-sm ${m.from === "Лада Север" ? "rounded-br-sm bg-primary text-primary-foreground" : "rounded-bl-sm bg-muted text-foreground"}`}
+              className={`max-w-[75%] rounded-2xl px-3.5 py-2.5 text-sm ${m.from === currentUserName ? "rounded-br-sm bg-primary text-primary-foreground" : "rounded-bl-sm bg-muted text-foreground"}`}
             >
               <div>{m.text}</div>
-              <div
-                className={`mt-1 text-[9px] ${m.from === "Лада Север" ? "text-white/65" : "text-muted-foreground"}`}
-              >
+              <div className={`mt-1 text-[9px] ${m.from === currentUserName ? "text-white/65" : "text-muted-foreground"}`}>
                 {m.time}
-                {m.recipient !== "all" && " · лично"}
               </div>
             </div>
           </div>
@@ -1964,7 +2398,7 @@ function ChatPanel({ title = "Чат клуба" }: { title?: string }) {
         <input
           value={message}
           onChange={(e) => setMessage(e.target.value)}
-          placeholder="Напиши что-нибудь..."
+          placeholder={`Написать ${targetFriend.name}...`}
           className="min-w-0 flex-1 rounded-xl border border-input bg-background px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-primary/30"
         />
         <button
@@ -1978,147 +2412,399 @@ function ChatPanel({ title = "Чат клуба" }: { title?: string }) {
   );
 }
 
-function Friends() {
-  const [friends] = useLocalStorage("arena-friends", seedFriends);
+function Friends({ 
+  player,
+  pendingChatFriend,
+  onPendingChatConsumed,
+}: { 
+  player?: AuthUser | null;
+  pendingChatFriend?: { id: string; name: string; online: boolean } | null;
+  onPendingChatConsumed?: () => void;
+}) {
+  const isGuest = player?.guest;
+   const [friends, setFriends] = useState<{ id: string; name: string; online: boolean }[]>([]);
+  const [friendRequests, setFriendRequests] = useState<{ fromId: string; fromName: string; timestamp: number; fromOnline: boolean }[]>([]);
+  const [activeSubTab, setActiveSubTab] = useState<"friends" | "requests">("friends");
   const [search, setSearch] = useState("");
-  const matches = friends.filter((f) =>
-    `${f.name} ${f.id}`.toLowerCase().includes(search.toLowerCase()),
-  );
+  const [searchResults, setSearchResults] = useState<{ id: string; name: string; online: boolean }[]>([]);
+  const [notice, setNotice] = useState("");
+  const [chatFriend, setChatFriend] = useState<{ id: string; name: string; online: boolean } | null>(null);
+  const userId = player?.id;
+    // Автооткрытие чата, если перешли с главной страницы
+  useEffect(() => {
+    if (pendingChatFriend) {
+      setChatFriend(pendingChatFriend);
+      onPendingChatConsumed?.();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingChatFriend]);
+
+    useEffect(() => {
+    if (!userId || isGuest) return;
+    socket.emit('get-friends', userId, (response: any) => {
+      if (response?.success) setFriends(response.friends);
+    });
+    socket.emit('get-friend-requests', userId, (response: any) => {
+      if (response?.success) setFriendRequests(response.requests || []);
+    });
+    // Реальное время: друг зашёл/вышел
+    const handle = ({ userId: changedId, online }: { userId: string; online: boolean }) => {
+      setFriends(prev => prev.map(f => f.id === changedId ? { ...f, online } : f));
+      setSearchResults(prev => prev.map(f => f.id === changedId ? { ...f, online } : f));
+    };
+    socket.on('friend-status-changed', handle);
+    return () => { socket.off('friend-status-changed', handle); };
+  }, [userId, isGuest]);
+
+  const handleSearch = (query: string) => {
+    setSearch(query);
+    if (query.length < 1 || isGuest) return;
+    socket.emit('search-users', query, (response: any) => {
+      if (response?.success) setSearchResults(response.results);
+    });
+  };
+
+    const addFriend = (friendId: string) => {
+    if (!userId || isGuest) return;
+    socket.emit('send-friend-request', { userId, friendId }, (response: any) => {
+      if (response?.success) {
+        setNotice(response.autoAccepted ? "Взаимный запрос — вы теперь друзья!" : "Запрос в друзья отправлен!");
+        socket.emit('get-friends', userId, (res: any) => {
+          if (res?.success) setFriends(res.friends);
+        });
+      } else {
+        setNotice(response?.error || "Ошибка");
+      }
+      setTimeout(() => setNotice(""), 3000);
+    });
+  };
+
+  const acceptRequest = (fromId: string) => {
+    if (!userId || isGuest) return;
+    socket.emit('accept-friend-request', { userId, fromId }, (response: any) => {
+      if (response?.success) {
+        setNotice("Запрос принят!");
+        setFriendRequests(prev => prev.filter(r => r.fromId !== fromId));
+        socket.emit('get-friends', userId, (res: any) => {
+          if (res?.success) setFriends(res.friends);
+        });
+      } else {
+        setNotice(response?.error || "Ошибка");
+      }
+      setTimeout(() => setNotice(""), 3000);
+    });
+  };
+
+  const declineRequest = (fromId: string) => {
+    if (!userId || isGuest) return;
+    socket.emit('decline-friend-request', { userId, fromId }, (response: any) => {
+      if (response?.success) {
+        setFriendRequests(prev => prev.filter(r => r.fromId !== fromId));
+      }
+    });
+  };
+
+  const removeFriend = (friendId: string) => {
+    if (!userId || isGuest) return;
+    socket.emit('remove-friend', { userId, friendId }, (response: any) => {
+      if (response?.success) {
+        setFriends(prev => prev.filter(f => f.id !== friendId));
+        setNotice("Друг удален");
+        setTimeout(() => setNotice(""), 3000);
+      }
+    });
+  };
+
+  const matches = friends.filter((f) => `${f.name} ${f.id}`.toLowerCase().includes(search.toLowerCase()));
+
   return (
     <div className="animate-rise">
       <SectionHeading
         eyebrow="социальный клуб"
         title="Друзья"
-        detail="Собери состав, который знает твои слабые Кеста."
+        detail="Собери состав, который знает твои слабые места."
       />
+      {notice && (
+        <div className="mb-4 rounded-xl bg-[#dceae3] px-4 py-3 text-sm font-medium text-accent">
+          {notice}
+        </div>
+      )}
       <div className="grid gap-6 xl:grid-cols-[.9fr_1.1fr]">
         <div className="rounded-2xl border border-card-border bg-card p-5">
-          <div className="relative">
-            <Search
-              size={16}
-              className="absolute left-3 top-3 text-muted-foreground"
-            />
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="ID или никнейм игрока"
-              className="w-full rounded-xl border border-input bg-background py-2.5 pl-9 pr-3 text-sm outline-none focus:ring-2 focus:ring-primary/30"
-            />
-          </div>
-          <div className="mt-5 flex items-center justify-between">
-            <h2 className="font-display text-xl font-bold">Твои игроки</h2>
-            <span className="rounded-full bg-muted px-2 py-1 font-mono text-[10px]">
-              {friends.length} / 50
-            </span>
-          </div>
-          <div className="mt-3 space-y-2">
-            {matches.map((friend) => (
-              <div
-                key={friend.id}
-                className="flex items-center gap-3 rounded-xl p-2.5 transition hover:bg-muted"
-              >
-                <div className="relative">
-                  <Avatar
-                    initials={friend.initials}
-                    color={friend.color}
-                    size="sm"
-                  />
-                  {friend.online && (
-                    <span className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-card bg-accent" />
-                  )}
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex justify-between gap-2">
-                    <b className="truncate text-sm">{friend.name}</b>
-                    <MessageCircle
-                      size={16}
-                      className="text-muted-foreground"
-                    />
-                  </div>
-                  <div className="truncate text-[11px] text-muted-foreground">
-                    {friend.id} · {friend.status}
-                  </div>
-                </div>
+          {isGuest ? (
+            <div className="py-12 text-center text-sm text-muted-foreground">
+              Войдите в аккаунт, чтобы использовать друзей.
+            </div>
+          ) : (
+            <>
+              <div className="relative">
+                <Search size={16} className="absolute left-3 top-3 text-muted-foreground" />
+                <input
+                  value={search}
+                  onChange={(e) => handleSearch(e.target.value)}
+                  placeholder="ID или никнейм игрока"
+                  className="w-full rounded-xl border border-input bg-background py-2.5 pl-9 pr-3 text-sm outline-none focus:ring-2 focus:ring-primary/30"
+                />
               </div>
-            ))}
-          </div>
-          <button
-            onClick={() => setSearch("MA-")}
-            className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-input py-3 text-xs font-bold text-primary"
-          >
-            <Plus size={15} /> Добавить по ID
-          </button>
+              
+              {search && searchResults.length > 0 && (
+                <div className="mt-4 space-y-2 border-b border-border pb-4">
+                  <div className="text-xs font-bold text-muted-foreground uppercase tracking-wide">Результаты поиска</div>
+                  {searchResults.filter(r => !friends.some(f => f.id === r.id)).map(r => (
+                    <div key={r.id} className="flex items-center gap-3 rounded-xl p-2.5 transition hover:bg-muted">
+                      <Avatar initials={r.name[0]} color="#32786d" size="sm" />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-bold">{r.name}</div>
+                        <div className="truncate text-[11px] text-muted-foreground">{r.id} · {r.online ? 'В сети' : 'Не в сети'}</div>
+                      </div>
+                      <button onClick={() => addFriend(r.id)} className="rounded-lg bg-secondary px-3 py-2 text-xs font-bold text-secondary-foreground">
+                        Добавить
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+                            <div className="mt-5 flex gap-1 rounded-xl bg-muted p-1 w-fit">
+                <button
+                  onClick={() => setActiveSubTab("friends")}
+                  className={`rounded-lg px-3 py-1.5 text-xs font-bold transition-colors ${activeSubTab === "friends" ? "bg-card shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                >
+                  Друзья ({friends.length})
+                </button>
+                <button
+                  onClick={() => setActiveSubTab("requests")}
+                  className={`relative rounded-lg px-3 py-1.5 text-xs font-bold transition-colors ${activeSubTab === "requests" ? "bg-card shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                >
+                  Запросы
+                  {friendRequests.length > 0 && (
+                    <span className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-white">
+                      {friendRequests.length}
+                    </span>
+                  )}
+                </button>
+              </div>
+
+                            {activeSubTab === "friends" && (
+              <div className="mt-3 space-y-2">
+                {matches.map((friend) => {
+                  const initials = friend.name.split(/\s+/).slice(0, 2).map(p => p[0]).join('').toUpperCase();
+                  const colorIndex = friend.name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0) % PLAYER_COLORS.length;
+                  const color = PLAYER_COLORS[colorIndex];
+                  return (
+                    <div key={friend.id} className="flex items-center gap-3 rounded-xl p-2.5 transition hover:bg-muted">
+                      <div className="relative">
+                        <Avatar initials={initials} color={color} size="sm" />
+                        {friend.online && <span className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-card bg-accent" />}
+                      </div>
+                                            <div className="min-w-0 flex-1">
+                        <div className="flex justify-between gap-2">
+                          <b className="truncate text-sm">{friend.name}</b>
+                          <button
+                            onClick={() => setChatFriend(friend)}
+                            className={`rounded-lg p-1 transition-colors ${chatFriend?.id === friend.id ? "bg-primary text-white" : "text-muted-foreground hover:bg-primary/10 hover:text-primary"}`}
+                            title="Открыть чат"
+                          >
+                            <MessageCircle size={16} />
+                          </button>
+                        </div>
+                        <div className="truncate text-[11px] text-muted-foreground">
+                          {friend.id} · {friend.online ? 'В сети' : 'Не в сети'}
+                        </div>
+                      </div>
+                      <button onClick={() => removeFriend(friend.id)} className="rounded-lg p-2 text-muted-foreground hover:bg-red-50 hover:text-red-500" title="Удалить">
+                        <Trash2 size={15} />
+                      </button>
+                    </div>
+                  );
+                })}
+                                {matches.length === 0 && <div className="py-6 text-center text-sm text-muted-foreground">Друзей пока нет. Найди их по ID.</div>}
+              </div>
+              )}
+
+              {activeSubTab === "requests" && (
+              <div className="mt-3 space-y-2">
+                {friendRequests.length === 0 && (
+                  <div className="py-6 text-center text-sm text-muted-foreground">Нет входящих запросов</div>
+                )}
+                {friendRequests.map((req) => {
+                  const initials = req.fromName.split(/\s+/).slice(0, 2).map(p => p[0]).join('').toUpperCase();
+                  const colorIndex = req.fromName.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0) % PLAYER_COLORS.length;
+                  const color = PLAYER_COLORS[colorIndex];
+                  return (
+                    <div key={req.fromId} className="flex items-center gap-3 rounded-xl p-2.5 transition hover:bg-muted">
+                      <div className="relative">
+                        <Avatar initials={initials} color={color} size="sm" />
+                        {req.fromOnline && <span className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-card bg-accent" />}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <b className="truncate text-sm">{req.fromName}</b>
+                        <div className="truncate text-[11px] text-muted-foreground">
+                          {req.fromId} · {req.fromOnline ? 'В сети' : 'Не в сети'}
+                        </div>
+                      </div>
+                      <div className="flex gap-1.5">
+                        <button
+                          onClick={() => acceptRequest(req.fromId)}
+                          className="rounded-lg bg-[#dceae3] px-3 py-1.5 text-xs font-bold text-accent hover:bg-[#c8dfd3]"
+                        >
+                          Принять
+                        </button>
+                        <button
+                          onClick={() => declineRequest(req.fromId)}
+                          className="rounded-lg bg-[#f6dfd7] px-3 py-1.5 text-xs font-bold text-primary hover:bg-[#efcec2]"
+                        >
+                          Отклонить
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              )}
+            </>
+          )}
         </div>
-        <ChatPanel title="Чат лобби" />
+                        {chatFriend ? (
+          <ChatPanel
+            key={chatFriend.id}
+            targetFriend={chatFriend}
+            onClose={() => setChatFriend(null)}
+            currentUserName={player?.name || "Игрок"}
+          />
+        ) : (
+          <div className="flex min-h-[440px] flex-col items-center justify-center rounded-2xl border border-dashed border-card-border bg-card p-5 text-center">
+            <MessageCircle size={40} className="text-muted-foreground/40" />
+            <p className="mt-3 text-sm font-bold text-muted-foreground">Выбери друга для начала чата</p>
+            <p className="mt-1 text-xs text-muted-foreground/70">Нажми на иконку чата рядом с именем друга слева</p>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
 function Shop() {
+  const player = (() => {
+    try {
+      const raw = localStorage.getItem("arena-session-user");
+      return raw && raw !== "null" ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  })();
+  const isGuest = !!player?.guest;
   const [coins, setCoins] = useLocalStorage("arena-coins", 2400);
-  const [inventory, setInventory] = useLocalStorage<OwnedItem[]>(
-    "arena-inventory",
-    seedInventory,
-  );
-  const [section, setSection] = useState<"cases" | "skins">("cases");
-  const [notice, setNotice] = useState("");
-  const cases = [
-    {
-      name: "Классика",
-      desc: "Случайный токен или кубики",
-      price: 300,
-      color: "#e96852",
-      icon: Package,
-    },
-    {
-      name: "Ночной рейс",
-      desc: "Редкий городской предмет",
-      price: 650,
-      color: "#5d4c83",
-      icon: Gift,
-    },
-    {
-      name: "Большая ставка",
-      desc: "Шанс на легендарный предмет",
-      price: 1200,
-      color: "#d3a247",
-      icon: Crown,
-    },
-  ];
-  const buySkin = (item: GameItem) => {
-    if (coins < item.price) {
-      setNotice("Не хватает Coins — загляни в ежедневный бонус.");
-      return;
-    }
-    setCoins(coins - item.price);
-    setInventory([
-      ...inventory,
-      {
-        ...item,
-        id: `${item.id}-${Date.now()}`,
-        ownedAt: new Date().toISOString(),
-      },
-    ]);
-    setNotice(`«${item.name}» добавлен в инвентарь.`);
-  };
+  const [inventory, setInventory] = useServerSync<OwnedItem[]>("arena-inventory", [], ['user-inventory-updated'], 'get-user-inventory');
+  const [marketItems] = useServerSync<MarketItem[]>("arena-market-items", [], ['custom-items-updated'], 'get-custom-items');
+  const [section, setSection] = useState<"cases" | "cards">("cases");  const [notice, setNotice] = useState("");
+  const [adminCases] = useServerSync<CaseDesign[]>("arena-admin-cases", [], ['admin-cases-updated'], 'get-admin-cases');
+const safeAdminCases = Array.isArray(adminCases) ? adminCases.filter((c): c is CaseDesign => c !== null && c !== undefined && c.isActive !== false) : [];
+const cases: CaseDesign[] = safeAdminCases;
+const vipItems = marketItems.filter(i => i.isActive && i.category === "vip");
   const buyCase = (name: string, price: number) => {
-    if (coins < price) {
-      setNotice("Не хватает Coins — загляни в ежедневный бонус.");
-      return;
-    }
-    const drop = shopSkins[Math.floor(Math.random() * shopSkins.length)];
-    setCoins(coins - price);
-    setInventory([
-      ...inventory,
-      {
-        ...drop,
-        id: `${drop.id}-${Date.now()}`,
-        ownedAt: new Date().toISOString(),
-      },
-    ]);
-    setNotice(`Кейс «${name}» открыт: получен предмет «${drop.name}».`);
-  };
+  if (coins < price) {
+    setNotice("Не хватает Coins — загляни в ежедневный бонус.");
+    return;
+  }
+
+  // Находим кейс
+  const selectedCase = cases.find(c => c.name === name);
+  if (!selectedCase) return;
+
+  // Создаём объект кейса как предмет в инвентаре
+    const caseItem: OwnedItem = {
+    id: `case-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: selectedCase.name,
+    type: "board",
+    rarity: "Кейс",
+    color: selectedCase.color || "#29233e",
+    price: price,
+    description: selectedCase.desc || "Кейс с предметами",
+    ownedAt: new Date().toISOString(),
+    imageDataUrl: selectedCase.imageDataUrl,
+    cardWidth: selectedCase.cardWidth,
+    cardHeight: selectedCase.cardHeight,
+    imageHeight: selectedCase.imageHeight,
+    shopScale: selectedCase.shopScale,
+  } as any;
+
+  // Обновляем локальные стейты
+  const updatedInventory = [...inventory, caseItem];
+  setCoins(coins - price);
+  setInventory(updatedInventory);
+
+  // Отправляем изменения на сервер
+  const userId = getSessionUserId();
+  if (userId) {
+    socket.emit('save-user-data', { 
+      userId, 
+      newData: { 
+        ...JSON.parse(localStorage.getItem("arena-user-data-" + userId) || "{}"),
+        inventory: updatedInventory, 
+        coins: coins - price 
+      } 
+    });
+  }
+
+  setNotice(`Кейс «${selectedCase.name}» добавлен в инвентарь! Открой его там.`);
+};
+
+const buyVip = (vip: MarketItem) => {
+  if (coins < vip.price) {
+    setNotice("Не хватает Coins — загляни в ежедневный бонус.");
+    return;
+  }
+
+  const days = vip.vipDuration || 7;
+  const currentVipUntil = localStorage.getItem("arena-vip-until");
+  const now = Date.now();
+  let baseTime = now;
+  if (currentVipUntil && new Date(currentVipUntil) > new Date(now)) {
+    baseTime = new Date(currentVipUntil).getTime();
+  }
+
+  const vipEnd = new Date(baseTime + days * 24 * 60 * 60 * 1000);
+  localStorage.setItem("arena-vip-until", vipEnd.toISOString());
+  setCoins(coins - vip.price);
+
+  // Добавляем VIP как предмет в инвентарь
+    const vipItem: OwnedItem = {
+    id: `vip-${Date.now()}`,
+    name: vip.name,
+    type: "board",
+    rarity: "VIP",
+    color: vip.bgColor || "#d3a247",
+    price: vip.price,
+    description: vip.description || `VIP на ${days} дней`,
+    ownedAt: new Date().toISOString(),
+    vipDuration: days,
+    imageDataUrl: vip.imageDataUrl,
+    cardWidth: vip.cardWidth,
+    cardHeight: vip.cardHeight,
+    imageHeight: vip.imageHeight,
+    shopScale: vip.shopScale,
+  } as any;
+
+  const updatedInv = [...inventory, vipItem];
+  setInventory(updatedInv);
+
+  const userId = getSessionUserId();
+  if (userId) {
+    socket.emit('save-user-data', {
+      userId,
+      newData: {
+        ...JSON.parse(localStorage.getItem("arena-user-data-" + userId) || "{}"),
+        vipUntil: vipEnd.toISOString(),
+        coins: coins - vip.price,
+        inventory: updatedInv,
+      }
+    });
+  }
+
+  setNotice(`VIP продлён до ${vipEnd.toLocaleDateString("ru-RU")}!`);
+};
+
   return (
     <div className="animate-rise">
       <SectionHeading
@@ -2140,123 +2826,459 @@ function Shop() {
           </button>
         </div>
       )}
-      <div className="mb-5 flex gap-2 rounded-xl bg-muted p-1 w-fit">
-        <button
-          onClick={() => setSection("cases")}
-          className={`rounded-lg px-4 py-2 text-xs font-bold ${section === "cases" ? "bg-card shadow-sm" : "text-muted-foreground"}`}
-        >
-          Кейсы
-        </button>
-        <button
-          onClick={() => setSection("skins")}
-          className={`rounded-lg px-4 py-2 text-xs font-bold ${section === "skins" ? "bg-card shadow-sm" : "text-muted-foreground"}`}
-        >
-          Прямые скины
-        </button>
-      </div>
-      <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-        {section === "cases"
-          ? cases.map((product) => {
-              const Icon = product.icon;
-              return (
-                <div
-                  key={product.name}
-                  className="lift overflow-hidden rounded-2xl border border-card-border bg-card"
-                >
-                  <div
-                    className="relative flex h-44 items-center justify-center overflow-hidden"
-                    style={{ backgroundColor: product.color }}
-                  >
-                    <div className="absolute h-36 w-36 rounded-full border border-white/20"></div>
-                    <div className="absolute h-24 w-24 rounded-full border border-white/20"></div>
-                    <Icon size={48} className="relative text-white/90" />
-                  </div>
-                  <div className="p-5">
-                    <h3 className="font-display text-xl font-bold">
-                      {product.name}
-                    </h3>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      {product.desc}
-                    </p>
-                    <div className="mt-5 flex items-center justify-between">
-                      <span className="flex items-center gap-1.5 font-mono text-sm font-bold">
-                        <Coins size={15} className="text-[#b18428]" />
-                        {product.price}
-                      </span>
-                      <button
-                        onClick={() => buyCase(product.name, product.price)}
-                        className="rounded-lg bg-primary px-3.5 py-2 text-xs font-bold text-primary-foreground"
-                      >
-                        Открыть кейс
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              );
-            })
-          : shopSkins.map((product) => (
+            <div className="mb-5 flex gap-2 rounded-xl bg-muted p-1 w-fit">
+  <button
+    onClick={() => setSection("cases")}
+    className={`rounded-lg px-4 py-2 text-xs font-bold ${section === "cases" ? "bg-card shadow-sm" : "text-muted-foreground"}`}
+  >
+    Кейсы
+  </button>
+  <button
+    onClick={() => setSection("cards")}
+    className={`rounded-lg px-4 py-2 text-xs font-bold ${section === "cards" ? "bg-card shadow-sm" : "text-muted-foreground"}`}
+  >
+    Карточки
+  </button>
+</div>
+                  <div className="grid gap-5" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(185px, 1fr))" }}>
+                {section === "cases" &&
+          cases.map((product) => {
+            const caseItems = (product.items || [])
+              .map(id => marketItems.find(m => m.id === id))
+              .filter(Boolean);
+            return (
+              (() => {
+                const sz = getCardSize(product);
+                return (
               <div
                 key={product.id}
-                className="lift overflow-hidden rounded-2xl border border-card-border bg-card"
+                className="lift overflow-hidden rounded-2xl border border-card-border bg-card flex flex-col"
+                style={{ width: `${sz.cardWidth}px` }}
               >
-                <div
-                  className="flex h-36 items-center justify-center"
-                  style={{ backgroundColor: product.color }}
+                    <div
+                  className="relative flex items-center justify-center overflow-hidden"
+                  style={{
+                    height: `${sz.imageHeight}px`,
+                    backgroundColor: product.color || "#e96852",
+                  }}
                 >
-                  <div className="rounded-2xl border border-white/30 p-5 text-white">
-                    <Dice5 size={36} />
-                  </div>
+                  {product.imageDataUrl ? (
+                    <img
+                      src={product.imageDataUrl}
+                      alt={product.name}
+                      className="h-full w-full object-contain p-3"
+                      style={{ transform: `scale(${sz.shopScale / 100})` }}
+                    />
+                  ) : (
+                    <div className="text-6xl" style={{ color: product.color || "#e96852" }}>📦</div>
+                  )}
                 </div>
-                <div className="p-5">
-                  <div className="flex items-center justify-between">
-                    <h3 className="font-display text-xl font-bold">
-                      {product.name}
-                    </h3>
-                    <span className="text-[10px] font-bold uppercase text-primary">
-                      {product.rarity}
-                    </span>
+                <div className="p-4 flex flex-col gap-3 flex-1">
+                  <div>
+                    <h3 className="font-display text-lg font-bold">{product.name}</h3>
+                    <p className="mt-1 text-xs text-muted-foreground">{product.desc || "Случайный предмет"}</p>
                   </div>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {product.description}
-                  </p>
-                  <div className="mt-5 flex items-center justify-between">
+                  {caseItems.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {caseItems.map((it) => (
+                        <span key={it!.id} className="rounded-md bg-muted px-2 py-0.5 text-[10px] font-medium">
+                          {it!.name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div className="mt-auto flex items-center justify-between pt-2 border-t border-border">
                     <span className="flex items-center gap-1.5 font-mono text-sm font-bold">
                       <Coins size={15} className="text-[#b18428]" />
-                      {product.price}
+                      {product.price ?? 100}
                     </span>
                     <button
-                      onClick={() => buySkin(product)}
-                      className="rounded-lg bg-primary px-3.5 py-2 text-xs font-bold text-primary-foreground"
+                      onClick={() => {
+                        if (isGuest) {
+                          setNotice("❌ Гостевой режим не может покупать. Зарегистрируйтесь, чтобы прогресс сохранялся.");
+                          setTimeout(() => setNotice(""), 10000);
+                          return;
+                        }
+                        buyCase(product.name, product.price ?? 100);
+                      }}
+                      className={`rounded-lg px-3.5 py-2 text-xs font-bold ${
+                        isGuest
+                          ? "bg-muted text-muted-foreground cursor-not-allowed"
+                          : "bg-primary text-primary-foreground"
+                      }`}
                     >
                       Купить
                     </button>
                   </div>
                 </div>
               </div>
-            ))}
+              );
+              })()
+            );
+          })}
+
+        {section === "cards" &&
+          marketItems.filter(i => i.isActive && i.category === "card").map((item) => {
+            const slotNum = Number(item.slotIndex || 0);
+            const rarityColor = item.rarity === "common" ? "#b0b0b0" : item.rarity === "rare" ? "#2563eb" : "#9b5de5";
+            const isBuyable = true;
+            const sz = getCardSize(item);
+            return (
+              <div
+                key={item.id}
+                className="lift overflow-hidden rounded-2xl border border-card-border bg-card flex flex-col"
+                style={{ width: `${sz.cardWidth}px` }}
+              >
+                                <div
+                  className="relative flex items-center justify-center overflow-hidden bg-[#fdfaf5]"
+                  style={{ height: `${sz.imageHeight}px` }}
+                >
+                  {item.imageDataUrl ? (
+                    <img
+                      src={item.imageDataUrl}
+                      alt={item.name}
+                      className="h-full w-full object-contain p-3"
+                      style={{ transform: `scale(${sz.shopScale / 100})` }}
+                    />
+                  ) : (
+                    <div className="text-6xl">❓</div>
+                  )}
+                  <div className="absolute bottom-0 left-0 right-0 h-1" style={{ backgroundColor: rarityColor }} />
+                </div>
+                <div className="p-4 flex flex-col gap-3 flex-1">
+                  <div>
+                    <h3 className="font-display text-lg font-bold">{item.name}</h3>
+                    <p className="mt-1 text-xs text-muted-foreground">Заменяет слот: {slotNum} · {item.rarity}</p>
+                  </div>
+                  <div className="mt-auto flex items-center justify-between pt-2 border-t border-border">
+                    <span className="flex items-center gap-1.5 font-mono text-sm font-bold">
+                      <Coins size={15} className="text-[#b18428]" />
+                      {item.price}
+                    </span>
+                    <button
+                      onClick={() => {
+                        if (isGuest) {
+                          setNotice("❌ Гостевой режим не может покупать. Зарегистрируйтесь.");
+                          setTimeout(() => setNotice(""), 10000);
+                          return;
+                        }
+                        const price = item.price;
+                        const coinsNow = Number(localStorage.getItem("arena-coins") || 2400);
+                        if (coinsNow < price) { setNotice("Не хватает Coins."); return; }
+                         const owned: OwnedItem = {
+                          id: `${item.id}-${Date.now()}`,
+                          name: item.name,
+                          type: "board",
+                          rarity: item.rarity,
+                          color: "#29233e",
+                          price: item.price,
+                          description: `Заменяет слот ${slotNum}`,
+                          ownedAt: new Date().toISOString(),
+                          slotIndex: slotNum,
+                          imageDataUrl: item.imageDataUrl,
+                          marketItemId: item.id,
+                          cardWidth: item.cardWidth,
+                          cardHeight: item.cardHeight,
+                          imageHeight: item.imageHeight,
+                          shopScale: item.shopScale,
+                        } as any;
+                        const inv = JSON.parse(localStorage.getItem("arena-inventory") || "[]");
+                        localStorage.setItem("arena-inventory", JSON.stringify([...inv, owned]));
+                        localStorage.setItem("arena-coins", String(coinsNow - price));
+                        const uid = getSessionUserId();
+                        if (uid) {
+                          socket.emit('save-user-data', { userId: uid, newData: { ...JSON.parse(localStorage.getItem("arena-user-data-" + uid) || "{}"), inventory: [...inv, owned], coins: coinsNow - price } });
+                        }
+                        setNotice(`«${item.name}» добавлен в инвентарь!`);
+                      }}
+                      className={`rounded-lg px-3.5 py-2 text-xs font-bold ${
+                        isGuest
+                          ? "bg-muted text-muted-foreground cursor-not-allowed"
+                          : "bg-primary text-primary-foreground"
+                      }`}
+                    >
+                      Купить
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
       </div>
+
+           {/* VIP-статус */}
+      {vipItems.length > 0 && (
+        <div className="mt-10">
+          <h3 className="mb-4 font-display text-xl font-bold">VIP-статус</h3>
+          <p className="mb-4 text-xs text-muted-foreground">
+            VIP даёт: x2 опыт за игры, создание лобби во всех режимах и с доп. функциями (включая Дуэль, 2х2, Быстрая игра, с паролем и др.), иконку VIP возле ника.
+          </p>
+                    <div className="grid gap-5" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(185px, 1fr))" }}>
+            {vipItems.map((vip) => (
+              (() => {
+                const sz = getCardSize(vip);
+                return (
+              <div
+                key={vip.id}
+                className="lift overflow-hidden rounded-2xl border border-card-border bg-card flex flex-col"
+                style={{ width: `${sz.cardWidth}px` }}
+              >
+                <div
+                  className="relative flex items-center justify-center overflow-hidden"
+                  style={{
+                    height: `${sz.imageHeight}px`,
+                    backgroundColor: vip.bgColor || "#d3a247",
+                  }}
+                >
+                  {vip.imageDataUrl ? (
+                    <img
+                      src={vip.imageDataUrl}
+                      alt={vip.name}
+                      className="h-full w-full object-contain p-3"
+                      style={{ transform: `scale(${sz.shopScale / 100})` }}
+                    />
+                  ) : (
+                    <Crown size={64} style={{ color: vip.bgColor || "#d3a247" }} />
+                  )}
+                </div>
+                <div className="p-4 flex flex-col gap-3 flex-1">
+                  <div>
+                    <h4 className="font-display text-lg font-bold">{vip.name}</h4>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {vip.description || `Продлевает VIP на ${vip.vipDuration || 7} дней`}
+                    </p>
+                  </div>
+                  <div className="mt-auto flex items-center justify-between pt-2 border-t border-border">
+                    <span className="flex items-center gap-1.5 font-mono text-sm font-bold">
+                      <Coins size={15} className="text-[#b18428]" />
+                      {vip.price}
+                    </span>
+                    <button
+                      onClick={() => {
+                        if (isGuest) {
+                          setNotice("❌ Гостевой режим не может покупать. Зарегистрируйтесь.");
+                          setTimeout(() => setNotice(""), 10000);
+                          return;
+                        }
+                        buyVip(vip);
+                      }}
+                      className={`rounded-lg px-3.5 py-2 text-xs font-bold ${
+                        isGuest
+                          ? "bg-muted text-muted-foreground cursor-not-allowed"
+                          : "bg-primary text-primary-foreground"
+                      }`}
+                    >
+                      Купить
+                    </button>
+                  </div>
+                </div>
+              </div>
+              );
+              })()
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 function Inventory({ onMarket }: { onMarket: () => void }) {
-  const [inventory, setInventory] = useLocalStorage<OwnedItem[]>(
-    "arena-inventory",
-    seedInventory,
-  );
-  const [active, setActive] = useLocalStorage<Record<ItemType, string>>(
-    "arena-active-skins",
-    { dice: "none", token: "none", board: "none" },
-  );
+  const [inventory, setInventory] = useServerSync<OwnedItem[]>("arena-inventory", [], ['user-inventory-updated'], 'get-user-inventory');
+  const [active, setActive] = useLocalStorage<{ dice: string; token: string; board: string; activeSkins: Record<number, string> }>("arena-active-skins", 
+    { dice: "none", token: "none", board: "none", activeSkins: {} });
   const [notice, setNotice] = useState("");
-  const apply = (item: OwnedItem) => {
+    const [sellTarget, setSellTarget] = useState<OwnedItem | null>(null);
+  const [sellPrice, setSellPrice] = useState("");
+    // Нормализация: если старый state без activeSkins — добавим пустой объект
+  useEffect(() => {
+    if (!active.activeSkins) {
+      setActive({ ...active, activeSkins: {} });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const [casesData] = useServerSync<CaseDesign[]>("arena-admin-cases", [], ['admin-cases-updated'], 'get-admin-cases');
+const [marketItems] = useServerSync<MarketItem[]>("arena-market-items", [], ['custom-items-updated'], 'get-custom-items');
+const currentUserId = getSessionUserId();
+const getRecommendedPrice = (item: OwnedItem): number => {
+  if (!item) return 100;
+  // 1. Ищем базовую цену в магазине по marketItemId или slotIndex
+  const shopItem = item.marketItemId
+    ? marketItems.find((m) => m.id === item.marketItemId)
+    : marketItems.find(
+        (m) => m.category === "card" && m.slotIndex === item.slotIndex
+      );
+  const basePrice = shopItem?.price || item.price || 0;
+
+  if (basePrice > 0) {
+    // 95% от базовой цены магазина
+    return Math.max(50, Math.round(basePrice * 0.95));
+  }
+  return 100;
+};
+const openCase = (caseItem: OwnedItem) => {
+  // Находим кейс по имени
+  const safeCasesData = Array.isArray(casesData) ? casesData.filter(c => c !== null && c !== undefined) : [];
+const caseData = safeCasesData.find(c => c.name === caseItem.name);
+  if (!caseData || !caseData.items || caseData.items.length === 0) {
+    setNotice("В этом кейсе нет предметов для выпадения.");
+    return;
+  }
+
+  // Выбираем случайный предмет из списка
+  const availableItems = Array.isArray(marketItems) ? marketItems.filter(item => item.isActive && caseData.items.includes(item.id)) : [];
+  if (availableItems.length === 0) {
+    setNotice("В этом кейсе нет доступных предметов.");
+    return;
+  }
+
+  const drop = availableItems[Math.floor(Math.random() * availableItems.length)];
+
+  // Создаём объект выигранного предмета
+  let dropItem: OwnedItem;
+  if (drop.category === "vip") {
+  const currentVipUntil = localStorage.getItem("arena-vip-until");
+  const now = Date.now();
+  let baseTime = now;
+  if (currentVipUntil && new Date(currentVipUntil) > new Date(now)) {
+    baseTime = new Date(currentVipUntil).getTime();
+  }
+  const vipEnd = new Date(baseTime + (drop.vipDuration || 7) * 24 * 60 * 60 * 1000);
+  localStorage.setItem("arena-vip-until", vipEnd.toISOString());
+  
+  // Отправляем на сервер
+  const userId = getSessionUserId();
+  if (userId) {
+    socket.emit('save-user-data', {
+      userId,
+      newData: {
+        ...JSON.parse(localStorage.getItem("arena-user-data-" + userId) || "{}"),
+        vipUntil: vipEnd.toISOString()
+      }
+    });
+  }
+  
+  setNotice(`VIP продлён до ${vipEnd.toLocaleDateString("ru-RU")}!`);
+  return; // Не добавляем в инвентарь
+
+      } else if (drop.category === "dice") {
+    dropItem = {
+      id: `dice-${Date.now()}`,
+      name: drop.name,
+      type: "dice",
+      rarity: drop.rarity,
+      color: "#32786d",
+      price: drop.price,
+      description: "Скин кубиков",
+      ownedAt: new Date().toISOString(),
+      imageDataUrl: drop.imageDataUrl,
+      marketItemId: drop.id,
+      cardWidth: drop.cardWidth,
+      cardHeight: drop.cardHeight,
+      imageHeight: drop.imageHeight,
+      shopScale: drop.shopScale,
+    } as any;
+  } else {
+    dropItem = {
+      id: `card-${Date.now()}`,
+      name: drop.name,
+      type: "board",
+      rarity: drop.rarity,
+      color: "#29233e",
+      price: drop.price,
+      description: "Карточка поля",
+      ownedAt: new Date().toISOString(),
+      slotIndex: drop.slotIndex,
+      imageDataUrl: drop.imageDataUrl,
+      marketItemId: drop.id,
+      cardWidth: drop.cardWidth,
+      cardHeight: drop.cardHeight,
+      imageHeight: drop.imageHeight,
+      shopScale: drop.shopScale,
+    } as any;
+  }
+
+  // Убираем кейс из инвентаря, добавляем выигранный предмет
+  const updatedInventory = inventory.filter(i => i.id !== caseItem.id);
+  const newInventory = [...updatedInventory, dropItem];
+  setInventory(newInventory);
+
+  // Отправляем на сервер
+  const userId = getSessionUserId();
+  if (userId) {
+    socket.emit('save-user-data', { 
+      userId, 
+      newData: { 
+        ...JSON.parse(localStorage.getItem("arena-user-data-" + userId) || "{}"),
+        inventory: newInventory
+      } 
+    });
+  }
+
+  setNotice(`🎉 Кейс «${caseItem.name}» открыт! Выпал предмет: «${dropItem.name}»!`);
+};
+      const apply = (item: OwnedItem) => {
+  const newSkins = { ...active.activeSkins };
+  if (item.slotIndex !== undefined) {
+    const marketRef =
+      item.marketItemId ||
+      marketItems.find(m => m.name === item.name && m.slotIndex === item.slotIndex)?.id ||
+      item.id;
+    newSkins[item.slotIndex] = marketRef;
+    // Не трогаем active[type] для слот-предметов — только activeSkins
+    setActive({ ...active, activeSkins: newSkins });
+  } else {
     setActive({ ...active, [item.type]: item.id });
-    setNotice(`«${item.name}» применён для следующих партий.`);
-  };
+  }
+  // Если это VIP-предмет, устанавливаем дату окончания
+  if (item.rarity === "VIP") {
+    const vipEnd = new Date();
+    vipEnd.setDate(vipEnd.getDate() + (item.vipDuration || 7));
+    localStorage.setItem("arena-vip-until", vipEnd.toISOString());
+  }
+  // Отправляем на сервер
+   const userId = getSessionUserId();
+  if (userId) {
+    socket.emit('update-active-skins', { userId, activeSkins: newSkins });
+    // Дублируем в user-data, чтобы не потерять при следующем save-user-data
+    const userDataKey = "arena-user-data-" + userId;
+    const existing = JSON.parse(localStorage.getItem(userDataKey) || "{}");
+    localStorage.setItem(userDataKey, JSON.stringify({ ...existing, activeSkins: newSkins }));
+  }
+  setNotice(`«${item.name}» применён для следующих партий.`);
+};
+
+const deactivate = (item: OwnedItem) => {
+  const newSkins = { ...active.activeSkins };
+  const nextActive = { ...active } as any;
+  if (item.slotIndex !== undefined) {
+    delete newSkins[item.slotIndex];
+    nextActive.activeSkins = newSkins;
+  }
+  // Всегда очищаем active[type] для этого предмета
+  if (nextActive[item.type] === item.id) {
+    nextActive[item.type] = "none";
+  }
+  setActive(nextActive);
+  // Если это VIP-предмет, удаляем дату окончания
+  if (item.rarity === "VIP") {
+    localStorage.removeItem("arena-vip-until");
+  }
+  // Отправляем на сервер
+    const userId = getSessionUserId();
+  if (userId) {
+    socket.emit('update-active-skins', { userId, activeSkins: newSkins });
+    // Дублируем в user-data, чтобы не потерять при следующем save-user-data
+    const userDataKey = "arena-user-data-" + userId;
+    const existing = JSON.parse(localStorage.getItem(userDataKey) || "{}");
+    localStorage.setItem(userDataKey, JSON.stringify({ ...existing, activeSkins: newSkins }));
+  }
+};
   return (
     <div className="animate-rise">
       <SectionHeading
-        eyebrow="твоя коллекция"
+        eyebrow="твой инвентарь"
         title="Инвентарь"
         detail="Выбирай активные предметы для будущих партий."
         action={
@@ -2274,69 +3296,208 @@ function Inventory({ onMarket }: { onMarket: () => void }) {
           {notice}
         </div>
       )}
-      <div className="mb-5 grid gap-3 sm:grid-cols-3">
-        <div className="rounded-xl border border-card-border bg-card p-4">
-          <div className="text-xs text-muted-foreground">Всего предметов</div>
-          <div className="mt-1 font-mono text-2xl font-bold">
+            <div className="mb-5 grid gap-2 sm:grid-cols-3">
+        <div className="rounded-xl border border-card-border bg-card p-2.5">
+          <div className="text-[9px] text-muted-foreground">Всего предметов</div>
+          <div className="mt-1 font-mono text-sm font-bold">
             {inventory.length}
           </div>
         </div>
-        <div className="rounded-xl border border-card-border bg-card p-4">
-          <div className="text-xs text-muted-foreground">Активных</div>
-          <div className="mt-1 font-mono text-2xl font-bold">
-            {Object.values(active).filter((v) => v !== "none").length}
+        <div className="rounded-xl border border-card-border bg-card p-2.5">
+          <div className="text-[9px] text-muted-foreground">Активных</div>
+          <div className="mt-1 font-mono text-sm font-bold">
+            {(active.dice !== "none" ? 1 : 0) + (active.token !== "none" ? 1 : 0) + (active.board !== "none" ? 1 : 0) + Object.keys(active.activeSkins || {}).length}
           </div>
         </div>
-        <div className="rounded-xl border border-card-border bg-card p-4">
-          <div className="text-xs text-muted-foreground">Можно выставить</div>
-          <div className="mt-1 font-mono text-2xl font-bold">
+        <div className="rounded-xl border border-card-border bg-card p-2.5">
+          <div className="text-[9px] text-muted-foreground">Можно выставить</div>
+          <div className="mt-1 font-mono text-sm font-bold">
             {inventory.length}
           </div>
         </div>
       </div>
-      <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-        {inventory.map((item) => (
-          <div
-            key={item.id}
-            className="lift overflow-hidden rounded-2xl border border-card-border bg-card"
-          >
-            <div
-              className="flex h-32 items-center justify-center"
-              style={{ backgroundColor: item.color }}
-            >
-              <div className="rounded-xl border border-white/30 p-4 text-white">
-                <Dice5 size={32} />
-              </div>
-            </div>
-            <div className="p-4">
-              <div className="flex items-center justify-between gap-2">
-                <h3 className="font-bold">{item.name}</h3>
-                {active[item.type] === item.id && (
-                  <span className="rounded-full bg-[#dceae3] px-2 py-1 text-[10px] font-bold text-accent">
-                    Активен
-                  </span>
-                )}
-              </div>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {item.description}
-              </p>
-              <button
-                onClick={() => apply(item)}
-                className="mt-4 w-full rounded-lg bg-primary py-2.5 text-xs font-bold text-primary-foreground"
-              >
-                {active[item.type] === item.id ? "Применён" : "Применить"}
-              </button>
-            </div>
-          </div>
-        ))}
+            <div className="flex flex-wrap gap-5">
+        {inventory.map((item) => {
+  const isCase = item.rarity === "Кейс";
+  const isVip = item.rarity === "VIP";
+      const currentRef = item.slotIndex !== undefined
+    ? (item.marketItemId || marketItems.find(m => m.name === item.name && m.slotIndex === item.slotIndex)?.id || item.id)
+    : item.id;
+  const isActive = item.slotIndex !== undefined
+    ? active.activeSkins?.[item.slotIndex] === currentRef
+    : active[item.type] === item.id;
+  const sourceMarketItem = findMarketItemForOwned(item, marketItems);
+  const sz = getCardSize(sourceMarketItem ?? item);
+  
+  return (
+             <div
+          key={item.id}
+          className="lift overflow-hidden rounded-2xl border border-card-border bg-card flex flex-col"
+          style={{ width: `${sz.cardWidth}px` }}
+        >
+      <div
+        className="relative flex items-center justify-center overflow-hidden bg-[#fdfaf5]"
+        style={{ height: `${sz.imageHeight}px` }}
+      >
+                {item.imageDataUrl ? (
+          <img
+            src={item.imageDataUrl}
+            alt={item.name}
+            className="h-full w-full object-contain p-3"
+            style={{ transform: `scale(${sz.shopScale / 100})` }}
+          />
+        ) : isCase ? (
+          <Package size={56} style={{ color: item.color }} />
+        ) : isVip ? (
+          <Crown size={56} style={{ color: item.color }} />
+        ) : item.slotIndex !== undefined && CELL_LOGOS[item.slotIndex] ? (
+          <div style={{ fontSize: 56, lineHeight: 1 }}>{CELL_LOGOS[item.slotIndex]}</div>
+        ) : (
+          <Dice5 size={56} style={{ color: item.color }} />
+        )}
+        <div className="absolute bottom-0 left-0 right-0 h-1" style={{ backgroundColor: item.rarity === "common" ? "#b0b0b0" : item.rarity === "rare" ? "#2563eb" : item.rarity === "epic" ? "#9b5de5" : item.rarity === "Кейс" ? "#e96852" : item.rarity === "VIP" ? "#d3a247" : "#b0b0b0" }} />
       </div>
-      {inventory.length === 0 && (
+      <div className="p-4 flex flex-col flex-1">
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="font-bold">{item.name}</h3>
+          {isVip && (
+            <span className="rounded-full bg-[#f3e7c8] px-2 py-1 text-[10px] font-bold text-[#99711f]">
+              VIP
+            </span>
+          )}
+          {isCase && (
+            <span className="rounded-full bg-muted px-2 py-1 text-[10px] font-bold">
+              Кейс
+            </span>
+          )}
+          {isActive && (
+            <span className="rounded-full bg-[#dceae3] px-2 py-1 text-[10px] font-bold text-accent">
+              Активен
+            </span>
+          )}
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">{item.description}</p>
+        {isCase ? (
+  <button onClick={() => openCase(item)} className="mt-4 w-full rounded-lg bg-primary py-2.5 text-xs font-bold text-primary-foreground">
+    Открыть кейс
+  </button>
+) : isVip ? (
+  <div className="mt-4 rounded-lg bg-[#f3e7c8] p-2 text-center text-[11px] font-bold text-[#7e5f1d]">
+    {(() => {
+      const vipUntil = localStorage.getItem("arena-vip-until");
+      if (!vipUntil || new Date(vipUntil) < new Date()) return "VIP не активен";
+      const daysLeft = Math.ceil((new Date(vipUntil).getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+      return `Активен · осталось ${daysLeft} дн.`;
+    })()}
+  </div>
+) : (
+                      <div className="mt-4 flex items-center gap-1.5">
+                <button
+                  onClick={() => (isActive ? deactivate(item) : apply(item))}
+                  className={`relative flex h-6 w-9 shrink-0 items-center rounded-full transition-colors ${isActive ? "bg-accent" : "bg-muted"}`}
+                  title={isActive ? "Деактивировать" : "Применить"}
+                >
+                  <span
+                    className={`absolute h-4 w-4 rounded-full bg-white shadow-sm transition-all duration-200 ${
+                      isActive ? "left-[18px]" : "left-1"
+                    }`}
+                  />
+                </button>
+                <span className={`text-[9px] font-bold ${isActive ? "text-accent" : "text-muted-foreground"}`}>
+                  {isActive ? "Вкл" : "Выкл"}
+                </span>
+                <button
+                  onClick={() => {
+                    setSellTarget(item);
+                    setSellPrice(String(getRecommendedPrice(item)));
+                  }}
+                  className="ml-auto shrink-0 rounded-lg bg-secondary px-2 py-1.5 text-[10px] font-bold text-secondary-foreground"
+                >
+                  Продать
+                </button>
+              </div>
+            )}
+      </div>
+    </div>
+  );
+})}
+      </div>
+            {inventory.length === 0 && (
         <div className="rounded-2xl border border-dashed border-card-border bg-card p-12 text-center">
           <Package size={28} className="mx-auto text-muted-foreground" />
           <p className="mt-3 font-bold">Инвентарь пока пуст</p>
           <p className="mt-1 text-sm text-muted-foreground">
-            Загляни в Кагазин и открой первый кейс.
+            Загляни в Магазин и открой первый кейс.
           </p>
+        </div>
+      )}
+
+      {sellTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#29233e]/60 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-2xl border border-card-border bg-card p-6 shadow-2xl">
+            <div className="flex items-start justify-between">
+              <div>
+                <div className="font-mono text-[10px] uppercase tracking-[.2em] text-primary">продажа</div>
+                <h2 className="mt-1 font-display text-2xl font-bold">Выставить на рынок</h2>
+                <p className="mt-1 text-xs text-muted-foreground">«{sellTarget.name}»</p>
+              </div>
+              <button onClick={() => setSellTarget(null)} className="rounded-lg p-2 text-muted-foreground hover:bg-muted">
+                <X size={18} />
+              </button>
+            </div>
+            <label className="mt-5 block text-xs font-bold">
+              Цена в Coins
+              <input
+                type="number"
+                min="1"
+                autoFocus
+                value={sellPrice}
+                onChange={(e) => setSellPrice(e.target.value)}
+                className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
+              />
+                 <span className="mt-1 block text-[10px] text-muted-foreground">
+                Рекомендуемая цена: {getRecommendedPrice(sellTarget)} Coins
+              </span>
+            </label>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                onClick={() => setSellTarget(null)}
+                className="rounded-xl border border-input px-4 py-2.5 text-xs font-bold"
+              >
+                Отмена
+              </button>
+              <button
+                onClick={() => {
+                  const amount = Number(sellPrice);
+                  if (!Number.isFinite(amount) || amount < 1) {
+                    setNotice("Введите корректную цену");
+                    return;
+                  }
+                  socket.emit('add-market-listing', {
+                    item: sellTarget,
+                    seller: getSessionUserName(),
+                    sellerId: currentUserId || "",
+                    price: amount,
+                  }, (response: any) => {
+                    if (response?.success) {
+                      const updatedInventory = inventory.filter(i => i.id !== sellTarget.id);
+                      setInventory(updatedInventory);
+                      if (currentUserId) {
+                        socket.emit('save-user-data', { userId: currentUserId, newData: { ...JSON.parse(localStorage.getItem("arena-user-data-" + currentUserId) || "{}"), inventory: updatedInventory } });
+                      }
+                      setNotice(`«${sellTarget.name}» выставлен на рынке!`);
+                      setSellTarget(null);
+                    } else {
+                      setNotice(response?.error || "Не удалось выставить на рынок");
+                    }
+                  });
+                }}
+                className="rounded-xl bg-primary px-4 py-2.5 text-xs font-bold text-primary-foreground"
+              >
+                Выставить за {sellPrice || 0} Coins
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -2345,66 +3506,131 @@ function Inventory({ onMarket }: { onMarket: () => void }) {
 
 function Market() {
   const [coins, setCoins] = useLocalStorage("arena-coins", 2400);
-  const [inventory, setInventory] = useLocalStorage<OwnedItem[]>(
+    const [inventory, setInventory] = useServerSync<OwnedItem[]>(
     "arena-inventory",
-    seedInventory,
+    [],
+    ['user-inventory-updated'],
+    'get-user-inventory'
   );
-  const [listings, setListings] = useLocalStorage<Listing[]>(
+  const [listings] = useServerSync<Listing[]>(
     "arena-market",
-    seedListings,
+    [],
+    ['market-listings', 'market-listings-updated'],
+    'get-market-listings'
+);
+  const [marketItems] = useServerSync<MarketItem[]>(
+    "arena-market-items",
+    [],
+    ['custom-items-updated'],
+    'get-custom-items'
   );
   const [filter, setFilter] = useState<"all" | ItemType>("all");
   const [selected, setSelected] = useState("");
   const [price, setPrice] = useState("500");
   const [notice, setNotice] = useState("");
+  const currentUserId = getSessionUserId();
   const visible = listings.filter(
     (l) => filter === "all" || l.item.type === filter,
   );
   const typeName = (type: ItemType) =>
     type === "dice" ? "Кубики" : type === "token" ? "Фишки" : "Темы поля";
+  const getRecommendedPrice = (item: OwnedItem | null): number => {
+  if (!item) return 0;
+  // Ищем другие объявления с таким же предметом (по id или имени)
+  const sameItemListings = listings.filter(
+    (l) => l.item.id === item.id || l.item.name === item.name
+  );
+  if (sameItemListings.length > 0) {
+    const avg = sameItemListings.reduce((sum, l) => sum + l.price, 0) / sameItemListings.length;
+    return Math.round(avg);
+  }
+  // Если нет подобных — 95% от базовой цены
+  return Math.round(item.price * 0.95);
+};
   const sell = (e: FormEvent) => {
-    e.preventDefault();
-    const item = inventory.find((i) => i.id === selected);
-    const amount = Number(price);
-    if (!item || !Number.isFinite(amount) || amount < 1) return;
-    setListings([
-      ...listings,
-      {
-        id: `listing-${Date.now()}`,
-        item,
-        seller: "Лада Север",
-        sellerId: "you",
-        price: amount,
-      },
-    ]);
-    setInventory(inventory.filter((i) => i.id !== selected));
-    setSelected("");
-    setNotice(`«${item.name}» выставлен на рынке.`);
-  };
-  const buy = (listing: Listing) => {
-    if (listing.sellerId === "you") return;
-    if (coins < listing.price) {
-      setNotice("Недостаточно Coins для этой сделки.");
-      return;
+  e.preventDefault();
+  const item = inventory.find((i) => i.id === selected);
+  const amount = Number(price);
+  if (!item || !Number.isFinite(amount) || amount < 1) return;
+  // Отправляем на сервер
+  socket.emit('add-market-listing', {
+    item,
+    seller: getSessionUserName(),
+    sellerId: currentUserId || "you",
+    price: amount
+  }, (response: any) => {
+    if (response?.success) {
+      // Только после успешного ответа удаляем из инвентаря
+      const updatedInventory = inventory.filter((i) => i.id !== selected);
+      setInventory(updatedInventory);
+      setSelected("");
+      setNotice(`«${item.name}» выставлен на рынке.`);
+      
+      if (currentUserId) {
+        socket.emit('save-user-data', { userId: currentUserId, newData: { ...JSON.parse(localStorage.getItem("arena-user-data-" + currentUserId) || "{}"), inventory: updatedInventory } });
+      }
+    } else {
+      setNotice(response?.error || "Не удалось выставить на рынок.");
     }
-    setCoins(coins - listing.price);
-    setInventory([
-      ...inventory,
-      {
-        ...listing.item,
-        id: `${listing.item.id}-${Date.now()}`,
-        ownedAt: new Date().toISOString(),
-      },
-    ]);
-    setListings(listings.filter((l) => l.id !== listing.id));
-    setNotice(`Покупка завершена: «${listing.item.name}» в инвентаре.`);
-  };
+  });
+};
+  const buy = (listing: Listing) => {
+      if (listing.sellerId === currentUserId) return;
+  if (coins < listing.price) {
+    setNotice("Недостаточно Coins для этой сделки.");
+    return;
+  }
+  socket.emit('buy-market-listing', { listingId: listing.id, buyerId: currentUserId || "you" }, (response: any) => {
+    if (response?.success) {
+      const purchasedItem = response.item;
+      // Если это VIP-товар, продлеваем VIP и не добавляем в инвентарь
+            if (purchasedItem.category === "vip") {
+        const vipDuration = purchasedItem.vipDuration || 7;
+        const currentVipUntil = localStorage.getItem("arena-vip-until");
+        let baseTime = (currentVipUntil && new Date(currentVipUntil) > new Date()) ? new Date(currentVipUntil).getTime() : Date.now();
+        const vipEnd = new Date(baseTime + vipDuration * 24 * 60 * 60 * 1000);
+        localStorage.setItem("arena-vip-until", vipEnd.toISOString());
+        setNotice(`VIP продлён до ${vipEnd.toLocaleDateString("ru-RU")}!`);
+        setCoins(coins - listing.price);
+
+        const vipItem: OwnedItem = {
+          id: `vip-${Date.now()}`,
+          name: purchasedItem.name,
+          type: "board",
+          rarity: "VIP",
+          color: "#d3a247",
+          price: purchasedItem.price,
+          description: purchasedItem.description || `VIP на ${vipDuration} дней`,
+          ownedAt: new Date().toISOString(),
+          vipDuration,
+        };
+        const updatedInv = [...inventory, vipItem];
+        setInventory(updatedInv);
+
+        if (currentUserId) {
+          socket.emit('save-user-data', { userId: currentUserId, newData: { ...JSON.parse(localStorage.getItem("arena-user-data-" + currentUserId) || "{}"), coins: coins - listing.price, vipUntil: vipEnd.toISOString(), inventory: updatedInv } });
+        }
+      } else {
+        // Обычный предмет - добавляем в инвентарь
+        const updatedInventory = [...inventory, { ...purchasedItem, id: `${purchasedItem.id}-${Date.now()}`, ownedAt: new Date().toISOString() }];
+        setCoins(coins - listing.price);
+        setInventory(updatedInventory);
+        if (currentUserId) {
+          socket.emit('save-user-data', { userId: currentUserId, newData: { ...JSON.parse(localStorage.getItem("arena-user-data-" + currentUserId) || "{}"), inventory: updatedInventory, coins: coins - listing.price } });
+        }
+        setNotice(`Покупка завершена: «${listing.item.name}» в инвентаре.`);
+      }
+    } else {
+      setNotice(response?.error || "Не удалось купить");
+    }
+  });
+};
   return (
     <div className="animate-rise">
       <SectionHeading
-        eyebrow="обмен клуба"
-        title="Рынок"
-        detail="Продавай предметы из коллекции и находи редкие скины."
+  eyebrow="обмен клуба"
+  title="Рынок"
+  detail="Продавай предметы и находи редкие скины."
         action={
           <div className="flex items-center gap-2 rounded-xl bg-[#f3e7c8] px-4 py-2.5 text-sm font-bold text-[#7e5f1d]">
             <Coins size={17} /> {coins.toLocaleString("ru-RU")} Coins
@@ -2446,15 +3672,20 @@ function Market() {
             </select>
           </label>
           <label className="mt-4 block text-xs font-bold">
-            Цена в Coins
-            <input
-              type="number"
-              min="1"
-              value={price}
-              onChange={(e) => setPrice(e.target.value)}
-              className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
-            />
-          </label>
+    Цена в Coins
+    <input
+      type="number"
+      min="1"
+      value={price}
+      onChange={(e) => setPrice(e.target.value)}
+      className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
+    />
+    {selected && (
+      <span className="mt-1 block text-[10px] text-muted-foreground">
+        Рекомендуемая цена: {getRecommendedPrice(inventory.find(i => i.id === selected) || null)} Coins
+      </span>
+    )}
+</label>
           <button
             type="submit"
             disabled={!selected}
@@ -2480,49 +3711,84 @@ function Market() {
               </button>
             ))}
           </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            {visible.map((listing) => (
-              <div
+             <div className="flex flex-wrap gap-4">
+              {visible.map((listing) => {
+              const rarityColor = listing.item.rarity === "common" ? "#b0b0b0" : listing.item.rarity === "rare" ? "#2563eb" : listing.item.rarity === "epic" ? "#9b5de5" : "#b0b0b0";
+              const sourceMarketItem = findMarketItemForOwned(listing.item, marketItems);
+              const sz = getCardSize(sourceMarketItem ?? listing.item);
+              return (
+                <div
                 key={listing.id}
-                className="lift rounded-2xl border border-card-border bg-card p-4"
+                className="lift overflow-hidden rounded-2xl border border-card-border bg-card flex flex-col"
+                style={{ width: `${sz.cardWidth}px` }}
               >
-                <div className="flex items-center gap-3">
-                  <div
-                    className="flex h-14 w-14 items-center justify-center rounded-xl"
-                    style={{ backgroundColor: listing.item.color }}
-                  >
-                    <Dice5 size={27} className="text-white" />
-                  </div>
-                  <div className="min-w-0 flex-1">
+                <div
+                  className="relative flex items-center justify-center overflow-hidden bg-[#fdfaf5]"
+                  style={{ height: `${sz.imageHeight}px` }}
+                >
+                  {listing.item.imageDataUrl ? (
+                    <img
+                      src={listing.item.imageDataUrl}
+                      alt={listing.item.name}
+                      className="h-full w-full object-contain p-3"
+                      style={{ transform: `scale(${sz.shopScale / 100})` }}
+                    />
+                  ) : (
+                    <div className="text-5xl">{listing.item.type === "board" ? "🃏" : listing.item.type === "dice" ? "🎲" : "🎁"}</div>
+                  )}
+                  <div className="absolute bottom-0 left-0 right-0 h-1" style={{ backgroundColor: rarityColor }} />
+                </div>
+                <div className="p-4 flex flex-col gap-2 flex-1">
+                  <div>
                     <h3 className="truncate font-bold">{listing.item.name}</h3>
                     <p className="text-[11px] text-muted-foreground">
                       {typeName(listing.item.type)} · {listing.item.rarity}
                     </p>
-                    <p className="mt-1 text-[11px] text-muted-foreground">
-                      Продавец: {listing.seller}
-                    </p>
+                    <p className="mt-0.5 text-[11px] text-muted-foreground">Продавец: {listing.seller}</p>
+                  </div>
+                  <div className="mt-auto flex items-center justify-between border-t border-border pt-3">
+                    <span className="flex items-center gap-1 font-mono text-sm font-bold">
+                      <Coins size={14} className="text-[#b18428]" />
+                      {listing.price}
+                    </span>
+                    {listing.sellerId === currentUserId ? (
+                     <button
+                        onClick={() => {
+                          socket.emit('remove-market-listing', { listingId: listing.id, userId: currentUserId || "you" }, (response: any) => {
+                            if (response?.success) {
+                              setNotice("Объявление снято, предмет возвращён в инвентарь.");
+                              // Синхронизируем инвентарь локально
+                              if (Array.isArray(response.inventory)) {
+                                setInventory(response.inventory);
+                                localStorage.setItem("arena-inventory", JSON.stringify(response.inventory));
+                                if (currentUserId) {
+                                  const userDataKey = "arena-user-data-" + currentUserId;
+                                  const existing = JSON.parse(localStorage.getItem(userDataKey) || "{}");
+                                  localStorage.setItem(userDataKey, JSON.stringify({ ...existing, inventory: response.inventory }));
+                                }
+                              }
+                            } else {
+                              setNotice(response?.error || "Ошибка удаления");
+                            }
+                          });
+                        }}
+                         className="rounded-lg bg-[#f6dfd7] px-2 py-1.5 text-[10px] font-bold text-primary hover:bg-[#efcec2] whitespace-nowrap"
+                      >
+                        Снять
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => buy(listing)}
+                        className="rounded-lg bg-primary px-3 py-2 text-xs font-bold text-primary-foreground"
+                      >
+                        Купить
+                      </button>
+                    )}
                   </div>
                 </div>
-                <div className="mt-4 flex items-center justify-between border-t border-border pt-3">
-                  <span className="flex items-center gap-1 font-mono text-sm font-bold">
-                    <Coins size={14} className="text-[#b18428]" />
-                    {listing.price}
-                  </span>
-                  {listing.sellerId === "you" ? (
-                    <span className="text-xs font-bold text-muted-foreground">
-                      Твоё объявление
-                    </span>
-                  ) : (
-                    <button
-                      onClick={() => buy(listing)}
-                      className="rounded-lg bg-secondary px-3 py-2 text-xs font-bold text-secondary-foreground"
-                    >
-                      Купить
-                    </button>
-                  )}
-                </div>
               </div>
-            ))}
+            );
+            })}
           </div>
           {visible.length === 0 && (
             <div className="rounded-2xl border border-dashed border-card-border bg-card p-12 text-center text-sm text-muted-foreground">
@@ -2535,13 +3801,17 @@ function Market() {
   );
 }
 
-function Profile({ onInventory }: { onInventory: () => void }) {
-  const [name, setName] = useLocalStorage("arena-nickname", "Лада Север");
+function Profile({ onInventory, player }: { onInventory: () => void; player?: AuthUser | null }) {
+  const [name, setName] = useState(player?.name || "Гость");
   const [saved, setSaved] = useState(false);
-  const [inventory] = useLocalStorage<OwnedItem[]>(
-    "arena-inventory",
-    seedInventory,
-  );
+  const userData = useMemo(() => {
+    if (player?.id) {
+      const saved = localStorage.getItem("arena-user-data-" + player.id);
+      return saved ? JSON.parse(saved) : null;
+    }
+    return null;
+  }, [player]);
+  const inventory = userData?.inventory || [];
   const save = () => {
     setSaved(true);
     window.setTimeout(() => setSaved(false), 1800);
@@ -2549,47 +3819,77 @@ function Profile({ onInventory }: { onInventory: () => void }) {
   return (
     <div className="animate-rise">
       <SectionHeading
-        eyebrow="карточка игрока"
-        title="Профиль"
-        detail="Твоя история, титул и коллекция на виду."
+  eyebrow="карточка игрока"
+  title="Профиль"
+  detail="Твоя история, титул и имущество на виду."
       />
       <div className="grid gap-6 xl:grid-cols-[.8fr_1.2fr]">
         <div className="rounded-2xl bg-[#29233e] p-6 text-[#f7f0e3]">
           <div className="flex items-center gap-4">
-            <Avatar initials="ЛС" color="#e96852" size="lg" />
+            <Avatar initials={player?.initials || "Г"} color={player?.color || "#32786d"} size="lg" />
             <div>
-              <div className="font-mono text-[10px] uppercase tracking-[.2em] text-[#e7ba68]">
-                MA-4821
+              <div className="font-mono text-[10px] uppercase tracking-[.2em] text-[#e7ba68]">{player?.id || "MA-XXXX"}
               </div>
               <h2 className="mt-1 font-display text-2xl font-bold">{name}</h2>
               <div className="mt-1 text-xs text-[#bbb4c5]">
-                Доминант · уровень 12
+                Уровень {userData?.stats?.level ?? 0}
               </div>
             </div>
           </div>
           <div className="mt-8 grid grid-cols-3 gap-3 border-t border-white/10 pt-5 text-center">
             <div>
-              <div className="font-mono text-xl font-bold">27</div>
+              <div className="font-mono text-xl font-bold">{userData?.stats?.wins ?? 0}</div>
               <div className="text-[10px] text-[#aaa2b4]">побед</div>
             </div>
             <div>
-              <div className="font-mono text-xl font-bold">68%</div>
+              <div className="font-mono text-xl font-bold">{userData?.stats?.games ? Math.round((userData.stats.wins / userData.stats.games) * 100) + "%" : "0%"}</div>
               <div className="text-[10px] text-[#aaa2b4]">винрейт</div>
             </div>
             <div>
-              <div className="font-mono text-xl font-bold">19 ч</div>
+              <div className="font-mono text-xl font-bold">{Math.floor((userData?.minutesOnline ?? 0) / 60) + " ч"}</div>
               <div className="text-[10px] text-[#aaa2b4]">на арене</div>
             </div>
           </div>
-          <div className="mt-6">
-            <div className="mb-2 flex justify-between text-[11px]">
-              <span>Прогресс уровня</span>
-              <span className="font-mono text-[#e7ba68]">760 / 1 000 XP</span>
-            </div>
-            <div className="h-2 overflow-hidden rounded-full bg-white/10">
-              <div className="h-full w-[76%] rounded-full bg-[#e7ba68]" />
-            </div>
+                    <div className="mt-6">
+            {(() => {
+              const xp = userData?.stats?.xp ?? 0;
+              const xpInLevel = xp % 1000;
+              const percent = Math.min(100, Math.max(0, xpInLevel / 10));
+              const nextLevelXp = Math.floor(xp / 1000) * 1000 + 1000;
+              return (
+                <>
+                  <div className="mb-2 flex justify-between text-[11px]">
+                    <span>Прогресс уровня</span>
+                    <span className="font-mono text-[#e7ba68]">{xpInLevel} / 1000 XP</span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-[#e96852] to-[#e7ba68] transition-all duration-700 ease-out"
+                      style={{ width: `${percent}%` }}
+                    />
+                  </div>
+                </>
+              );
+            })()}
           </div>
+          {(() => {
+  const vipUntil = localStorage.getItem("arena-vip-until");
+  if (!vipUntil) return null;
+  const endDate = new Date(vipUntil);
+  if (endDate < new Date()) return null;
+  const daysLeft = Math.ceil((endDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+  return (
+    <div className="mt-4 rounded-xl bg-[#d3a247] p-3 text-white">
+      <div className="flex items-center justify-between">
+        <span className="font-bold">VIP активен</span>
+        <span className="font-mono">осталось {daysLeft} дн.</span>
+      </div>
+      <div className="mt-1 text-[10px] opacity-80">
+        До {endDate.toLocaleDateString("ru-RU")}
+      </div>
+    </div>
+  );
+})()}
         </div>
         <div className="rounded-2xl border border-card-border bg-card p-6">
           <div className="flex items-center justify-between">
@@ -2613,8 +3913,8 @@ function Profile({ onInventory }: { onInventory: () => void }) {
             <label className="text-xs font-bold">
               Уникальный ID
               <div className="mt-2 flex items-center gap-2 rounded-xl border border-input bg-muted px-3 py-2.5 text-sm font-normal text-muted-foreground">
-                <Hash size={15} /> MA-4821
-              </div>
+  <Hash size={15} /> {player?.id || "MA-XXXX"}
+</div>
             </label>
           </div>
           <div className="mt-5 border-t border-border pt-5">
@@ -2643,107 +3943,115 @@ function Profile({ onInventory }: { onInventory: () => void }) {
   );
 }
 
-function BoardGame({ onExit }: { onExit: () => void }) {
-  const [settings] = useLocalStorage<AdminSettings>(
-    "arena-admin-settings",
-    defaultSettings,
-  );
-  const [cardDesigns] = useLocalStorage<CardDesign[]>("arena-card-designs", []);
-  const [players, setPlayers] = useState<Player[]>(() => {
-    // 1. Определяем, сколько игроков должно быть (из лобби, по умолчанию 4)
-    let maxPlayers = 4;
-    try {
-      const savedMax = localStorage.getItem("arena-lobby-maxPlayers");
-      if (savedMax) {
-        const parsed = parseInt(savedMax, 10);
-        if (parsed >= 2 && parsed <= 6) maxPlayers = parsed;
-      }
-    } catch {
-      /* ignore */
-    }
+function BoardGame({ onExit, initialRoomId, currentUser }: { onExit: () => void; initialRoomId?: string | null; currentUser?: AuthUser | null }) {
+  const [settings] = useServerSync<AdminSettings>(
+  "arena-admin-settings",
+  defaultSettings,
+  ['admin-settings', 'admin-settings-updated'],
+  'get-admin-settings'
+);
+const [cardDesigns] = useServerSync<CardDesign[]>(
+  "arena-card-designs",
+  [],
+  ['card-designs', 'card-designs-updated'],
+  'get-card-designs'
+);
+const [marketItems] = useServerSync<MarketItem[]>(
+  "arena-market-items",
+  [],
+  ['custom-items-updated'],
+  'get-custom-items'
+);
+useEffect(() => { globalCardDesigns = cardDesigns; }, [cardDesigns]);
 
-    // 2. Определяем текущего игрока (как и было в старом коде)
-    let me: { name: string; initials: string; color: string } = {
-      name: "Лада Север",
-      initials: "ЛС",
-      color: "#e96852",
+    // Синхронизация активных скинов игрока при переключении в Inventory
+  useEffect(() => {
+    const handler = () => {
+      const skins = JSON.parse(localStorage.getItem("arena-active-skins") || "{}").activeSkins || {};
+      if (!skins || Object.keys(skins).length === 0) return;
+      setGlobalCustomSkins(prev => ({ ...prev, ...skins }));
     };
-    try {
-      const stored = localStorage.getItem("arena-session-user");
-      if (stored) {
-        const u = JSON.parse(stored) as AuthUser;
-        if (u?.name) {
-          const parts = u.name.trim().split(/\s+/);
-          const initials = parts
-            .slice(0, 2)
-            .map((p: string) => p[0])
-            .join("")
-            .toUpperCase();
-          me = {
-            name: u.name,
-            initials: u.initials || initials,
-            color: PLAYER_COLORS[0],
-          };
-        }
-      } else {
-        const nickname = localStorage.getItem("arena-nickname");
-        if (nickname) {
-          const parts = nickname.trim().split(/\s+/);
-          const initials = parts
-            .slice(0, 2)
-            .map((p: string) => p[0])
-            .join("")
-            .toUpperCase();
-          me = { name: nickname, initials, color: PLAYER_COLORS[0] };
-        }
-      }
-    } catch {
-      /* ignore */
-    }
+    window.addEventListener("storage", handler);
+    return () => {
+      window.removeEventListener("storage", handler);
+    };
+  }, []);
 
-    // Функция перемешивания Кассива (Фишер-Йетс)
-    function shuffleArray<T>(array: T[]): T[] {
-      const arr = [...array];
-      for (let i = arr.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [arr[i], arr[j]] = [arr[j], arr[i]];
-      }
-      return arr;
-    }
+    // Игроки приходят из пропсов, если игра мультиплеерная
+  const [players, setPlayers] = useState<Player[]>([]);
+  const playersRef = useRef<Player[]>([]);
+  const [rolled, setRolled] = useState(false);
+  const [owners, setOwners] = useState<Record<number, string>>({});
 
-    // 3. Берем нужное количество игроков, применяем данные и перемешиваем
-    const playersArray = initialPlayers
-      .slice(0, maxPlayers)
-      .map((p) =>
-        p.id === "you"
-          ? { ...p, ...me, money: settings.startCapital, position: 0 }
-          : { ...p, money: settings.startCapital, position: 0 },
+      // Пересчёт глобальных скинов при изменении players или marketItems
+  useEffect(() => {
+    if (!players || players.length === 0) return;
+    if (!marketItems || marketItems.length === 0) return;
+    const playersWithSkins = players.filter(p => p && p.activeSkins && Object.keys(p.activeSkins).length > 0);
+    if (playersWithSkins.length === 0) return;
+
+    const activeSlots: Record<number, { vip: boolean; playerId: string }[]> = {};
+    playersWithSkins.forEach((p: any) => {
+      const skins = p.activeSkins || {};
+      Object.keys(skins).forEach((slotKey) => {
+        const slot = Number(slotKey);
+        if (!activeSlots[slot]) activeSlots[slot] = [];
+        activeSlots[slot].push({ vip: !!p.isVip, playerId: p.id });
+      });
+    });
+
+    const resolvedSkins: Record<number, string> = {};
+    Object.keys(activeSlots).forEach((slotKey) => {
+      const slot = Number(slotKey);
+      const item = marketItems.find(
+        (m) => m.category === "card" && m.slotIndex === slot && m.isActive !== false
       );
-    // Возвращаем перемешанный Кассив (первый игрок в Кассиве будет ходить первым)
-    return shuffleArray(playersArray);
-  });
+      if (item) resolvedSkins[slot] = item.id;
+    });
+
+        setGlobalCustomSkins((prev) => ({ ...prev, ...resolvedSkins }));
+  }, [players, marketItems]);
+
+  const [isDoubleRoll, setIsDoubleRoll] = useState(false);
+  const [doubleCount, setDoubleCount] = useState(0);
+const diceRollingRef = useRef(false);
+const isSpinningRef = useRef(false);
+const timeLeftRef = useRef(45);
+  const turnRef = useRef(0);
+  const ownersRef = useRef<Record<number, string>>({});
+  const improvementsRef = useRef<Record<number, number>>({});
+  const mortgagesRef = useRef<Record<number, number>>({});
+  const jackpotRef = useRef(0);
+  const globalTurnCounterRef = useRef(0);
+  const gameOverRef = useRef(false);
+  const isRemoteUpdate = useRef(false);
+  const lastReceivedStateRef = useRef("");
+  const movingPlayerIdRef = useRef<string | null>(null);
+  const rolledRef = useRef(false); // <--- ДОБАВЛЕНО
+  const isDoubleRollRef = useRef(false); // <--- ДОБАВЛЕНО
+  const rewardRef = useRef<string | null>(null);
+  const rewardGivenRef = useRef(false); // защита от повторного начисления
+  const eliminationOrderRef = useRef<string[]>([]); // порядок выбывания по банкротству
+const auctionRef = useRef<AuctionState | null>(null);
+const pendingJailMovementRef = useRef<{ d1: number; d2: number; capturedTurn: number } | null>(null);
   const [turn, setTurn] = useState(0);
   const [mortgages, setMortgages] = useState<Record<number, number>>({});
   const [globalTurnCounter, setGlobalTurnCounter] = useState(0);
   const getRent = (cellIdx: number, impr: Record<number, number>) => {
-    if (
-      mortgages[cellIdx] !== undefined &&
-      mortgages[cellIdx] > globalTurnCounter
-    ) {
-      return 0;
-    }
-    return Math.floor(
-      (boardCells[cellIdx].rent ?? 0) *
-        RENT_MULTIPLIERS[Math.min(impr[cellIdx] ?? 0, 5)],
-    );
-  };
+  if (mortgages[cellIdx] !== undefined && mortgages[cellIdx] > globalTurnCounter) return 0;
+  // Базовая рента = 10% от стоимости поля
+  const basePrice = getCell(cellIdx).price ?? 0;
+  const rent = basePrice * 0.1 * RENT_MULTIPLIERS[Math.min(impr[cellIdx] ?? 0, 5)];
+  return Math.round(rent / 10) * 10;
+};
 
   const [dice, setDice] = useState<[number, number]>([2, 3]);
   const [targetDice, setTargetDice] = useState<[number, number]>([2, 3]);
   const [isSpinning, setIsSpinning] = useState(false);
   const [diceRolling, setDiceRolling] = useState(false);
-  const [rolled, setRolled] = useState(false);
-  const [owners, setOwners] = useState<Record<number, string>>({});
+  useEffect(() => { playersRef.current = players; }, [players]);
+  useEffect(() => { diceRollingRef.current = diceRolling; }, [diceRolling]);
+  useEffect(() => { isSpinningRef.current = isSpinning; }, [isSpinning]);
   const [jackpot, setJackpot] = useState(0);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(
     null,
@@ -2754,13 +4062,296 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     number[]
   >([]);
   const [animPath, setAnimPath] = useState<number[] | null>(null);
+  const animPathRef = useRef<number[] | null>(null);
+useEffect(() => { animPathRef.current = animPath; }, [animPath]);
   const [animStep, setAnimStep] = useState(0);
   const [selectedCell, setSelectedCell] = useState<number | null>(null);
   const [selectedPos, setSelectedPos] = useState<{
     x: number;
     y: number;
   } | null>(null);
-  const [jailPaymentPending, setJailPaymentPending] = useState(false);
+    const [jailPaymentPending, setJailPaymentPending] = useState(false);
+    const [fireTrailAnim, setFireTrailAnim] = useState<{
+    from: number;
+    to: number;
+    playerId: string;
+  } | null>(null);
+  // (удалено — скорость теперь константа 320ms)
+  const [diagonalAnim, setDiagonalAnim] = useState<{ from: number; to: number; playerId: string } | null>(null);
+
+    // ---- ИСПРАВЛЕННАЯ СИНХРОНИЗАЦИЯ ----
+  const joinedRef = useRef(false); // <-- ЗАЩИТА ОТ ПОВТОРНОГО ОТПРАВЛЕНИЯ
+
+  // ---- НАЧАЛО ВСТАВКИ: СИНХРОНИЗАЦИЯ ИГРОКОВ И СОЛО-ГЕНЕРАЦИЯ ----
+  useEffect(() => {
+    // Если это соло-игра (нет ID комнаты) — создаём локальных игроков
+    if (!initialRoomId) {
+      let maxPlayers = 4;
+      try {
+        const savedMax = localStorage.getItem("arena-lobby-maxPlayers");
+        if (savedMax) {
+          const parsed = parseInt(savedMax, 10);
+          if (parsed >= 2 && parsed <= 6) maxPlayers = parsed;
+        }
+      } catch {}
+
+      let me: { name: string; initials: string; color: string } = {
+        name: "Игрок",
+        initials: "ИГ",
+        color: "#e96852",
+      };
+      try {
+        const stored = localStorage.getItem("arena-session-user");
+        if (stored) {
+          const u = JSON.parse(stored) as AuthUser;
+          if (u?.name) {
+            const parts = u.name.trim().split(/\s+/);
+            const initials = parts.slice(0, 2).map((p: string) => p[0]).join("").toUpperCase();
+            me = { name: u.name, initials: u.initials || initials, color: PLAYER_COLORS[0] };
+          }
+        } else {
+          const nickname = localStorage.getItem("arena-nickname");
+          if (nickname) {
+            const parts = nickname.trim().split(/\s+/);
+            const initials = parts.slice(0, 2).map((p: string) => p[0]).join("").toUpperCase();
+            me = { name: nickname, initials, color: PLAYER_COLORS[0] };
+          }
+        }
+      } catch {}
+
+      function shuffleArray<T>(array: T[]): T[] {
+        const arr = [...array];
+        for (let i = arr.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [arr[i], arr[j]] = [arr[j], arr[i]];
+        }
+        return arr;
+      }
+
+      const localPlayers = initialPlayers
+        .slice(0, maxPlayers)
+        .map((p) =>
+          p.id === "you"
+            ? { ...p, ...me, money: settings.startCapital, position: 0 }
+            : { ...p, money: settings.startCapital, position: 0 },
+        );
+      setPlayers(shuffleArray(localPlayers));
+      // Для соло-игры сами ставим кастомные скины из localStorage
+      const localSkins = JSON.parse(localStorage.getItem("arena-active-skins") || "{}").activeSkins || {};
+      setGlobalCustomSkins(localSkins);
+      return;
+    }
+
+    // Если игра уже запущена в мультиплеере, больше не отправляем запрос
+    if (joinedRef.current) return;
+    joinedRef.current = true;
+
+        // Выбираем случайный индекс цвета от 0 до 4
+    const randomColorIndex = Math.floor(Math.random() * PLAYER_COLORS.length);
+
+    let me = {
+      id: currentUser?.id || "you",
+      name: currentUser?.name || "Игрок",
+      initials: currentUser?.initials || "ИГ",
+      color: PLAYER_COLORS[randomColorIndex], // <-- ТЕПЕРЬ ЦВЕТ СЛУЧАЙНЫЙ
+      money: settings.startCapital,
+      position: 0,
+      vipUntil: localStorage.getItem("arena-vip-until") || undefined,
+      activeSkins: JSON.parse(localStorage.getItem("arena-active-skins") || "{}").activeSkins || {},
+    };
+
+    if (initialRoomId) {
+      console.log("Отправляем enter-game-room для комнаты:", initialRoomId);
+      socket.emit('enter-game-room', { roomId: initialRoomId, playerData: me });
+    }
+
+    const handlePlayersUpdate = (serverPlayers: any[]) => {
+  console.log("✅ Игроки получены от сервера:", serverPlayers);
+  // ВАЖНО: убираем null и undefined из массива, чтобы не сломать игру!
+  const cleanPlayers = serverPlayers.filter(p => p !== null && p !== undefined);
+  if (!cleanPlayers || cleanPlayers.length === 0) {
+    console.warn("⚠️ Сервер прислал пустой список игроков, пропускаем рендер...");
+    return;
+  }
+  setPlayers(cleanPlayers);
+
+      const resolveGameDesigns = (serverPlayers: any[]) => {
+    if (!serverPlayers || serverPlayers.length === 0) return;
+    if (!marketItems || marketItems.length === 0) return;
+    // Собираем какие слоты вообще активированы (без анализа конкретного ID)
+    const activeSlots: Record<number, { vip: boolean; playerId: string }[]> = {};
+
+    serverPlayers.forEach((p: any) => {
+      if (!p) return;
+      const skins = p.activeSkins || {};
+      Object.keys(skins).forEach((slotKey) => {
+        const slot = Number(slotKey);
+        if (!activeSlots[slot]) activeSlots[slot] = [];
+        activeSlots[slot].push({ vip: !!p.isVip, playerId: p.id });
+      });
+    });
+
+    const resolvedSkins: Record<number, string> = {};
+    Object.keys(activeSlots).forEach((slotKey) => {
+      const slot = Number(slotKey);
+      // Ищем товар-карточку в магазине по slotIndex — игнорируя конкретный id
+      const item = marketItems.find(
+        (m) => m.category === "card" && m.slotIndex === slot && m.isActive !== false
+      );
+      if (item) resolvedSkins[slot] = item.id;
+    });
+
+    setGlobalCustomSkins((prev) => ({ ...prev, ...resolvedSkins }));
+  };
+resolveGameDesigns(cleanPlayers);
+};
+
+    const handleBroadcastMessage = (msg: any) => {
+      setChatMessages((old) => [...old, msg]);
+    };
+
+    // Принимаем игровые логи от других игроков
+    const handleGameLogBroadcast = (entry: any) => {
+      setLog((old) => [...old, entry].slice(-50));
+    };
+
+    // Подписываемся на события сервера строго один раз при монтировании
+    socket.on('update-game-players', handlePlayersUpdate);
+    socket.on('game-chat-message-broadcast', handleBroadcastMessage);
+    socket.on('game-log-add-broadcast', handleGameLogBroadcast);
+    // Обработчик получения нового таймера
+    socket.on('sync-timer-broadcast', (newTime) => {
+      setTimeLeft(newTime);
+    });
+
+            socket.on('server-roll-result', ({ d1, d2, playerId }) => {
+      const steps = d1 + d2;
+      const activePlayerIdx = playersRef.current.findIndex(p => p.id === playerId); 
+      if (activePlayerIdx === -1) return;
+
+      // ЕСЛИ ИГРОК В ТЮРЬМЕ, ЗАПУСКАЕМ ЛОГИКУ ТЮРЬМЫ С СЕРВЕРНЫМИ КУБИКАМИ
+      const isPlayerInJail = (playersRef.current[activePlayerIdx]?.jailTurns ?? 0) > 0;
+      if (isPlayerInJail) {
+          if ((currentUser?.id || "you") === playerId) {
+           rollJail(d1, d2, playerId);
+        } else {
+             // Обновляем позицию для наблюдателя
+             setPlayers((prevPlayers) =>
+                prevPlayers.map((p, i) => (i === activePlayerIdx ? { ...p, position: (p.position + steps) % 40 } : p))
+             );
+          }
+          return;
+      }
+
+      const oldPos = playersRef.current[activePlayerIdx]?.position || 0;
+      const isDoubles = d1 === d2;
+
+            doRollAnimation(d1, d2, () => {
+                const path: number[] = [oldPos];
+        for (let i = 1; i <= steps; i++) path.push((oldPos + i) % 40);
+        const finalPos = path[path.length - 1];
+        
+        movingPlayerIdRef.current = playerId;
+        setAnimStep(0);
+        setAnimPath(path);
+
+         const isMyTurn = playersRef.current[activePlayerIdx]?.id === (currentUser?.id || "you");
+
+        if (isMyTurn) {
+          // ЛОГ ДОБАВЛЯЕТСЯ ТОЛЬКО ТЕМ, КТО БРОСАЕТ
+          addLog(`🎲 ${playersRef.current[activePlayerIdx]?.name} выбросил ${d1} и ${d2} = ${steps}`);
+          
+          afterAnimRef.current = () => {
+            setPlayers((prevPlayers) =>
+              prevPlayers.map((p, i) => (i === activePlayerIdx ? { ...p, position: finalPos } : p))
+            );
+            setRolled(true);
+            setIsDoubleRoll(isDoubles);
+            processLanding(finalPos, oldPos, activePlayerIdx);
+          };
+        } else {
+          setPlayers((prevPlayers) =>
+            prevPlayers.map((p, i) => (i === activePlayerIdx ? { ...p, position: finalPos } : p))
+          );
+        }
+      });
+    });
+
+          socket.on('update-remote-state', (data) => {
+      if (data.senderId === (currentUser?.id || "you")) return;
+
+      // ВАЖНО! Сравниваем данные...
+      const stateString = JSON.stringify(data);
+      if (lastReceivedStateRef.current === stateString) return;
+      lastReceivedStateRef.current = stateString;
+
+      // Обновляем всё, что пришло (даже если игроки пустые, но владельцы/ход изменились!)
+      if (data.players && data.players.length > 0) {
+        setPlayers(data.players.filter((p: any) => p !== null && p !== undefined));
+      }
+      setOwners(data.owners);
+      setImprovements(data.improvements);
+      setTurn(data.turn);
+      setGlobalTurnCounter(data.globalTurnCounter);
+      setJackpot(data.jackpot);
+      setMortgages(data.mortgages || {});
+      setRolled(data.rolled ?? false); 
+      setIsDoubleRoll(data.isDoubleRoll ?? false); 
+      
+      if (data.gameOver) setGameOver(true);
+      if (data.reward) setReward(data.reward);
+      if (data.auction) setAuction(data.auction);
+      else setAuction(null); 
+    });
+
+    // ВСТАВИТЬ ЭТИ 4 БЛОКА СЮДА (после закрывающей скобки update-remote-state, но внутри useEffect):
+    socket.on('player-left', (playerId) => {
+      // Живой игрок вышел — награды не получает, помечаем leftAlive
+      handleVoluntaryLeave(playerId);
+    });
+
+    socket.on('game-ended', () => {
+      if (rewardGivenRef.current) return; // уже наградили — не дублируем
+      setGameOver(true);
+      window.setTimeout(finishGame, 200);
+    });
+
+    socket.on('trade-proposed-broadcast', (data) => {
+      const initiatorId = data.initiatorId;
+      const trade = data.trade;
+      const targetIdx = playersRef.current.findIndex(p => p.id === (currentUser?.id || "you"));
+      const initiatorIdx = playersRef.current.findIndex(p => p.id === initiatorId);
+      if (targetIdx !== -1 && initiatorIdx !== -1) {
+        setTradeInitiator({ id: initiatorId, fromIdx: initiatorIdx, isDouble: data.isDoubleRoll, doubleCount: data.doubleCount });
+        setPendingTrade({ initiatorId, trade });
+        setTurn(targetIdx);
+        setRolled(false);
+      }
+    });
+
+    socket.on('trade-resolved-broadcast', ({ initiatorId }) => {
+      if (initiatorId === (currentUser?.id || "you")) {
+        setTrade(null);
+        setPendingTrade(null);
+      }
+    });
+
+    // 🌟 ВАЖНО: Тотальная очистка всех сокетов при размонтировании
+        return () => {
+      socket.off('update-game-players', handlePlayersUpdate);
+      socket.off('game-chat-message-broadcast', handleBroadcastMessage);
+      socket.off('server-roll-result');
+      socket.off('game-log-add-broadcast', handleGameLogBroadcast);
+      socket.off('player-left'); // <--- ДОБАВИТЬ
+      socket.off('game-ended');  // <--- ДОБАВИТЬ
+      socket.off('sync-timer-broadcast'); // <--- ДОБАВИТЬ ЭТУ СТРОКУ
+      socket.off('trade-proposed-broadcast');
+      socket.off('trade-resolved-broadcast');
+    };
+  }, [initialRoomId, settings.startCapital, currentUser]);
+
+  // ---- КОНЕЦ ВСТАВКИ ----
+
   // ВСТАВИТЬ ЭТОТ БЛОК (Закрываем попап при смене хода)
   useEffect(() => {
     setSelectedCell(null);
@@ -2820,6 +4411,51 @@ function BoardGame({ onExit }: { onExit: () => void }) {
   ]);
 
   const [timeLeft, setTimeLeft] = useState(45);
+
+  // При открытии окна действия (покупка/аренда/налог/шанс) даём игроку свежие 45 секунд
+  useEffect(() => {
+    if (pendingAction) {
+      setTimeLeft(45);
+      timeoutHandled.current = false;
+    }
+  }, [pendingAction]);
+  const [socketConnected, setSocketConnected] = useState(socket.connected);
+
+  // Следим за состоянием соединения — показываем оверлей при разрыве
+  useEffect(() => {
+    const onConnect = () => {
+      setSocketConnected(true);
+      if (initialRoomId && currentUser?.id) {
+        let me = {
+          id: currentUser.id,
+          name: currentUser.name,
+          initials: currentUser.initials,
+          color: "#e63946",
+          money: 0,
+          position: 0,
+          vipUntil: localStorage.getItem("arena-vip-until") || undefined,
+          activeSkins: JSON.parse(localStorage.getItem("arena-active-skins") || "{}").activeSkins || {},
+        };
+        socket.emit('enter-game-room', { roomId: initialRoomId, playerData: me });
+      }
+    };
+    const onDisconnect = () => setSocketConnected(false);
+    socket.on('connect', onConnect);
+    socket.on('disconnect', onDisconnect);
+
+    // ⚡ Если сокет УЖЕ подключён на момент монтирования BoardGame —
+    //    эмитим enter-game-room вручную, чтобы сервер снял флаг disconnected
+    //    и отменил таймер авто-банкротства.
+    if (socket.connected && initialRoomId && currentUser?.id) {
+      // Небольшая задержка, чтобы основной useEffect успел положить данные
+      window.setTimeout(onConnect, 50);
+    }
+
+    return () => {
+      socket.off('connect', onConnect);
+      socket.off('disconnect', onDisconnect);
+    };
+  }, [initialRoomId, currentUser?.id]);
   const [vote, setVote] = useState<{
     target: Player;
     votes: Record<string, "yes" | "no">;
@@ -2828,17 +4464,30 @@ function BoardGame({ onExit }: { onExit: () => void }) {
   const [voteLog, setVoteLog] = useState<string[]>([]);
   const [gameOver, setGameOver] = useState(false);
   const [reward, setReward] = useState<string | null>(null);
+  useEffect(() => { turnRef.current = turn; }, [turn]);
+  useEffect(() => { ownersRef.current = owners; }, [owners]);
+  useEffect(() => { improvementsRef.current = improvements; }, [improvements]);
+  useEffect(() => { mortgagesRef.current = mortgages; }, [mortgages]);
+  useEffect(() => { jackpotRef.current = jackpot; }, [jackpot]);
+  useEffect(() => { rolledRef.current = rolled; }, [rolled]); // <--- ДОБАВЛЕНО
+  useEffect(() => { isDoubleRollRef.current = isDoubleRoll; }, [isDoubleRoll]); // <--- ДОБАВЛЕНО
+  useEffect(() => { globalTurnCounterRef.current = globalTurnCounter; }, [globalTurnCounter]);
+  useEffect(() => { gameOverRef.current = gameOver; }, [gameOver]);
+  useEffect(() => { rewardRef.current = reward; }, [reward]);
+  useEffect(() => { auctionRef.current = auction; }, [auction]);
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState<
     { from: string; text: string; timestamp: number }[]
   >([]);
-  const [doubleCount, setDoubleCount] = useState(0);
-  const [isDoubleRoll, setIsDoubleRoll] = useState(false);
+  const logContainerRef = useRef<HTMLDivElement>(null);
+  const [chatAutoScroll, setChatAutoScroll] = useState(true);
+  const [globalCustomSkins, setGlobalCustomSkins] = useState<Record<number, string>>({});
   const timeoutHandled = useRef(false);
   const voteHandled = useRef(false);
   const afterAnimRef = useRef<(() => void) | null>(null);
 
-  const current = players[turn];
+  const current = players && players[turn] ? players[turn] : null;
+  const player = current as Player;
   // --- 3D DICE IMPLEMENTATION ---
   const getFinalAngles = (val: number) => {
     switch (val) {
@@ -2949,13 +4598,24 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     const [rotY, setRotY] = useState(0);
 
     useEffect(() => {
-      let interval: NodeJS.Timeout | null = null;
+      let rafId: number | null = null;
+      let lastTime = 0;
+      const FRAME_MS = 1000 / 60; // 60 FPS
+      // Пересчёт скорости: было 12–36° каждые 70мс, стало ≈2.9–8.6° каждые ~16.7мс
+      const SPEED = (12 + Math.random() * 24) * (FRAME_MS / 70);
+
+      const tick = (now: number) => {
+        if (lastTime === 0) lastTime = now;
+        if (now - lastTime >= FRAME_MS) {
+          setRotX((prev) => (prev + SPEED) % 360);
+          setRotY((prev) => (prev + SPEED) % 360);
+          lastTime = now;
+        }
+        rafId = requestAnimationFrame(tick);
+      };
+
       if (isRolling) {
-        // Вращение с уменьшенной на 40% скоростью (интервал 70мс, угол 12-36)
-        interval = setInterval(() => {
-          setRotX((prev) => (prev + 12 + Math.random() * 24) % 360);
-          setRotY((prev) => (prev + 12 + Math.random() * 24) % 360);
-        }, 70); // <-- Увеличили время с 50 до 70 Кс
+        rafId = requestAnimationFrame(tick);
       } else {
         // При остановке плавно приходим к целевым углам
         const finalAngles = getFinalAngles(value);
@@ -2963,7 +4623,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
         setRotY(finalAngles.y);
       }
       return () => {
-        if (interval) clearInterval(interval);
+        if (rafId) cancelAnimationFrame(rafId);
       };
     }, [isRolling, value]);
 
@@ -2997,8 +4657,8 @@ function BoardGame({ onExit }: { onExit: () => void }) {
   // --- END 3D DICE IMPLEMENTATION ---
   const alive = players.filter((p) => !p.bankrupt);
   const total = dice[0] + dice[1];
-  const inJail = (current.jailTurns ?? 0) > 0;
-  const currentCellName = boardCells[current.position]?.name ?? "?";
+  const inJail = (player?.jailTurns ?? 0) > 0;
+const currentCellName = boardCells[player?.position ?? 0]?.name ?? "?";
   const CORNER = new Set([0, 10, 20, 30]);
   const busy =
     rolled ||
@@ -3008,51 +4668,114 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     gameOver ||
     !!animPath ||
     diceRolling;
+    jailPaymentPending;
 
-  const monopolyGroups = GROUPS.map((g, gIdx) => ({
-    gIdx,
-    group: g,
-    has: g.cells.every((ci) => owners[ci] === current.id),
-  })).filter((x) => x.has);
+  const dynamicGroups = getDynamicGroups();
+const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
+  gIdx,
+  group,
+  has: player?.id ? (group.cells as readonly number[]).every((ci) => owners[ci] === player.id) : false,
+})).filter((x) => x.has);
+    const getCellCenterPct = (index: number) => {
+    const { row, col } = cellGridPos(index);
+    const sizes = [1.9, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1.9];
+    const totalFr = 12.8;
+    let xFr = 0;
+    for (let i = 0; i < col - 1; i++) xFr += sizes[i];
+    xFr += sizes[col - 1] / 2;
+    let yFr = 0;
+    for (let i = 0; i < row - 1; i++) yFr += sizes[i];
+    yFr += sizes[row - 1] / 2;
+    return { x: (xFr / totalFr) * 100, y: (yFr / totalFr) * 100 };
+  };
+  const isAnimating = !!animPath && animPath.length > 0;
+  const movingPlayerId = isAnimating ? movingPlayerIdRef.current : null;
+  const movingPlayer = movingPlayerId ? players.find((p) => p.id === movingPlayerId) : null;
+  const movingCellIdx = animPath ? animPath[Math.min(animStep, animPath.length - 1)] : null;
+
   const getDisplayPos = (pid: string) => {
-    if (animPath && pid === current.id)
-      return animPath[Math.min(animStep, animPath.length - 1)];
-    return players.find((p) => p.id === pid)?.position ?? 0;
+  if (animPath && pid === movingPlayerIdRef.current)
+    return animPath[Math.min(animStep, animPath.length - 1)];
+  return players.find((p) => p.id === pid)?.position ?? 0;
+};
+
+    const addLog = (entry: string, type: "default" | "special" = "default") => {
+    const logEntry = { text: entry, type, timestamp: Date.now() };
+    setLog((old) => [...old, logEntry].slice(-50));
+    
+    // Если это мультиплеер, отправляем лог на сервер, чтобы его увидели другие игроки
+    if (initialRoomId) {
+      socket.emit('game-log-add', { roomId: initialRoomId, entry: logEntry });
+    }
   };
 
-  const addLog = (entry: string, type: "default" | "special" = "default") =>
-    setLog((old) =>
-      [...old, { text: entry, type, timestamp: Date.now() }].slice(-50),
-    );
-  const sendChat = (e: FormEvent) => {
+    // Отправляем на сервер событие о выполнении ежедневного квеста.
+  // Сервер проверит, что это наш игрок, и засчитает квест.
+  const emitQuestEvent = (questId: string) => {
+    const myId = currentUser?.id;
+    if (!myId) return;
+    socket.emit('quest-event', { userId: myId, questId });
+  };
+    const sendChat = (e: FormEvent) => {
     e.preventDefault();
     if (!chatInput.trim()) return;
-    setChatMessages((old) => [
-      ...old,
-      { from: current.name, text: chatInput.trim(), timestamp: Date.now() },
-    ]);
+
+    // Отправляем сообщение на сервер в конкретную комнату
+    socket.emit('game-chat-message', {
+      roomId: initialRoomId,
+      from: currentUser?.name || "Игрок",
+      text: chatInput.trim(),
+      timestamp: Date.now()
+    });
     setChatInput("");
   };
 
-  const nextAliveIndex = (from: number) => {
-    for (let s = 1; s <= players.length; s++) {
-      const i = (from + s) % players.length;
-      if (!players[i].bankrupt) return i;
+  // Автоскролл вниз при новых логах/сообщениях, если пользователь у нижнего края
+  useEffect(() => {
+    if (!chatAutoScroll) return;
+    const el = logContainerRef.current;
+    if (!el) return;
+    // Прокручиваем в самый низ при появлении новых данных
+    el.scrollTop = el.scrollHeight;
+  }, [log, chatMessages, chatAutoScroll]);
+
+  // Если пользователь улистал вверх/в середину — через 60 сек возвращаем его вниз
+  useEffect(() => {
+    if (chatAutoScroll) return; // он уже внизу — таймер не нужен
+    const timer = window.setTimeout(() => {
+      const el = logContainerRef.current;
+      if (!el) return;
+      // Плавный скролл вниз
+      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+      // Через мгновение включаем автоскролл, чтобы onScroll не отключил его обратно
+      window.setTimeout(() => setChatAutoScroll(true), 400);
+    }, 60_000); // 60 секунд
+    return () => window.clearTimeout(timer);
+  }, [chatAutoScroll]);
+
+    const nextAliveIndex = (from: number) => {
+    // Фильтруем null/undefined игроков, чтобы не было краха и застревания хода
+    const validPlayers = playersRef.current.filter(p => p !== null && p !== undefined);
+    if (validPlayers.length === 0) return from;
+
+    for (let s = 1; s <= validPlayers.length; s++) {
+      const i = (from + s) % validPlayers.length;
+      if (!validPlayers[i].bankrupt) return i;
     }
     return from;
   };
 
-  const advanceTurn = (fromIdx = turn, forceNext = false) => {
-    const nextGlobalTurn = globalTurnCounter + 1;
+    const advanceTurn = (fromIdx = turnRef.current, forceNext = false) => {
+    const nextGlobalTurn = globalTurnCounterRef.current + 1;
     setGlobalTurnCounter(nextGlobalTurn);
 
     // Проверяем и очищаем истекшие залоги (если ход counter > залогового срока)
-    const expired = Object.keys(mortgages).filter(
-      (key) => mortgages[Number(key)] <= nextGlobalTurn,
+    const expired = Object.keys(mortgagesRef.current).filter(
+      (key) => mortgagesRef.current[Number(key)] <= nextGlobalTurn,
     );
     if (expired.length > 0) {
-      const newOwners = { ...owners };
-      const newMortgages = { ...mortgages };
+      const newOwners = { ...ownersRef.current };
+      const newMortgages = { ...mortgagesRef.current };
       expired.forEach((key) => {
         const idx = Number(key);
         if (newOwners[idx]) {
@@ -3066,57 +4789,101 @@ function BoardGame({ onExit }: { onExit: () => void }) {
       setOwners(newOwners);
       setMortgages(newMortgages);
     }
-    // Если это дубль (1-й или 2-й), Кы не переключаем ход, а даём бросать снова тому же игроку
+
+    // Если это дубль (1-й или 2-й), мы не переключаем ход, а даём бросать снова тому же игроку
     if (!forceNext && isDoubleRoll && doubleCount < 3) {
       setRolled(false);
       setTimeLeft(45);
       setImprovedGroupsThisTurn([]);
       timeoutHandled.current = false;
-      setMessage(`${players[fromIdx].name}, дубль! Бросай кубики снова.`);
-      return; // Ход не Кеняется
+      setMessage(`${playersRef.current[fromIdx].name}, дубль! Бросай кубики снова.`);
+      return;
     }
     const next = nextAliveIndex(fromIdx);
     setTurn(next);
+    // ДОБАВЛЯЕМ ОТПРАВКУ НОВОГО ТАЙМЕРА ВСЕМ
+    if (initialRoomId) {
+      socket.emit('sync-timer', { roomId: initialRoomId, timeLeft: 45 });
+    }
+    
     setRolled(false);
     setTimeLeft(45);
     setImprovedGroupsThisTurn([]);
     setDoubleCount(0);
     setIsDoubleRoll(false);
     timeoutHandled.current = false;
-    setMessage(`${players[next].name}, твой ход. Бросай кости.`);
+    setMessage(`${playersRef.current[next].name}, твой ход. Бросай кости.`);
   };
+  
 
+  // Настоящее банкротство — даёт право на награду по месту
   const bankruptPlayer = (index: number, reason: string) => {
+    const allPlayers = playersRef.current;
+    const targetPlayer = allPlayers[index];
+    if (!targetPlayer) return;
+    if (targetPlayer.bankrupt) return; // уже выбыл
+
+    // Ежедневный квест "Сыграй 1 партию" — засчитываем только тому,
+    // кто реально обанкротился внутри партии, а не вышел живым.
+    if (targetPlayer.id === currentUser?.id && !targetPlayer.leftAlive) {
+      emitQuestEvent("playGame");
+    }
+
     setPlayers((old) =>
       old.map((p, i) => (i === index ? { ...p, bankrupt: true, money: 0 } : p)),
     );
-    addLog(`💀 ${players[index].name} — банкрот: ${reason}`);
 
-    // Очищаем поля, постройки И ЗАЛОГИ банкрота
-    const newOwners = { ...owners };
-    const newImprovements = { ...improvements };
-    const newMortgages = { ...mortgages };
+    // Записываем порядок выбывания (первый — последнее место)
+    if (!eliminationOrderRef.current.includes(targetPlayer.id)) {
+      eliminationOrderRef.current.push(targetPlayer.id);
+    }
+
+    addLog(`💀 ${targetPlayer.name} — банкрот: ${reason}`);
+
+    const newOwners = { ...ownersRef.current };
+    const newImprovements = { ...improvementsRef.current };
+    const newMortgages = { ...mortgagesRef.current };
     Object.keys(newOwners).forEach((key) => {
       const cellIdx = Number(key);
-      if (newOwners[cellIdx] === players[index].id) {
+      if (newOwners[cellIdx] === targetPlayer.id) {
         delete newOwners[cellIdx];
         delete newImprovements[cellIdx];
-        delete newMortgages[cellIdx]; // Очищаем залог!
+        delete newMortgages[cellIdx];
       }
     });
     setOwners(newOwners);
     setImprovements(newImprovements);
-    setMortgages(newMortgages); // Применяем очистку залогов
+    setMortgages(newMortgages);
     addLog(
-      `🏚 Поля, постройки и залоги игрока ${players[index].name} возвращены в банк.`,
+      `🏚 Поля, постройки и залоги игрока ${targetPlayer.name} возвращены в банк.`,
     );
 
-    const remainingAlive = players.filter((p, i) => i !== index && !p.bankrupt);
+    const remainingAlive = allPlayers.filter((p, i) => i !== index && !p.bankrupt);
     if (remainingAlive.length <= 1) {
       setGameOver(true);
       window.setTimeout(finishGame, 300);
     } else {
-      advanceTurn(index, true); // forceNext = true, чтобы дубли не Кешали смене хода
+      advanceTurn(index, true);
+    }
+  };
+
+  // Выход живым — награду не даёт, в eliminationOrder не попадает
+  const handleVoluntaryLeave = (playerId: string) => {
+    const allPlayers = playersRef.current;
+    const idx = allPlayers.findIndex(p => p.id === playerId);
+    if (idx === -1) return;
+    const leaving = allPlayers[idx];
+    if (leaving.bankrupt) return; // уже выбыл — не наш случай
+
+    setPlayers((old) =>
+      old.map((p, i) => (i === idx ? { ...p, bankrupt: true, leftAlive: true, money: 0 } : p)),
+    );
+    addLog(`🚪 ${leaving.name} покинул игру досрочно (без награды).`);
+
+    const remainingAlive = allPlayers.filter((p, i) => i !== idx && !p.bankrupt);
+    if (remainingAlive.length <= 1) {
+      setGameOver(true);
+      window.setTimeout(finishGame, 300);
     }
   };
 
@@ -3127,6 +4894,11 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     const result = `🗳 Голосование: ${yes}/${tot} «Да». ${target.name} ${stays ? "остаётся" : "выбывает"}.`;
     addLog(result);
     setVote(null);
+
+    // Закрываем окна действий — игрок проигнорировал свой ход
+    if (pendingAction) setPendingAction(null);
+    if (auction) setAuction(null);
+
     if (stays) advanceTurn(turn);
     else bankruptPlayer(turn, "решение стола");
   };
@@ -3142,31 +4914,30 @@ function BoardGame({ onExit }: { onExit: () => void }) {
   };
 
   const handleTimeout = () => {
-    if (
-      timeoutHandled.current ||
-      rolled ||
-      pendingAction ||
-      auction ||
-      animPath ||
-      diceRolling
-    )
-      return;
+    if (timeoutHandled.current || auction || animPath || diceRolling) return;
+    // Если ход уже сделан и окон не открыто — тайм-аут ни к чему
+    if (rolled && !pendingAction) return;
     timeoutHandled.current = true;
+
+    // Закрываем окно действия — игрок проигнорировал
+    if (pendingAction) setPendingAction(null);
+
+    // Если за столом двое — голосовать не с кем, исключаем сразу
     if (alive.length <= 2) {
       bankruptPlayer(turn, "тайм-аут");
       return;
     }
+
+    // Иначе — всегда голосование за исключение
     voteHandled.current = false;
-    setVote({ target: current, votes: {}, left: settings.voteDuration });
-    setMessage(`Время вышло. Голосование за ${current.name}.`);
+    setVote({ target: player, votes: {}, left: settings.voteDuration });
+    setMessage(`Время вышло. Голосование за ${player.name}.`);
   };
 
   useEffect(() => {
     if (
-      rolled ||
       vote ||
       gameOver ||
-      pendingAction ||
       auction ||
       animPath ||
       diceRolling
@@ -3206,9 +4977,12 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     return () => window.clearInterval(id);
   });
 
-  useEffect(() => {
+    useEffect(() => {
     if (!animPath || animStep >= animPath.length - 1) return;
-    const t = window.setTimeout(() => setAnimStep((s) => s + 1), 310);
+    const totalSteps = animPath.length - 1;
+    // 1-2 шага — 550ms, 3-6 — 416ms, 7+ — 320ms
+    const stepDuration = totalSteps <= 2 ? 550 : totalSteps <= 6 ? 416 : 320;
+    const t = window.setTimeout(() => setAnimStep((s) => s + 1), stepDuration);
     return () => window.clearTimeout(t);
   }, [animPath, animStep]);
 
@@ -3216,10 +4990,13 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     if (!animPath || animStep < animPath.length - 1) return;
     const cb = afterAnimRef.current;
     afterAnimRef.current = null;
+    const totalSteps = animPath.length - 1;
+    // Та же длительность, что и у последнего шага, + небольшой запас
+    const stepDuration = totalSteps <= 2 ? 550 : totalSteps <= 6 ? 416 : 320;
     const t = window.setTimeout(() => {
       setAnimPath(null);
       if (cb) cb();
-    }, 180);
+    }, stepDuration + 20);
     return () => window.clearTimeout(t);
   }, [animPath, animStep]);
 
@@ -3228,9 +5005,11 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     newPos: number,
     oldPos: number,
     capturedTurn: number,
+    isForwardMove = true,
   ) => {
-    const cur = players[capturedTurn];
-    const passedStart = newPos !== 0 && newPos < oldPos;
+    const cur = playersRef.current[capturedTurn];
+    // Бонус за Старт — только при движении вперёд с переходом через 0
+    const passedStart = isForwardMove && newPos !== 0 && newPos < oldPos;
     if (passedStart) {
       setPlayers((ps) =>
         ps.map((p, i) =>
@@ -3239,7 +5018,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
       );
       addLog(`🏁 ${cur.name} прошёл Старт: +2 000 К`);
     }
-    const cell = boardCells[newPos];
+    const cell = getCell(newPos);
     switch (cell.type) {
       case "start":
         addLog(`🏁 ${cur.name} попал на Старт! +3 000 К`);
@@ -3252,7 +5031,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
         advanceTurn(capturedTurn);
         break;
       case "property": {
-        const owner = owners[newPos];
+        const owner = ownersRef.current[newPos];
         if (!owner) {
           addLog(
             `🏢 ${cur.name} встал на «${cell.name}» (${cell.price?.toLocaleString("ru-RU")} К). Купить?`,
@@ -3266,8 +5045,8 @@ function BoardGame({ onExit }: { onExit: () => void }) {
           addLog(`🏠 ${cur.name} на своём поле «${cell.name}»`);
           advanceTurn(capturedTurn);
         } else {
-          const rent = getRent(newPos, improvements);
-          const ownerName = players.find((p) => p.id === owner)?.name ?? "?";
+          const rent = getRent(newPos, improvementsRef.current);
+          const ownerName = playersRef.current.find((p) => p.id === owner)?.name ?? "?";
           if (rent === 0) {
             addLog(
               `💸 ${cur.name} попал на «${cell.name}», но поле в залоге. Аренда не взимается.`,
@@ -3309,77 +5088,97 @@ function BoardGame({ onExit }: { onExit: () => void }) {
           ev.kind === "birthday"
             ? ev.amount * (aliveCount - 1)
             : ev.kind === "hotels"
-              ? ev.amount *
-                Object.values(improvements).reduce((s, v) => s + v, 0)
-              : ev.amount;
-        const gain = ev.kind === "gain" || ev.kind === "birthday";
-        addLog(`🎲 ${cur.name} встал на «Шанс»: «${ev.desc}»`);
-        if (gain) {
-          // Auto-credit gains
-          if (ev.kind === "birthday") {
-            setPlayers((ps) =>
-              ps.map((p, i) => {
-                if (i === capturedTurn)
-                  return { ...p, money: p.money + totalAmt };
-                if (!p.bankrupt)
-                  return { ...p, money: Math.max(0, p.money - ev.amount) };
-                return p;
-              }),
-            );
-            addLog(
-              `🎂 Все игроки скинулись ${cur.name} по ${ev.amount.toLocaleString("ru-RU")} К`,
-            );
-          } else {
-            setPlayers((ps) =>
-              ps.map((p, i) =>
-                i === capturedTurn ? { ...p, money: p.money + totalAmt } : p,
-              ),
-            );
-            addLog(
-              `💰 ${cur.name} получил ${totalAmt.toLocaleString("ru-RU")} К`,
-            );
-          }
-          advanceTurn(capturedTurn);
-        } else {
-          setPendingAction({
-            type: "chance",
-            amount: totalAmt,
-            gain: false,
-            desc: ev.desc,
-          });
+              ? ev.amount * Object.values(improvements).reduce((s, v) => s + v, 0)
+              : ev.kind === "pay_each"
+                ? ev.amount * (aliveCount - 1)
+                : ev.kind === "mass_gain" || ev.kind === "mass_lose"
+                  ? ev.amount * aliveCount
+                  : ev.amount;
+        const desc = ev.desc.replace(/{name}/g, cur.name);
+        addLog(`🎲 ${cur.name} встал на «Шанс»: «${desc}»`);
+
+        switch (ev.kind) {
+          case "gain":
+            setPlayers((ps) => ps.map((p, i) => (i === capturedTurn ? { ...p, money: p.money + ev.amount } : p)));
+            addLog(`💰 ${cur.name} получил ${ev.amount.toLocaleString("ru-RU")} К`);
+            advanceTurn(capturedTurn);
+            break;
+          case "birthday":
+            setPlayers((ps) => ps.map((p, i) => {
+              if (i === capturedTurn) return { ...p, money: p.money + totalAmt };
+              if (!p.bankrupt) return { ...p, money: Math.max(0, p.money - ev.amount) };
+              return p;
+            }));
+            addLog(`🎂 Все игроки скинулись ${cur.name} по ${ev.amount.toLocaleString("ru-RU")} К`);
+            advanceTurn(capturedTurn);
+            break;
+          case "mass_gain":
+            setPlayers((ps) => ps.map((p) => p.bankrupt ? p : { ...p, money: p.money + ev.amount }));
+            addLog(`💰 Все игроки получили по ${ev.amount.toLocaleString("ru-RU")} К`);
+            advanceTurn(capturedTurn);
+            break;
+          case "pay_each":
+            if (totalAmt <= 0) { advanceTurn(capturedTurn); break; }
+            setPendingAction({ type: "chance", amount: totalAmt, gain: false, desc });
+            break;
+          case "hotels":
+            if (totalAmt <= 0) {
+              addLog(`🎲 ${cur.name} встал на «Шанс»: «${desc}». Ничего не должен, так как нет филиалов и отелей.`);
+              advanceTurn(capturedTurn);
+            } else {
+              setPendingAction({ type: "chance", amount: totalAmt, gain: false, desc });
+            }
+            break;
+          case "mass_lose":
+            setPlayers((ps) => ps.map((p) => p.bankrupt ? p : { ...p, money: Math.max(0, p.money - ev.amount) }));
+            addLog(`💸 Все игроки потеряли по ${ev.amount.toLocaleString("ru-RU")} К`);
+            advanceTurn(capturedTurn);
+            break;
+          case "lose":
+          default:
+            if (totalAmt <= 0) { advanceTurn(capturedTurn); break; }
+            setPendingAction({ type: "chance", amount: totalAmt, gain: false, desc });
+            break;
         }
         break;
       }
-      case "challenge": {
-        const ev =
-          CHALLENGE_EVENTS_DATA[
-            Math.floor(Math.random() * CHALLENGE_EVENTS_DATA.length)
-          ];
+       case "challenge": {
+        const ev = CHALLENGE_EVENTS_DATA[Math.floor(Math.random() * CHALLENGE_EVENTS_DATA.length)];
         const nPos = (newPos + (ev.forward ? ev.steps : 40 - ev.steps)) % 40;
-        addLog(
-          `⚡ ${cur.name} встал на «Испытание»: «${ev.desc}» → «${boardCells[nPos].name}»`,
-        );
-        // Перемещаем игрока
-        setPlayers((ps) =>
-          ps.map((p, i) => (i === capturedTurn ? { ...p, position: nPos } : p)),
-        );
-        // ЗАПУСКАЕМ ПРИЗЕМЛЕНИЕ на новое поле (чтобы предложить покупку)
-        window.setTimeout(() => {
-          processLanding(nPos, newPos, capturedTurn);
-        }, 10);
+        const desc = ev.desc.replace(/{name}/g, cur.name);
+        addLog(`⚡ ${desc} → «${getCell(nPos).name}»`);
+
+        // Запускаем огненный след
+        setFireTrailAnim({ from: newPos, to: nPos, playerId: cur.id });
+
+        setTimeout(() => {
+          setPlayers((ps) =>
+            ps.map((p, i) => (i === capturedTurn ? { ...p, position: nPos } : p))
+          );
+
+          setTimeout(() => {
+            setFireTrailAnim(null);
+            processLanding(nPos, newPos, capturedTurn, ev.forward);
+          }, 1500); // Увеличили время для более красивого шлейфа
+        }, 600);
+
         break;
       }
-      case "gotojail":
+            case "gotojail":
         addLog(`👮 ${cur.name} попал на «В тюрьму»! Отправляется за решётку.`);
-        setPlayers((ps) =>
-          ps.map((p, i) =>
-            i === capturedTurn
-              ? { ...p, position: 10, jailTurns: 3, jailAttempts: 0 }
-              : p,
-          ),
-        );
-        addLog(`🔒 ${cur.name} отправлен в тюрьму (до 3 попыток дубля)`);
-        advanceTurn(capturedTurn, true);
+        setDiagonalAnim({ from: newPos, to: 10, playerId: cur.id });
+        setTimeout(() => {
+          setPlayers((ps) =>
+            ps.map((p, i) =>
+              i === capturedTurn
+                ? { ...p, position: 10, jailTurns: 3, jailAttempts: 0 }
+                : p,
+            ),
+          );
+          setDiagonalAnim(null);
+          addLog(`🔒 ${cur.name} отправлен в тюрьму (до 3 попыток дубля)`);
+          advanceTurn(capturedTurn, true);
+        }, 1200);
         break;
       case "jail":
         // 1.7.1: landing on Jail cell = same as gotojail
@@ -3454,11 +5253,11 @@ function BoardGame({ onExit }: { onExit: () => void }) {
         (j) => j - entryFee + (entryFee - prize < 0 ? 0 : entryFee - prize),
       );
       addLog(
-        `🎰 ${current.name} угадал! Секретное число: ${secret}. Выиграл ${prize.toLocaleString("ru-RU")} К! (ставка ${entryFee.toLocaleString("ru-RU")} К)`,
+        `🎰 ${player.name} угадал! Секретное число: ${secret}. Выиграл ${prize.toLocaleString("ru-RU")} К! (ставка ${entryFee.toLocaleString("ru-RU")} К)`,
       );
     } else {
       addLog(
-        `🎰 ${current.name} не угадал. Секретное число: ${secret}. Потерял ${entryFee.toLocaleString("ru-RU")} К.`,
+        `🎰 ${player.name} не угадал. Секретное число: ${secret}. Потерял ${entryFee.toLocaleString("ru-RU")} К.`,
       );
     }
     advanceTurn();
@@ -3469,11 +5268,12 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     if (!pendingAction) return;
     const a = pendingAction;
     setPendingAction(null);
+    if (!player) return;
     switch (a.type) {
       case "rent":
         setPlayers((ps) =>
           ps.map((p) => {
-            if (p.id === current.id)
+            if (p.id === player.id)
               return { ...p, money: Math.max(0, p.money - a.amount) };
             if (p.id === a.ownerId) return { ...p, money: p.money + a.amount };
             return p;
@@ -3492,7 +5292,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
         );
         setJackpot((j) => j + a.amount);
         addLog(
-          `💸 ${current.name} заплатил налог ${a.amount.toLocaleString("ru-RU")} К в джекпот`,
+          `💸 ${player.name} заплатил налог ${a.amount.toLocaleString("ru-RU")} К в джекпот`,
         );
         advanceTurn();
         break;
@@ -3520,7 +5320,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
               : p,
           ),
         );
-        addLog(`🔒 ${current.name} отправлен в тюрьму (до 3 попыток дубля)`);
+        addLog(`🔒 ${player.name} отправлен в тюрьму (до 3 попыток дубля)`);
         advanceTurn();
         break;
       case "jackpot": {
@@ -3533,7 +5333,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
         }
         addLog(
           amt > 0
-            ? `🎰 ${current.name} выиграл Джекпот: +${amt.toLocaleString("ru-RU")} К!`
+            ? `🎰 ${player.name} выиграл Джекпот: +${amt.toLocaleString("ru-RU")} К!`
             : "🎰 Джекпот пуст.",
         );
         advanceTurn();
@@ -3542,20 +5342,28 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     }
   };
 
-  const buyProperty = () => {
+    const buyProperty = () => {
     if (!pendingAction || pendingAction.type !== "buy") return;
     const { cellIndex, price } = pendingAction;
-    if (current.money < price) {
+    const cp = playersRef.current[turnRef.current];
+    if (!cp) return;
+    if (cp.money < price) {
       addLog("❌ Недостаточно средств!");
       return;
     }
-    setOwners((old) => ({ ...old, [cellIndex]: current.id }));
+    setOwners((old) => ({ ...old, [cellIndex]: cp.id }));
     setPlayers((ps) =>
-      ps.map((p, i) => (i === turn ? { ...p, money: p.money - price } : p)),
+      ps.map((p, i) => (i === turnRef.current ? { ...p, money: p.money - price } : p)),
     );
     addLog(
-      `🏠 ${current.name} купил «${boardCells[cellIndex].name}» за ${price.toLocaleString("ru-RU")} К`,
+      `🏠 ${cp.name} купил «${getCell(cellIndex).name}» за ${price.toLocaleString("ru-RU")} К`,
     );
+
+    // Ежедневный квест "Купи 1 поле"
+    if (cp.id === currentUser?.id) {
+      emitQuestEvent("buyProperty");
+    }
+
     setPendingAction(null);
     advanceTurn();
   };
@@ -3573,7 +5381,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
 
     // 2. Собираем всех живых игроков, кроме того, кто выставил на аукцион
     let rawParticipants = players
-      .filter((p) => !p.bankrupt && p.id !== current.id)
+      .filter((p) => !p.bankrupt && p.id !== player.id)
       .map((p) => p.id);
 
     // 3. Если игроков больше 1, переставляем список так, чтобы первым шёл следующий по очереди
@@ -3601,9 +5409,9 @@ function BoardGame({ onExit }: { onExit: () => void }) {
       highBidder: null,
     });
     addLog(
-      `🔨 ${current.name} выставил на аукцион «${boardCells[cellIndex].name}». Старт: ${startPrice.toLocaleString("ru-RU")} К`,
+      `🔨 ${player.name} выставил на аукцион «${getCell(cellIndex).name}». Старт: ${startPrice.toLocaleString("ru-RU")} К`,
     );
-    addLog(`🔨 ${current.name} отказался от участия п   аукционе`);
+    addLog(`🔨 ${player.name} отказался от участия в аукционе`);
   };
 
   const auctionRaise = () => {
@@ -3612,7 +5420,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     const bidder = players.find((p) => p.id === bidderId);
     const newPrice = auction.price + 100;
     if (!bidder || bidder.money < newPrice) {
-      addLog("❌ Недостаточно   редств для ставки.");
+      addLog("❌ Недостаточно средств для ставки.");
       return;
     }
 
@@ -3626,10 +5434,10 @@ function BoardGame({ onExit }: { onExit: () => void }) {
         ),
       );
       addLog(
-        `🏆 ${winner.name} выиграл аукцион! «${boardCells[auction.cellIndex].name}»  за ${newPrice.toLocaleString("ru-RU")} К`,
+        `🏆 ${winner.name} выиграл аукцион! «${getCell(auction.cellIndex).name}»  за ${newPrice.toLocaleString("ru-RU")} К`,
       );
       setAuction(null);
-      advanceTurn(); // Передаём ход с учётом дублей
+      advanceTurn();
       return;
     }
 
@@ -3643,7 +5451,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     });
   };
 
-  const auctionDecline = () => {
+    const auctionDecline = () => {
     if (!auction) return;
     const bidderId = auction.participants[auction.currentIdx];
     const bidder = players.find((p) => p.id === bidderId);
@@ -3671,7 +5479,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
             ),
           );
           addLog(
-            `🏆 ${winner.name} выиграл аукцион! «${boardCells[auction.cellIndex].name}» за ${auction.price.toLocaleString("ru-RU")} К`,
+            `🏆 ${winner.name} выиграл аукцион! «${getCell(auction.cellIndex).name}» за ${auction.price.toLocaleString("ru-RU")} К`,
           );
         } else {
           addLog("🔨 Аукцион завершён без победителя.");
@@ -3684,8 +5492,32 @@ function BoardGame({ onExit }: { onExit: () => void }) {
       return;
     }
 
-    // Если остался 1 участник, НЕ завершаем аукцион автоматически.
-    // Он получит свой ход через кнопки «+100» или «Отказаться».
+    // Если остался 1 участник — он становится победителем по текущей цене
+    if (newParticipants.length === 1) {
+      const winnerId = newParticipants[0];
+      const winner = players.find((p) => p.id === winnerId);
+      if (winner && winner.money >= auction.price) {
+        setOwners((old) => ({
+          ...old,
+          [auction.cellIndex]: winnerId,
+        }));
+        setPlayers((ps) =>
+          ps.map((p) =>
+            p.id === winnerId ? { ...p, money: p.money - auction.price } : p,
+          ),
+        );
+        addLog(
+          `🏆 ${winner.name} выиграл аукцион! «${getCell(auction.cellIndex).name}» за ${auction.price.toLocaleString("ru-RU")} К`,
+        );
+      } else {
+        addLog(`🔨 Аукцион завершён без победителя (недостаточно средств у ${winner?.name}).`);
+      }
+      setAuction(null);
+      advanceTurn();
+      return;
+    }
+
+    // Если осталось больше 1 участника, продолжаем
     const nextIdx = auction.currentIdx % newParticipants.length;
     setAuction({
       ...auction,
@@ -3705,7 +5537,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
       return;
     }
     const cost = getImproveCost(cellIdx);
-    if (current.money < cost) {
+    if (player.money < cost) {
       addLog("❌ Недостаточно средств для улучшения!");
       return;
     }
@@ -3714,7 +5546,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
       addLog("ℹ️ Каксимальное улучшение!");
       return;
     }
-    const groupCells = GROUPS[gIdx].cells as readonly number[];
+    const groupCells = getDynamicGroups()[gIdx].cells as readonly number[];
     const allOthersAtLeastCurrent = groupCells.every((ci) => {
       if (ci === cellIdx) return true;
       return (improvements[ci] ?? 0) >= lvl;
@@ -3732,8 +5564,13 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     );
     setImprovedGroupsThisTurn((old) => [...old, gIdx]);
     addLog(
-      `🏗 ${current.name} улучшил «${boardCells[cellIdx].name}» → ${IMPROVE_LABELS[lvl + 1]} (-${cost.toLocaleString("ru-RU")} К)`,
+      `🏗 ${player.name} улучшил «${getCell(cellIdx).name}» → ${IMPROVE_LABELS[lvl + 1]} (-${cost.toLocaleString("ru-RU")} К)`,
     );
+
+    // Ежедневный квест "Улучши 1 поле"
+    if (player.id === currentUser?.id) {
+      emitQuestEvent("improveProperty");
+    }
   };
 
   const sellProperty = (cellIdx: number) => {
@@ -3743,7 +5580,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
       return;
     }
     const owner = owners[cellIdx];
-    if (owner !== current.id) {
+    if (owner !== player.id) {
       addLog("❌ Это поле не ваше.");
       return;
     }
@@ -3754,14 +5591,14 @@ function BoardGame({ onExit }: { onExit: () => void }) {
       ps.map((p, i) => (i === turn ? { ...p, money: p.money + cost } : p)),
     );
     addLog(
-      `🏗 ${current.name} продал улучшение на «${boardCells[cellIdx].name}» (+${cost.toLocaleString("ru-RU")} К)`,
+      `🏗 ${player.name} продал улучшение на «${getCell(cellIdx).name}» (+${cost.toLocaleString("ru-RU")} К)`,
     );
   };
   const mortgageProperty = () => {
     if (selectedCell === null) return;
     const cellIdx = selectedCell;
     const amt = getMortgage(cellIdx);
-    if (owners[cellIdx] !== current.id) {
+    if (owners[cellIdx] !== player.id) {
       addLog("❌ Это поле не ваше.");
       return;
     }
@@ -3795,7 +5632,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
       ),
     );
     addLog(
-      `🔒 ${current.name} заложил «${boardCells[cellIdx].name}» за ${amt.toLocaleString("ru-RU")} К. Истекает через 15 ходов.`,
+      `🔒 ${player.name} заложил «${getCell(cellIdx).name}» за ${amt.toLocaleString("ru-RU")} К. Истекает через 15 ходов.`,
     );
     setSelectedCell(null);
   };
@@ -3805,7 +5642,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     const cellIdx = selectedCell;
     const cost = getRedeemCost(cellIdx); // Новая цена выкупа
 
-    if (owners[cellIdx] !== current.id) {
+    if (owners[cellIdx] !== player.id) {
       addLog("❌ Это поле не ваше.");
       return;
     }
@@ -3816,7 +5653,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
       addLog("ℹ️ Поле не в залоге.");
       return;
     }
-    if (current.money < cost) {
+    if (player.money < cost) {
       addLog("❌ Недостаточно средств для выкупа!");
       return;
     }
@@ -3829,7 +5666,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
       ps.map((p, i) => (i === turn ? { ...p, money: p.money - cost } : p)),
     );
     addLog(
-      `🔓 ${current.name} выкупил «${boardCells[cellIdx].name}» за ${cost.toLocaleString("ru-RU")} К.`,
+      `🔓 ${player.name} выкупил «${getCell(cellIdx).name}» за ${cost.toLocaleString("ru-RU")} К.`,
     );
     setSelectedCell(null);
   };
@@ -3846,9 +5683,11 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     });
   };
 
-  const myOwnedCards = Object.entries(owners)
-    .filter(([, oid]) => oid === current.id)
-    .map(([ci]) => Number(ci));
+  const myOwnedCards = player
+    ? Object.entries(owners)
+        .filter(([, oid]) => oid === player.id)
+        .map(([ci]) => Number(ci))
+    : [];
   const tradeTarget = trade
     ? players.find((p) => p.id === trade.targetId)
     : null;
@@ -3860,6 +5699,18 @@ function BoardGame({ onExit }: { onExit: () => void }) {
 
   const proposeTrade = () => {
     if (!trade || !tradeTarget) return;
+    if (trade.myCards.length === 0 && trade.theirCards.length === 0) {
+      addLog("❌ В классическом режиме запрещено менять деньги на деньги!");
+      return;
+    }
+    if (trade.myMoney > player.money) {
+      addLog(`❌ У вас недостаточно средств (нужно ${trade.myMoney.toLocaleString("ru-RU")} К, есть ${player.money.toLocaleString("ru-RU")} К).`);
+      return;
+    }
+    if (trade.theirMoney > tradeTarget.money) {
+      addLog(`❌ У ${tradeTarget.name} недостаточно средств (нужно ${trade.theirMoney.toLocaleString("ru-RU")} К, есть ${tradeTarget.money.toLocaleString("ru-RU")} К).`);
+      return;
+    }
     const myVal =
       trade.myMoney +
       trade.myCards.reduce((s, ci) => s + (boardCells[ci].price ?? 0), 0);
@@ -3879,21 +5730,23 @@ function BoardGame({ onExit }: { onExit: () => void }) {
 
     // Сохраняем информацию об инициаторе и текущем состоянии дублей
     setTradeInitiator({
-      id: current.id,
+      id: player.id,
       fromIdx: turn,
       isDouble: isDoubleRoll,
       doubleCount: doubleCount,
     });
 
     // Отправляем предложение и переключаем ход на получателя
-    setPendingTrade({ initiatorId: current.id, trade });
+    setPendingTrade({ initiatorId: player.id, trade });
     setTurn(targetIdx); // Принудительно переключаем ход
+    socket.emit('trade-proposed', { roomId: initialRoomId, initiatorId: player.id, isDoubleRoll: isDoubleRoll, doubleCount: doubleCount, trade: { ...trade, initiatorId: player.id } });
+
     setRolled(false); // Сбрасываем флаг броска, если был
     setMessage(
       `Ожидаем ответа от ${tradeTarget.name} на предложение договора...`,
     );
     addLog(
-      `🤝 ${current.name} предлагает договор ${tradeTarget.name}. Ожидаем ответа...`,
+      `🤝 ${player.name} предлагает договор ${tradeTarget.name}. Ожидаем ответа...`,
     );
     setTrade(null); // Закрываем окно у инициатора
   };
@@ -3903,6 +5756,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     setTargetDice([d1, d2]);
     setDiceRolling(true); // Показываем оверлей
     setIsSpinning(true); // Запускаем вращение кубиков
+    // (удалено — скорость теперь константа)
 
     // 1. Останавливаем вращение через 1.5 секунды
     setTimeout(() => {
@@ -3917,16 +5771,16 @@ function BoardGame({ onExit }: { onExit: () => void }) {
     }, 2500); // 1000мс (вращение) + 400мс (статичная пауза) = 1500мс
   };
 
-  const rollJail = () => {
-    const d1 = 1 + Math.floor(Math.random() * 6);
-    const d2 = 1 + Math.floor(Math.random() * 6);
+  const rollJail = (d1: number, d2: number, playerId: string) => {
     const steps = d1 + d2;
-    const capturedTurn = turn;
+    // Находим индекс и данные игрока через Ref, чтобы не зависеть от устаревшего замыкания
+    const capturedTurn = playersRef.current.findIndex(p => p.id === playerId);
+    const player = playersRef.current[capturedTurn];
     // Если открыто окно договора, закрываем его перед попыткой выйти из тюрьмы
     setTrade(null);
     doRollAnimation(d1, d2, () => {
       // ... остальной код
-      const attempts = (current.jailAttempts ?? 0) + 1;
+      const attempts = (player.jailAttempts ?? 0) + 1;
       const isDouble = d1 === d2;
       setRolled(true);
       if (isDouble) {
@@ -3940,60 +5794,35 @@ function BoardGame({ onExit }: { onExit: () => void }) {
           ),
         );
         addLog(
-          `🎲 ${current.name} вышел из тюрьмы! Дубль! Двигается на ${steps} → «${boardCells[np].name}»`,
+          `🎲 ${player.name} вышел из тюрьмы! Дубль! Двигается на ${steps} → «${getCell(np).name}»`,
         );
-        const path: number[] = [];
+          const path: number[] = [10];
         for (let i = 1; i <= steps; i++) path.push((10 + i) % 40);
         afterAnimRef.current = () => processLanding(np, 10, capturedTurn);
         setAnimStep(0);
         setAnimPath(path);
-      } else if (attempts >= 3) {
-        // 3-я попытка: если есть деньги — принудительный выкуп, иначе — даем шанс продать/заложить
-        if (current.money >= 500) {
-          const np = (10 + steps) % 40;
-          setPlayers((ps) =>
-            ps.map((p, i) =>
-              i === capturedTurn
-                ? {
-                    ...p,
-                    money: Math.max(0, p.money - 500),
-                    position: np,
-                    jailTurns: 0,
-                    jailAttempts: 0,
-                  }
-                : p,
-            ),
-          );
-          addLog(
-            `🔓 ${current.name} — 3-я попытка, дубль не выпал. Принудительный выкуп 500 К, двигается на ${steps} → «${boardCells[np].name}»`,
-          );
-          const path: number[] = [];
-          for (let i = 1; i <= steps; i++) path.push((10 + i) % 40);
-          afterAnimRef.current = () => processLanding(np, 10, capturedTurn);
-          setAnimStep(0);
-          setAnimPath(path);
-        } else {
-          // Недостаточно денег для выкупа (менее 500 К) -> Открываем специальное окно
-          setJailPaymentPending(true);
-          setPlayers((ps) =>
-            ps.map((p, i) =>
-              i === capturedTurn
-                ? {
-                    ...p,
-                    jailTurns: 0,
-                    jailAttempts: 0,
-                  }
-                : p,
-            ),
-          );
-          addLog(
-            `❗ ${current.name} — 3-я попытка, дубль не выпал. Недостаточно денег для выкупа (500 К). Продайте или заложите имущество.`,
-          );
-          setMessage(
-            "Недостаточно денег (500 К). Продайте или заложите имущество.",
-          );
-          setTimeLeft(45); // Даем дополнительное время
-        }
+                  } else if (attempts >= 3) {
+        // 3-я попытка: дубль не выпал. Игрок обязан выкупиться, продать/заложить имущество или сдаться.
+        setJailPaymentPending(true);
+        // ВАЖНО: Сохраняем выпавшие кубики, чтобы после оплаты выкупа передвинуть игрока!
+        pendingJailMovementRef.current = { d1, d2, capturedTurn };
+        setPlayers((ps) =>
+          ps.map((p, i) =>
+            i === capturedTurn
+              ? {
+                  ...p,
+                  jailTurns: 1, // <--- ОСТАВЛЯЕМ > 0, чтобы кнопка выкупа не исчезала!
+                  jailAttempts: 0,
+                }
+              : p,
+          ),
+        );
+        
+        addLog(
+          `❗ ${player.name} — 3-я попытка, дубль не выпал. Обязан выкупиться или продать/заложить имущество.`,
+        );
+        setMessage("3-я попытка не удалась. Оплатите 500 К или продайте/заложите имущество.");
+        setTimeLeft(45);
       } else {
         // No double — stay in jail
         setPlayers((ps) =>
@@ -4001,26 +5830,32 @@ function BoardGame({ onExit }: { onExit: () => void }) {
             i === capturedTurn
               ? {
                   ...p,
-                  jailTurns: Math.max(0, (p.jailTurns ?? 3) - 1),
+                  jailTurns: Math.max(0, (p?.jailTurns ?? 3) - 1),
                   jailAttempts: attempts,
                 }
               : p,
           ),
         );
         addLog(
-          `🔒 ${current.name} — дубль не выпал (попытка ${attempts}/3). Остаётся в тюрьме.`,
+          `🔒 ${player.name} — дубль не выпал (попытка ${attempts}/3). Остаётся в тюрьме.`,
         );
         window.setTimeout(() => advanceTurn(capturedTurn), 900);
       }
     });
   };
 
-  const payBail = () => {
-    if (current.money < 500) {
+    const payBail = () => {
+    if (player.money < 500) {
       setMessage("Недостаточно денег (500 К)!");
       return;
     }
+
+    // Берем сохраненные кубики, если они есть (случай 3-й попытки)
+    const pendingMove = pendingJailMovementRef.current;
     setJailPaymentPending(false);
+    pendingJailMovementRef.current = null;
+
+    // Снимаем 500 К и выходим из тюрьмы
     setPlayers((ps) =>
       ps.map((p, i) =>
         i === turn
@@ -4028,124 +5863,214 @@ function BoardGame({ onExit }: { onExit: () => void }) {
           : p,
       ),
     );
-    addLog(`🔓 ${current.name} выкупился за 500 К`);
-    setMessage("Выкупился! Теперь бросай кубики.");
-  };
+    addLog(`🔓 ${player.name} выкупился за 500 К`);
 
-  const roll = () => {
-    if (busy) return;
-    // Если открыто окно договора, закрываем его перед броском
-    setTrade(null);
-    if (inJail) {
-      rollJail();
-      return;
-    }
-    // ... остальной код
-    const d1 = 1 + Math.floor(Math.random() * 6);
-    const d2 = 1 + Math.floor(Math.random() * 6);
-    const steps = d1 + d2;
-    const oldPos = current.position;
-    const capturedTurn = turn;
-    const isDoubles = d1 === d2;
+    if (pendingMove) {
+      // Если была 3-я попытка, двигаем на выпавшие шаги
+      const { d1, d2, capturedTurn } = pendingMove;
+      const steps = d1 + d2;
+      const np = (10 + steps) % 40;
 
-    doRollAnimation(d1, d2, () => {
-      addLog(
-        `🎲 ${current.name} выбросил ${d1} и ${d2} = ${steps}, отправился на «${boardCells[(oldPos + steps) % 40].name}»`,
-      );
-      setRolled(true);
-      setIsDoubleRoll(isDoubles);
+      setMessage(`Выкупился! Двигается на ${steps} клеток...`);
 
-      // Логика дублей
-      if (isDoubles) {
-        const newDoubleCount = doubleCount + 1;
-        setDoubleCount(newDoubleCount);
-        if (newDoubleCount === 3) {
-          addLog(
-            `🎲 Третий дубль подряд! ${current.name} отправляется в тюрьму!`,
-          );
-          setPlayers((ps) =>
-            ps.map((p, i) =>
-              i === capturedTurn
-                ? { ...p, position: 10, jailTurns: 3, jailAttempts: 0 }
-                : p,
-            ),
-          );
-          setDoubleCount(0);
-          setIsDoubleRoll(false);
-          setMessage(`🔒 ${current.name} — третий дубль! Отправлен в тюрьму.`);
-          advanceTurn(capturedTurn, true); // Принудительно передаём ход
-          return;
-        }
-      } else {
-        setDoubleCount(0);
-      }
-
-      const path: number[] = [];
-      for (let i = 1; i <= steps; i++) path.push((oldPos + i) % 40);
-      const finalPos = path[path.length - 1];
+            const path: number[] = [10];
+      for (let i = 1; i <= steps; i++) path.push((10 + i) % 40);
+      
       afterAnimRef.current = () => {
-        setPlayers((ps) =>
-          ps.map((p, i) =>
-            i === capturedTurn ? { ...p, position: finalPos } : p,
-          ),
+        setPlayers((prevPlayers) =>
+          prevPlayers.map((p, i) =>
+            i === capturedTurn ? { ...p, position: np } : p
+          )
         );
-        processLanding(finalPos, oldPos, capturedTurn);
+        processLanding(np, 10, capturedTurn);
       };
       setAnimStep(0);
       setAnimPath(path);
+      
+    } else {
+      // Если просто выкупился до броска
+      setRolled(false);
+      setTimeLeft(45);
+      setMessage("Выкупился! Теперь бросай кубики.");
+    }
+  };
+
+ const roll = () => {
+    if (busy) return;
+     if (!player) return;
+    setTrade(null);
+    // Всегда отправляем запрос на сервер (даже если в тюрьме), 
+    // сервер вернет числа, и логика тюрьмы запустится через rollJail(d1, d2)
+    socket.emit('roll-dice-request', { 
+      roomId: initialRoomId, 
+      playerId: player.id 
     });
+  };
+  
+
+  // Таблица наград по месту (1-е — максимум, далее по убыванию)
+  const PLACE_REWARDS = [
+    { coins: 300, xp: 450 }, // 1 место
+    { coins: 200, xp: 300 }, // 2
+    { coins: 120, xp: 180 }, // 3
+    { coins: 100, xp: 150 }, // 4
+    { coins: 80,  xp: 120 }, // 5
+  ];
+
+  // Определяем место игрока и его награду
+  const computePlaceAndReward = (playerId: string): { place: number; coins: number; xp: number } => {
+    const allPlayers = playersRef.current;
+    const p = allPlayers.find(x => x.id === playerId);
+    if (!p) return { place: 0, coins: 0, xp: 0 };
+    // Вышел живым — награда не полагается
+    if (p.leftAlive) return { place: 0, coins: 0, xp: 0 };
+
+    const aliveCount = allPlayers.filter(x => !x.bankrupt).length;
+    const eliminationOrder = eliminationOrderRef.current;
+    const reversed = [...eliminationOrder].reverse();
+    const revIdx = reversed.indexOf(playerId);
+
+    let place = 0;
+    if (!p.bankrupt) {
+      // Игрок ещё жив — место по богатству
+      const allOwners = ownersRef.current;
+      const getWealth = (pl: Player) =>
+        pl.money + Object.entries(allOwners)
+          .filter(([, oid]) => oid === pl.id)
+          .reduce((s, [ci]) => s + (boardCells[Number(ci)].price ?? 0), 0);
+      const aliveSorted = [...allPlayers.filter(x => !x.bankrupt)]
+        .sort((a, b) => getWealth(b) - getWealth(a));
+      place = aliveSorted.findIndex(x => x.id === playerId) + 1;
+    } else if (revIdx !== -1) {
+      place = aliveCount + revIdx + 1;
+    } else {
+      return { place: 0, coins: 0, xp: 0 };
+    }
+
+    const reward = PLACE_REWARDS[Math.min(place - 1, PLACE_REWARDS.length - 1)] || { coins: 0, xp: 0 };
+    return { place, coins: reward.coins, xp: reward.xp };
+  };
+
+  // Начисление награды локальному игроку (один раз)
+  const grantRewardToLocalPlayer = (place: number, coins: number, xpBase: number) => {
+    if (!currentUser?.id) return null;
+    if (rewardGivenRef.current) return null;
+    rewardGivenRef.current = true;
+
+    let currentStats = { games: 0, wins: 0, xp: 0, level: 0 };
+    const savedStats = localStorage.getItem("arena-stats");
+    if (savedStats) currentStats = JSON.parse(savedStats);
+
+    const isWinner = place === 1;
+    let addXP = xpBase;
+
+    // VIP может храниться и в объекте игрока, и в localStorage — учитываем оба источника
+    const meInGame = playersRef.current.find(p => p.id === currentUser.id);
+    const vipUntil = meInGame?.vipUntil || localStorage.getItem("arena-vip-until");
+    const isVip = vipUntil ? new Date(vipUntil) > new Date() : false;
+    if (isVip) addXP *= 2;
+
+    currentStats.games += 1;
+    if (isWinner) currentStats.wins += 1;
+    currentStats.xp += addXP;
+    currentStats.level = Math.floor(currentStats.xp / 1000);
+
+    localStorage.setItem("arena-stats", JSON.stringify(currentStats));
+
+    const userDataKey = "arena-user-data-" + currentUser.id;
+    const existingUserData = JSON.parse(localStorage.getItem(userDataKey) || "{}");
+    const newCoins = Number(localStorage.getItem("arena-coins") || 2400) + coins;
+    localStorage.setItem("arena-coins", String(newCoins));
+
+    const updatedUserData: any = { ...existingUserData, stats: currentStats, coins: newCoins };
+
+    // Дроп предмета — только из реальных товаров, созданных админом в магазине
+    const realItems = marketItems.filter(i => i.isActive !== false);
+    const drop = Math.random() < 0.25 && realItems.length > 0
+      ? realItems[Math.floor(Math.random() * realItems.length)]
+      : null;
+    let droppedName: string | null = null;
+    if (drop) {
+      const ex = JSON.parse(localStorage.getItem("arena-inventory") || "[]") as OwnedItem[];
+
+      // Если это VIP — продлеваем, в инвентарь не кладём
+      if (drop.category === "vip") {
+        const days = drop.vipDuration || 7;
+        const currentVipUntil = localStorage.getItem("arena-vip-until");
+        const now = Date.now();
+        let baseTime = now;
+        if (currentVipUntil && new Date(currentVipUntil) > new Date(now)) {
+          baseTime = new Date(currentVipUntil).getTime();
+        }
+        const vipEnd = new Date(baseTime + days * 24 * 60 * 60 * 1000);
+        localStorage.setItem("arena-vip-until", vipEnd.toISOString());
+        updatedUserData.vipUntil = vipEnd.toISOString();
+        droppedName = `${drop.name} (VIP +${days} дн.)`;
+      } else {
+        // Обычный предмет — кладём в инвентарь
+        const ownedItem: OwnedItem = {
+          id: `${drop.id}-${Date.now()}`,
+          name: drop.name,
+          type: drop.category === "dice" ? "dice" : "board",
+          rarity: drop.rarity,
+          color: "#29233e",
+          price: drop.price,
+          description: drop.description || (drop.category === "dice" ? "Скин кубиков" : "Карточка поля"),
+          ownedAt: new Date().toISOString(),
+          slotIndex: drop.slotIndex,
+          imageDataUrl: drop.imageDataUrl,
+          marketItemId: drop.id,
+        };
+        const newInv = [...ex, ownedItem];
+        localStorage.setItem("arena-inventory", JSON.stringify(newInv));
+        updatedUserData.inventory = newInv;
+        droppedName = drop.name;
+      }
+    }
+
+    localStorage.setItem(userDataKey, JSON.stringify(updatedUserData));
+
+    socket.emit('update-user-xp', { userId: currentUser.id, stats: currentStats });
+    socket.emit('save-user-data', { userId: currentUser.id, newData: updatedUserData });
+
+    return { addXP, coins, drop, droppedName };
   };
 
   const finishGame = () => {
-    const aliveNow = players.filter((p) => !p.bankrupt);
-    const won = aliveNow.length
-      ? [...aliveNow].sort((a, b) => {
-          const aVal =
-            a.money +
-            Object.entries(owners)
-              .filter(([, oid]) => oid === a.id)
-              .reduce((s, [ci]) => s + (boardCells[Number(ci)].price ?? 0), 0);
-          const bVal =
-            b.money +
-            Object.entries(owners)
-              .filter(([, oid]) => oid === b.id)
-              .reduce((s, [ci]) => s + (boardCells[Number(ci)].price ?? 0), 0);
-          return bVal - aVal;
-        })[0]
-      : current;
-    const xp = 450;
-    const coins = 300;
-    const drop =
-      Math.random() < 0.25
-        ? shopSkins[Math.floor(Math.random() * shopSkins.length)]
-        : null;
-    const winnerReason =
-      aliveNow.length <= 1
-        ? "🏆 Победитель по выживанию!"
-        : "🏆 Лидер по богатству!";
-    setReward(
-      `${winnerReason} ${won.name} побеждает! +${xp} XP и +${coins} Coins${drop ? ` · Предмет: ${drop.name} добавлен в инвентарь!` : ""}.`,
-    );
-    if (drop) {
-      const ex = JSON.parse(
-        localStorage.getItem("arena-inventory") || "[]",
-      ) as OwnedItem[];
-      localStorage.setItem(
-        "arena-inventory",
-        JSON.stringify([
-          ...ex,
-          {
-            ...drop,
-            id: `${drop.id}-${Date.now()}`,
-            ownedAt: new Date().toISOString(),
-          },
-        ]),
-      );
+    if (rewardGivenRef.current) return;
+
+    const allPlayers = playersRef.current;
+    const myId = currentUser?.id || "you";
+    const me = allPlayers.find(p => p.id === myId);
+    const alive = allPlayers.filter(p => !p.bankrupt);
+    const winner = alive.length === 1 ? alive[0] : null;
+    const winnerReason = alive.length <= 1 ? "🏆 Победитель по выживанию!" : "🏆 Лидер по богатству!";
+
+    // Если игрок вышел живым — просто сообщаем, без начисления
+    if (me?.leftAlive) {
+      rewardGivenRef.current = true;
+      setReward(`${winnerReason} Победил ${winner?.name || "Никто"}. Вы покинули игру досрочно — без награды.`);
+      setGameOver(true);
+      return;
     }
-    localStorage.setItem(
-      "arena-coins",
-      String(Number(localStorage.getItem("arena-coins") || 2400) + coins),
-    );
+
+    const { place, coins, xp } = computePlaceAndReward(myId);
+    if (place === 0) {
+      rewardGivenRef.current = true;
+      setReward(`${winnerReason} Победил ${winner?.name || "Никто"}.`);
+      setGameOver(true);
+      return;
+    }
+
+    // Ежедневный квест "Победи в партии" — только за полноценное 1-е место
+    if (place === 1) {
+      emitQuestEvent("winGame");
+    }
+
+    const grant = grantRewardToLocalPlayer(place, coins, xp);
+    const dropInfo = grant?.droppedName ? ` · Предмет: ${grant.droppedName} добавлен в инвентарь!` : "";
+    setReward(`${winnerReason} Победил ${winner?.name || "Никто"}. Вы заняли ${place} место: +${xp} XP и +${coins} Coins.${dropInfo}`);
+    setGameOver(true);
   };
 
   const cellGridPos = (index: number) => ({
@@ -4172,28 +6097,100 @@ function BoardGame({ onExit }: { onExit: () => void }) {
   type NumA = { type: string; amount: number };
   type GainA = { type: "chance"; amount: number; gain: boolean; desc: string };
 
+
+          useEffect(() => {
+    if (!initialRoomId) return;
+  if (isRemoteUpdate.current) return;
+  if (!playersRef.current || playersRef.current.length === 0) return; // <-- ДОБАВИЛИ ЭТУ СТРОЧКУ
+    // ВАЖНО: Отправляем состояние всегда, когда оно меняется!
+    console.log("📤 Отправляем изменения стейта другу...");
+    socket.emit('sync-game-state', {
+        roomId: initialRoomId,
+        senderId: currentUser?.id || "you", // <--- Добавили отправителя
+        players: playersRef.current,
+        owners: ownersRef.current,
+        improvements: improvementsRef.current,
+        turn: turnRef.current,
+        globalTurnCounter: globalTurnCounterRef.current,
+        jackpot: jackpotRef.current,
+        mortgages: mortgagesRef.current,
+        gameOver: gameOverRef.current,
+        reward: rewardRef.current,
+        auction: auctionRef.current, // <--- ДОБАВЛЕНО
+        rolled: rolledRef.current, // <--- ДОБАВЛЕНО
+        isDoubleRoll: isDoubleRollRef.current,
+        pendingAction: pendingAction, // <--- ДОБАВЛЕНО
+        globalCustomSkins: globalCustomSkins,
+        timeLeft: timeLeft // <--- ДОБАВЛЕНО
+    });
+    }, [turn, owners, improvements, jackpot, mortgages, gameOver, reward, auction, rolled, isDoubleRoll]);
+
+  // 🌟 ИДЕАЛЬНАЯ ЗАЩИТА ОТ ОШИБКИ #310: Если в комнате меньше 2 игроков, BoardGame показывает лобби и не рендерит тяжелый стол с хуками!
+  if (initialRoomId && (!players || players.length < 2)) {
+    if (globalTurnCounter > 0) {
+      // Если это не старт, а разгар игры — принудительно вызываем окно завершения матча
+      if (!gameOver) {
+        setGameOver(true);
+        window.setTimeout(finishGame, 100);
+      }
+    } else {
+      // Если игра только-только создаётся — спокойно показываем лобби ожидания
+      return (
+        <div className="flex h-screen w-screen flex-col gap-3 items-center justify-center bg-[#1c1828] text-xl text-white font-sans">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-[#ff5a00]"></div>
+          <div>Ожидание подключения игроков ({players?.length || 0}/2)...</div>
+          <div className="text-xs text-muted-foreground bg-white/5 px-3 py-1.5 rounded-lg font-mono">
+            Код комнаты: #{initialRoomId?.replace('#', '')}
+          </div>
+        </div>
+      );
+    }
+  }
+
   return (
     <div
       className="relative flex h-full overflow-hidden bg-[#1c1828]"
       onClick={() => setPlayerHover(null)}
     >
-      {/* Room info strip — absolute left */}
-      <div className="absolute left-0 top-0 z-10 flex h-full w-[108px] px-3 py-3 bg-foreground text-border border-t-[#29233e] border-r-[#29233e] border-b-[#29233e] border-l-[#29233e] pl-[135px] pr-[135px] justify-center items-center flex-col text-center gap-[14px] rounded-tl-[4px] rounded-tr-[4px] rounded-br-[4px] rounded-bl-[4px]">
-        <div className="font-mono text-[8px] uppercase leading-relaxed tracking-[.10em] text-primary text-left border-t-[0px] border-r-[0px] border-b-[0px] border-l-[0px] pt-[0px] pb-[0px] mt-[0px] mb-[0px]">
+      {!socketConnected && (
+        <div className="absolute inset-0 z-[999] flex items-center justify-center bg-black/70 backdrop-blur-sm">
+          <div className="rounded-2xl bg-card p-6 text-center shadow-2xl">
+            <div className="mx-auto mb-3 h-8 w-8 animate-spin rounded-full border-b-2 border-primary" />
+            <div className="font-display text-xl font-bold">Восстанавливаем соединение…</div>
+            <div className="mt-2 text-xs text-muted-foreground">
+              Если не удаётся подключиться более 2 минут — вас банкротят автоматически.
+            </div>
+          </div>
+        </div>
+      )}
+            {/* Room info strip — absolute left */}
+      <div className="absolute left-0 top-0 z-10 flex h-full w-[108px] px-3 py-3 bg-foreground text-border border-t-[#29233e] border-r-
+      [#29233e] border-b-[#29233e] border-l-[#29233e] pl-[135px] pr-[135px] justify-center items-center flex-col text-center gap-[14px] 
+      rounded-tl-[4px] rounded-tr-[4px] rounded-br-[4px] rounded-bl-[4px]">
+        <div className="font-mono text-[10px] uppercase leading-relaxed tracking-[.10em] text-primary text-left border-t-[0px] border-r-[0px] 
+        border-b-[0px] border-l-[0px] pt-[0px] pb-[0px] mt-[0px] mb-[0px]">
           <span className="block whitespace-nowrap">живая партия</span>
-          <span className="block whitespace-nowrap">стол MA-7K2P</span>
+<span className="block whitespace-nowrap">стол #{initialRoomId?.replace('#', '')}</span>
         </div>
         <h1 className="font-display text-[15px] font-bold leading-tight text-border">
           Пятничный клуб
         </h1>
-        <div className="mt-1 rounded-lg bg-[#f3e7c8] px-1.5 py-1 text-center">
-          <div className="font-mono text-[6px] text-[#7a5c1e]">ДЖЕКПОТ</div>
-          <div className="text-[11px]">🎰</div>
+        <div className="mt-1 flex flex-col gap-1 items-center">
+          {/* Джекпот */}
+          <div className="rounded-lg bg-[#f3e7c8] px-1.5 py-1 text-center">
+            <div className="font-mono text-[9px] text-[#7a5c1e]">ДЖЕКПОТ</div>
+            <div className="text-[14px]">🎰</div>
+          </div>
+          {/* Телепорт (всегда показываем как часть интерфейса) */}
+          <div className="rounded-lg bg-[#f3e7c8] px-1.5 py-1 text-center">
+            <div className="font-mono text-[9px] text-[#7a5c1e]">ТЕЛЕПОРТ</div>
+            <div className="text-[14px]">🌀</div>
+          </div>
         </div>
       </div>
       {/* Board + Right panel — shared centered container */}
       <div className="flex flex-1 items-start justify-center gap-5 overflow-hidden py-1.5 pr-2 pl-[268px] border-t-[#5e5a6e] border-r-[#5e5a6e] border-b-[#5e5a6e] border-l-[#5e5a6e] bg-foreground">
-        <div className="aspect-square h-full max-h-full shrink-0 shadow-[0_18px_60px_rgba(41,35,62,.35)]">
+                <div className="relative aspect-square h-full max-h-full shrink-0 shadow-[0_18px_60px_rgba(41,35,62,.35)]">
           <div
             className="grid h-full w-full gap-px bg-[#5e5a6e]"
             style={{
@@ -4201,29 +6198,55 @@ function BoardGame({ onExit }: { onExit: () => void }) {
               gridTemplateRows: "1.9fr repeat(9, 1fr) 1.9fr",
             }}
           >
-            {boardCells.map((cell, index) => {
-              const design = cardDesigns.find((d) => d.slotIndex === index);
-              const cellName = design?.name ?? cell.name;
-              const cellType = design?.type ?? cell.type;
-              const cellPrice = design?.price ?? cell.price;
-              const imageUrl = design?.imageDataUrl;
-              const { row, col } = cellGridPos(index);
-              const isCorner = CORNER.has(index);
-              const isTopRow = index >= 1 && index <= 9;
-              const isRightCol = index >= 11 && index <= 19;
-              const isBottomRow = index >= 21 && index <= 29;
-              const isLeftCol = index >= 31 && index <= 39;
-              const group = getCellGroup(index);
-              const ownedBy = owners[index];
-              const ownerPlayer = ownedBy
-                ? players.find((p) => p.id === ownedBy)
-                : null;
+        {boardCells.map((_, index) => {
+  // Базовые данные клетки (учитывает дизайны админа)
+  const cell = getCell(index);
+
+  // Скин показывается ТОЛЬКО если поле куплено и у владельца активирован скин для этого слота
+  const ownerId = owners[index];
+  const ownerPlayer = ownerId ? players.find((p) => p.id === ownerId) : null;
+  const ownerHasSkinForSlot = !!(ownerPlayer?.activeSkins && ownerPlayer.activeSkins[index] !== undefined);
+
+  // Ищем товар по slotIndex — работает и со старыми activeSkins вида "card-XXXX"
+  const customSkin = ownerHasSkinForSlot
+    ? marketItems.find((m) => m.category === "card" && m.slotIndex === index && m.isActive !== false)
+    : null;
+
+  // Админский дизайн карточки (применяется по умолчанию)
+  const adminDesign = cardDesigns.find((d) => d.slotIndex === index);
+
+  // Скин игрока имеет приоритет над админским дизайном
+  const design: CardDesign | undefined = customSkin
+    ? {
+        id: customSkin.id,
+        slotIndex: index,
+        name: customSkin.name,
+        type: "property" as CellType,
+        price: customSkin.price,
+        imageDataUrl: customSkin.imageDataUrl,
+        scale: customSkin.scale ?? 1,
+      }
+    : adminDesign;
+
+  const cellName = design?.name ?? cell.name;
+  const cellType = design?.type ?? cell.type;
+  const cellPrice = design?.price ?? cell.price;
+  const imageUrl = design?.imageDataUrl;
+  const { row, col } = cellGridPos(index);
+  const isCorner = CORNER.has(index);
+  const isTopRow = index >= 1 && index <= 9;
+  const isRightCol = index >= 11 && index <= 19;
+  const isBottomRow = index >= 21 && index <= 29;
+  const isLeftCol = index >= 31 && index <= 39;
+    // Если поле стало не собственностью — не показываем полоску и не считаем владельца
+  const isProperty = cell.type === "property";
+  const group = isProperty ? getCellGroup(index) : null;
               const improvLevel = improvements[index] ?? 0;
               const isMortgaged =
                 mortgages[index] !== undefined &&
                 mortgages[index] > globalTurnCounter;
               const displayPrice = group
-                ? ownedBy
+                ? ownerId
                   ? getRent(index, improvements)
                   : cell.price
                 : null;
@@ -4252,8 +6275,12 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                 (pendingAction as BuyA).cellIndex === index;
               const logo = CELL_LOGOS[index];
               const specialIcon = !logo ? SPECIAL_ICONS[cell.type] : null;
-              const playersHere = players.filter(
-                (p) => !p.bankrupt && getDisplayPos(p.id) === index,
+                const playersHere = players.filter(
+                (p) =>
+                  !p.bankrupt &&
+                  !(animStep > 0 && p.id === movingPlayerId) &&
+                  p.id !== diagonalAnim?.playerId &&
+                  getDisplayPos(p.id) === index,
               );
 
               // Font sizing — 1.1 big logos, 1.2 orientation
@@ -4305,18 +6332,19 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                     };
 
               const stripContent = (vertical?: boolean, flip?: boolean) =>
-                displayPrice != null ? (
-                  <span
-                    style={{
-                      fontSize: "7px",
-                      color: "#fff",
-                      fontWeight: 800,
-                      writingMode: vertical ? "vertical-rl" : undefined,
-                    }}
-                  >
-                    {displayPrice.toLocaleString("ru-RU")}
-                  </span>
-                ) : null;
+        displayPrice != null ? (
+          <span
+            style={{
+              fontSize: "10px",            // Увеличили размер шрифта на 2 пункта
+              letterSpacing: "1px",       // Добавили расстояние между цифрами
+              color: "#fff",
+              fontWeight: 800,
+              writingMode: vertical ? "vertical-rl" : undefined,
+            }}
+          >
+            {displayPrice.toLocaleString("ru-RU")}
+          </span>
+        ) : null;
 
               return (
                 <div
@@ -4325,7 +6353,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                     gridRow: row,
                     gridColumn: col,
                     backgroundColor: ownerPlayer
-                      ? ownerPlayer.color + "90"
+                      ? ownerPlayer.color + "B3"
                       : cellBg,
                   }}
                   className={`relative flex flex-col items-center justify-center overflow-visible cursor-default ${isHighlighted ? "ring-2 ring-primary ring-inset" : ""}`}
@@ -4530,6 +6558,9 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                             objectFit: "contain",
                             transform: `scale(${design?.scale ?? 1})`,
                             transformOrigin: "center center",
+                            filter: ownerPlayer
+                              ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(255,255,255,0.47))"
+                              : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
                           }}
                         />
                       </div>
@@ -4547,9 +6578,9 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                                     : "18px",
                               lineHeight: 1,
                               marginBottom: "1px",
-                              textShadow: ownerPlayer
-                                ? "0 0 5px rgba(0,0,0,0.7)"
-                                : "none",
+                              filter: ownerPlayer
+                                ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(255,255,255,0.47))"
+                                : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
                             }}
                           >
                             {logo}
@@ -4566,9 +6597,9 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                                     ? "17px"
                                     : "20px",
                               lineHeight: 1,
-                              textShadow: ownerPlayer
-                                ? "0 0 5px rgba(0,0,0,0.7)"
-                                : "none",
+                              filter: ownerPlayer
+                                ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(255,255,255,0.47))"
+                                : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
                             }}
                           >
                             {specialIcon}
@@ -4578,22 +6609,29 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                     )}
                     {/* Cell name — smaller when logo present */}
                   </div>
-                  {playersHere.length > 0 && (
-                    <div className="absolute bottom-[3px] left-1/2 flex -translate-x-1/2 gap-1 z-10">
-                      {playersHere.map((p) => (
+              {playersHere.length > 0 && (
+                <div
+                  className="absolute top-1/2 left-1/2 z-10 flex -translate-x-1/2 -translate-y-1/2 gap-0.5"
+                  style={{ zIndex: movingPlayerId && playersHere.some(p => p.id === movingPlayerId) ? 50 : 10 }}
+                >
+    {playersHere.map((p) => (
                         <div
-                          key={p.id}
-                          className="flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-sm"
-                          style={{
-                            backgroundColor: p.color,
-                            fontSize: "10px",
-                          }}
-                        >
-                          {p.initials[0]}
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                    key={p.id}
+                    className="flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-sm"
+                     style={{
+                      backgroundColor: p.color,
+                      fontSize: "10px",
+                      position: "relative",
+                      zIndex: p.id === movingPlayerId ? 2 : 1,
+                      boxShadow: "0 0 0 2px #ffffff, 0 1px 4px rgba(0,0,0,0.35)",
+                    }}
+                  >
+        {p.initials[0]}
+      </div>
+    ))}
+  </div>
+)}
+{/* Огненный след при испытании рендерится отдельно поверх доски, здесь оставляем пусто */}
                 </div>
               );
             })}
@@ -4611,32 +6649,33 @@ function BoardGame({ onExit }: { onExit: () => void }) {
               {(pendingAction || auction || pendingTrade) && (
                 <div className="shrink-0 mx-1.5 mt-1.5 rounded-xl bg-[#1e1b2e] border border-white/20 p-2.5 shadow-xl">
                   {pendingAction?.type === "buy" &&
+                    players[turn]?.id === (currentUser?.id || "you") && // <--- Проверка: видит только активный игрок
                     (() => {
                       const a = pendingAction as BuyA;
                       return (
                         <>
-                          <div className="text-[7.5px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
+                          <div className="text-[10px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
                             💼 Покупка поля
                           </div>
                           <div className="text-[10px] font-bold text-white mb-0.5">
                             {CELL_LOGOS[a.cellIndex] ?? ""}{" "}
                             {boardCells[a.cellIndex].name}
                           </div>
-                          <div className="text-[8px] text-white/55 mb-2">
+                          <div className="text-[11px] text-white/55 mb-2">
                             Если откажешься — поле уйдёт на аукцион среди других
                             игроков.
                           </div>
                           <div className="flex gap-1.5">
                             <button
                               onClick={buyProperty}
-                              disabled={current.money < a.price}
-                              className="flex-1 rounded-lg bg-[#e96852] py-1.5 text-[9px] font-bold text-white disabled:opacity-40 hover:bg-[#d45a43] transition-colors"
+                              disabled={player.money < a.price}
+                              className="flex-1 rounded-lg bg-[#e96852] py-1.5 text-[11px] font-bold text-white disabled:opacity-40 hover:bg-[#d45a43] transition-colors"
                             >
                               Купить {a.price.toLocaleString("ru-RU")} К
                             </button>
                             <button
                               onClick={sendToAuction}
-                              className="flex-1 rounded-lg bg-white/15 py-1.5 text-[9px] font-bold text-white hover:bg-white/20 transition-colors"
+                              className="flex-1 rounded-lg bg-white/15 py-1.5 text-[11px] font-bold text-white hover:bg-white/20 transition-colors"
                             >
                               На аукцион
                             </button>
@@ -4649,10 +6688,10 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                       const a = pendingAction as RentA;
                       return (
                         <>
-                          <div className="text-[7.5px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
+                          <div className="text-[10px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
                             🏠 Аренда
                           </div>
-                          <div className="text-[9px] text-white/80 mb-2">
+                          <div className="text-[11px] text-white/80 mb-2">
                             Ты на поле{" "}
                             <b className="text-white">
                               {boardCells[a.cellIndex].name}
@@ -4661,7 +6700,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                           </div>
                           <button
                             onClick={confirmAction}
-                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[9px] font-bold text-white hover:bg-[#d45a43] transition-colors"
+                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[11px] font-bold text-white hover:bg-[#d45a43] transition-colors"
                           >
                             Заплатить {a.amount.toLocaleString("ru-RU")} К
                           </button>
@@ -4673,15 +6712,15 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                       const a = pendingAction as NumA;
                       return (
                         <>
-                          <div className="text-[7.5px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
+                          <div className="text-[10px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
                             💸 Налог
                           </div>
-                          <div className="text-[9px] text-white/70 mb-2">
+                          <div className="text-[11px] text-white/70 mb-2">
                             Штраф уйдёт в копилку джекпота.
                           </div>
                           <button
                             onClick={confirmAction}
-                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[9px] font-bold text-white hover:bg-[#d45a43] transition-colors"
+                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[11px] font-bold text-white hover:bg-[#d45a43] transition-colors"
                           >
                             Заплатить {a.amount.toLocaleString("ru-RU")} К
                           </button>
@@ -4693,15 +6732,15 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                       const a = pendingAction as GainA;
                       return (
                         <>
-                          <div className="text-[7.5px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
+                          <div className="text-[10px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
                             🎲 Шанс
                           </div>
-                          <div className="text-[9px] text-white/80 leading-relaxed mb-2">
+                          <div className="text-[11px] text-white/80 leading-relaxed mb-2">
                             {a.desc}
                           </div>
                           <button
                             onClick={confirmAction}
-                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[9px] font-bold text-white hover:bg-[#d45a43] transition-colors"
+                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[11px] font-bold text-white hover:bg-[#d45a43] transition-colors"
                           >
                             Заплатить {a.amount.toLocaleString("ru-RU")} К
                           </button>
@@ -4726,7 +6765,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                             <div className="text-[7.5px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
                               🔒 Выкуп из тюрьмы
                             </div>
-                            {current.money < 500 ? (
+                            {player.money < 500 ? (
                               <>
                                 <div className="text-[9px] text-white/75 mb-2">
                                   Недостаточно средств (нужно 500 К). Продайте
@@ -4760,12 +6799,12 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                       const needPicks = a.diceCount || 0;
                       return (
                         <>
-                          <div className="text-[7.5px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
+                          <div className="text-[14px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
                             🎰 Казино Джекпота!
                           </div>
                           {needPicks === 0 ? (
                             <>
-                              <div className="text-[8px] text-white/70 mb-2">
+                              <div className="text-[12px] text-white/70 mb-2">
                                 Выбери количество кубиков:
                               </div>
                               <div className="grid grid-cols-3 gap-1.5">
@@ -4795,16 +6834,16 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                                       }
                                       className="rounded-lg bg-white/15 px-1 py-2 text-center hover:bg-[#e7ba68]/30 transition-colors"
                                     >
-                                      <div className="text-[11px]">
+                                      <div className="text-[16px]">
                                         {"🎲".repeat(dc)}
                                       </div>
-                                      <div className="text-[7px] font-bold text-white mt-0.5">
+                                      <div className="text-[12px] font-bold text-white mt-0.5">
                                         {fee.toLocaleString("ru-RU")} К
                                       </div>
-                                      <div className="text-[6px] text-white/50">
+                                      <div className="text-[11px] text-white/50">
                                         приз {prize.toLocaleString("ru-RU")} К
                                       </div>
-                                      <div className="text-[6px] text-[#e7ba68]">
+                                      <div className="text-[11px] text-[#e7ba68]">
                                         шанс {chance}
                                       </div>
                                     </button>
@@ -4815,18 +6854,18 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                                 onClick={() => {
                                   setPendingAction(null);
                                   addLog(
-                                    `🎰 ${current.name} пропустил игру в казино.`,
+                                    `🎰 ${player.name} пропустил игру в казино.`,
                                   );
                                   advanceTurn();
                                 }}
-                                className="mt-2 w-full rounded-lg bg-white/10 py-1.5 text-[9px] font-bold text-white hover:bg-white/20 transition-colors"
+                                className="mt-2 w-full rounded-lg bg-white/10 py-1.5 text-[11px] font-bold text-white hover:bg-white/20 transition-colors"
                               >
                                 Пропустить
                               </button>
                             </>
                           ) : (
                             <>
-                              <div className="text-[8px] text-white/70 mb-1">
+                              <div className="text-[11px] text-white/70 mb-1">
                                 {"🎲 ".repeat(needPicks)} Выбери {needPicks}{" "}
                                 число
                                 {needPicks > 1
@@ -4836,7 +6875,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                                   : ""}{" "}
                                 из 1–6:
                               </div>
-                              <div className="text-[7px] text-white/40 mb-2">
+                              <div className="text-[11px] text-white/40 mb-2">
                                 Ставка:{" "}
                                 {(needPicks === 1
                                   ? 350
@@ -4885,7 +6924,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                                       a.secret,
                                     )
                                   }
-                                  className="w-full rounded-lg bg-[#32786d] py-1.5 text-[9px] font-bold text-white hover:bg-[#266059] transition-colors"
+                                  className="w-full rounded-lg bg-[#32786d] py-1.5 text-[11px] font-bold text-white hover:bg-[#266059] transition-colors"
                                 >
                                   Поставить на [{pickedNums.join(", ")}] —
                                   испытать удачу!
@@ -4896,7 +6935,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                                   setPendingAction({ ...a, diceCount: 0 });
                                   setCasinoPick([]);
                                 }}
-                                className="mt-1 w-full rounded-lg py-1 text-[7px] text-white/40 hover:text-white/70"
+                                className="mt-1 w-full rounded-lg py-1 text-[11px] text-white/40 hover:text-white/70"
                               >
                                 ← Назад
                               </button>
@@ -4909,7 +6948,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                     (() => {
                       return (
                         <>
-                          <div className="text-[7.5px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
+                          <div className="text-[10px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
                             🔒 В тюрьму
                           </div>
                           <div className="text-[9px] text-white/75 mb-2">
@@ -4917,7 +6956,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                           </div>
                           <button
                             onClick={confirmAction}
-                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[9px] font-bold text-white hover:bg-[#d45a43] transition-colors"
+                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[11px] font-bold text-white hover:bg-[#d45a43] transition-colors"
                           >
                             ОК
                           </button>
@@ -4926,12 +6965,12 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                     })()}
                   {auction && (
                     <>
-                      <div className="text-[7.5px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
+                      <div className="text-[10px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
                         🔨 Аукцион — {CELL_LOGOS[auction.cellIndex] ?? ""} «
                         {boardCells[auction.cellIndex].name}»
                       </div>
                       <div className="flex items-baseline gap-1 mb-0.5">
-                        <span className="text-[8px] text-white/60">
+                        <span className="text-[10px] text-white/60">
                           Текущая ставка:
                         </span>
                         <span className="text-[11px] font-bold text-white">
@@ -4939,7 +6978,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                         </span>
                       </div>
                       {auction.highBidder && (
-                        <div className="text-[8px] text-white/50 mb-0.5">
+                        <div className="text-[10px] text-white/50 mb-0.5">
                           Лидер:{" "}
                           <b className="text-white">
                             {
@@ -4949,11 +6988,11 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                           </b>
                         </div>
                       )}
-                      <div className="text-[8px] text-white/70 mb-2">
+                      <div className="text-[10px] text-white/70 mb-2">
                         Ход:{" "}
                         <b className="text-white">{auctionCurPlayer?.name}</b>
                       </div>
-                      {(() => {
+                          {(() => {
                         const currentBidderId =
                           auction.participants[auction.currentIdx];
                         const currentBidder = players.find(
@@ -4962,36 +7001,45 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                         // Если текущий участник банкрот, просто показываем текст
                         if (currentBidder?.bankrupt)
                           return (
-                            <div className="text-center text-[8px] text-white/40 italic">
+                            <div className="text-center text-[10px] text-white/40 italic">
                               Игрок банкрот
                             </div>
                           );
-                        return (
-                          <div className="flex gap-1.5">
-                            <button
-                              onClick={auctionRaise}
-                              disabled={
-                                currentBidder &&
-                                currentBidder.money < auction.price + 100
-                              }
-                              className="flex-1 rounded-lg bg-[#32786d] py-1.5 text-[9px] font-bold text-white disabled:opacity-40 hover:bg-[#266059] transition-colors"
-                            >
-                              +100 →{" "}
-                              {(auction.price + 100).toLocaleString("ru-RU")} К
-                            </button>
-                            <button
-                              onClick={auctionDecline}
-                              className="flex-1 rounded-lg bg-white/15 py-1.5 text-[9px] font-bold text-white hover:bg-white/20 transition-colors"
-                            >
-                              Отказаться
-                            </button>
-                          </div>
-                        );
+
+                        // Проверяем, наш ли это ход в аукционе
+                        const isMyAuctionAction = currentBidderId === (currentUser?.id || "you");
+
+                        if (isMyAuctionAction) {
+                          return (
+                            <div className="flex gap-1.5">
+                              <button
+                                onClick={auctionRaise}
+                                disabled={currentBidder && currentBidder.money < auction.price + 100}
+                                className="flex-1 rounded-lg bg-[#32786d] py-1.5 text-[11px] font-bold text-white disabled:opacity-40 hover:bg-[#266059] transition-colors"
+                              >
+                                Поставить {(auction.price + 100).toLocaleString("ru-RU")} К
+                              </button>
+                              <button
+                                onClick={auctionDecline}
+                                className="flex-1 rounded-lg bg-white/15 py-1.5 text-[11px] font-bold text-white hover:bg-white/20 transition-colors"
+                              >
+                                Отказаться
+                              </button>
+                            </div>
+                          );
+                        } else {
+                          // Если ход не наш, просто показываем, кого ждем
+                          return (
+                            <div className="text-center text-[10px] text-white/50">
+                              Ожидание решения от игрока {currentBidder?.name || "..."}
+                            </div>
+                          );
+                        }
                       })()}
                     </>
                   )}
                   {pendingTrade &&
-                    (() => {
+                    pendingTrade.trade.targetId === (currentUser?.id || "you") && (() => {
                       const target = players.find(
                         (p) => p.id === pendingTrade.trade.targetId,
                       );
@@ -5006,7 +7054,19 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                           </div>
                           <div className="text-[9px] text-white/80 mb-2">
                             {initiator.name} предлагает тебе обмен.
-                          </div>
+                       </div>
+                      <div className="flex flex-col gap-1 text-[8px] text-white/60 mb-2">
+                    <div>
+                       <b className="text-white">{initiator.name}</b> отдаёт: 
+                        {pendingTrade.trade.myMoney > 0 && ` 💵${pendingTrade.trade.myMoney}`}
+                      {pendingTrade.trade.myCards.length > 0 && " 🃏" + pendingTrade.trade.myCards.map(ci => boardCells[ci].name).join(", ")}
+                      </div>
+                       <div>
+                    <b className="text-white">Вы</b> отдаёте: 
+                        {pendingTrade.trade.theirMoney > 0 && ` 💵${pendingTrade.trade.theirMoney}`}
+                       {pendingTrade.trade.theirCards.length > 0 && " 🃏" + pendingTrade.trade.theirCards.map(ci => boardCells[ci].name).join(", ")}
+                     </div>
+                       </div>
                           <div className="flex gap-1.5">
                             <button
                               onClick={() => {
@@ -5043,6 +7103,8 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                                 addLog(
                                   `✅ ${target.name} принял договор с ${initiator.name}!`,
                                 );
+
+                                socket.emit('trade-resolved', { roomId: initialRoomId, initiatorId: tradeInitiator?.id });
 
                                 // Возвращаем ход инициатору с учётом дублей
                                 const initInfo = tradeInitiator;
@@ -5124,8 +7186,8 @@ function BoardGame({ onExit }: { onExit: () => void }) {
               {trade && tradeTarget && (
                 <div className="shrink-0 mx-1.5 mb-1 rounded-xl border border-[#e7ba68]/30 bg-[#1a1729] overflow-hidden">
                   <div className="flex items-center justify-between px-2 py-1.5 bg-[#29233e] border-b border-white/10">
-                    <span className="font-mono text-[8px] font-bold text-[#e7ba68] uppercase tracking-wide">
-                      🤝 l N говор
+                    <span className="font-mono text-[13px] font-bold text-[#e7ba68] uppercase tracking-wide">
+                      🤝 Договор
                     </span>
                     <button
                       onClick={() => setTrade(null)}
@@ -5136,39 +7198,35 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                   </div>
                   <div className="grid grid-cols-2 gap-px bg-white/5 text-white">
                     <div className="bg-[#1a1729] p-1.5">
-                      <div className="text-[7px] font-bold text-[#e96852] mb-1">
-                        {current.name}{" "}
+                      <div className="text-[13px] font-bold text-[#e96852] mb-1">
+                        {player.name}{" "}
                         <span className="text-white/40 font-normal">
                           предлагает
                         </span>
                       </div>
                       <div className="flex items-center gap-1 mb-1">
-                        <span className="text-[7px] text-white/50">💵</span>
+                        <span className="text-[13px] text-white/50">💵</span>
                         <input
-                          type="number"
-                          min={0}
-                          max={current.money}
-                          value={trade.myMoney}
-                          onChange={(e) =>
-                            setTrade({
-                              ...trade,
-                              myMoney: Math.min(
-                                current.money,
-                                Number(e.target.value),
-                              ),
-                            })
-                          }
-                          className="w-full rounded bg-white/10 px-1 py-0.5 text-[8px] font-mono text-white border-none outline-none"
-                        />
-                        <span className="text-[6px] text-white/30 shrink-0">
-                          К
-                        </span>
+  type="number"
+  min={0}
+  value={trade.myMoney === 0 ? "" : trade.myMoney}
+  placeholder="0"
+  onFocus={(e) => e.target.select()}
+  onChange={(e) =>
+    setTrade({
+      ...trade,
+      myMoney: Math.max(0, Number(e.target.value) || 0),
+    })
+  }
+  className="w-full rounded bg-white/10 px-2 py-1.5 text-[13px] font-mono text-white border-none outline-none placeholder:text-white/70 placeholder:font-mono"
+/>
                       </div>
-                      <div className="space-y-0.5 max-h-16 overflow-y-auto">
+                      <div className="space-y-0.5 max-h-40 overflow-y-auto">
                         {myOwnedCards.map((ci) => (
                           <label
                             key={ci}
-                            className="flex items-center gap-1 cursor-pointer"
+                            className="flex items-center gap-2 cursor-pointer rounded px-1.5 py-0.5"
+                            style={{ backgroundColor: getCellGroup(ci)?.color || 'transparent' }}
                           >
                             <input
                               type="checkbox"
@@ -5181,20 +7239,20 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                                     : trade.myCards.filter((x) => x !== ci),
                                 })
                               }
-                              className="accent-[#e96852] w-2.5 h-2.5"
+                              className="accent-[#e96852] w-3.5 h-3.5"
                             />
-                            <span className="text-[7px] truncate">
+                            <span className="text-[13px] truncate text-white">
                               {CELL_LOGOS[ci] ?? ""} {boardCells[ci].name}
                             </span>
                           </label>
                         ))}
                         {myOwnedCards.length === 0 && (
-                          <div className="text-[6px] text-white/30 italic">
+                          <div className="text-[11px] text-white/30 italic">
                             Нет карточек
                           </div>
                         )}
                       </div>
-                      <div className="mt-1 text-[7px] font-bold text-[#e96852]">
+                      <div className="mt-1 text-[13px] font-bold text-[#e96852]">
                         {(
                           trade.myMoney +
                           trade.myCards.reduce(
@@ -5207,7 +7265,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                     </div>
                     <div className="bg-[#1a1729] p-1.5">
                       <div
-                        className="text-[7px] font-bold mb-1"
+                        className="text-[13px] font-bold mb-1"
                         style={{ color: tradeTarget.color }}
                       >
                         {tradeTarget.name}{" "}
@@ -5216,32 +7274,28 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                         </span>
                       </div>
                       <div className="flex items-center gap-1 mb-1">
-                        <span className="text-[7px] text-white/50">💵</span>
+                        <span className="text-[13px] text-white/50">💵</span>
                         <input
-                          type="number"
-                          min={0}
-                          max={tradeTarget.money}
-                          value={trade.theirMoney}
-                          onChange={(e) =>
-                            setTrade({
-                              ...trade,
-                              theirMoney: Math.min(
-                                tradeTarget.money,
-                                Number(e.target.value),
-                              ),
-                            })
-                          }
-                          className="w-full rounded bg-white/10 px-1 py-0.5 text-[8px] font-mono text-white border-none outline-none"
-                        />
-                        <span className="text-[6px] text-white/30 shrink-0">
-                          К
-                        </span>
+  type="number"
+  min={0}
+  value={trade.theirMoney === 0 ? "" : trade.theirMoney}
+  placeholder="0"
+  onFocus={(e) => e.target.select()}
+  onChange={(e) =>
+    setTrade({
+      ...trade,
+      theirMoney: Math.max(0, Number(e.target.value) || 0),
+    })
+  }
+  className="w-full rounded bg-white/10 px-2 py-1.5 text-[13px] font-mono text-white border-none outline-none placeholder:text-white/70 placeholder:font-mono"
+/>
                       </div>
-                      <div className="space-y-0.5 max-h-16 overflow-y-auto">
+                      <div className="space-y-0.5 max-h-40 overflow-y-auto">
                         {tradeTargetCards.map((ci) => (
                           <label
                             key={ci}
-                            className="flex items-center gap-1 cursor-pointer"
+                            className="flex items-center gap-2 cursor-pointer rounded px-1.5 py-0.5"
+                            style={{ backgroundColor: getCellGroup(ci)?.color || 'transparent' }}
                           >
                             <input
                               type="checkbox"
@@ -5254,21 +7308,21 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                                     : trade.theirCards.filter((x) => x !== ci),
                                 })
                               }
-                              className="accent-[#32786d] w-2.5 h-2.5"
+                              className="accent-[#32786d] w-3.5 h-3.5"
                             />
-                            <span className="text-[7px] truncate">
+                            <span className="text-[13px] truncate text-white">
                               {CELL_LOGOS[ci] ?? ""} {boardCells[ci].name}
                             </span>
                           </label>
                         ))}
                         {tradeTargetCards.length === 0 && (
-                          <div className="text-[6px] text-white/30 italic">
+                          <div className="text-[11px] text-white/30 italic">
                             Нет карточек
                           </div>
                         )}
                       </div>
                       <div
-                        className="mt-1 text-[7px] font-bold"
+                        className="mt-1 text-[13px] font-bold"
                         style={{ color: tradeTarget.color }}
                       >
                         {(
@@ -5282,16 +7336,43 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                       </div>
                     </div>
                   </div>
+                  {(() => {
+                    const myTotal = trade.myMoney + trade.myCards.reduce((s, ci) => s + (boardCells[ci].price ?? 0), 0);
+                    const theirTotal = trade.theirMoney + trade.theirCards.reduce((s, ci) => s + (boardCells[ci].price ?? 0), 0);
+                    const overLimit = myTotal > 0 && theirTotal > 0 && (myTotal > theirTotal * 2 || theirTotal > myTotal * 2);
+                    const notEnoughMy = trade.myMoney > player.money;
+                    const notEnoughTheir = trade.theirMoney > tradeTarget.money;
+                    if (!overLimit && !notEnoughMy && !notEnoughTheir) return null;
+                    return (
+                      <div className="px-2 pb-1.5 bg-[#0f0d1a]">
+                        {notEnoughMy && (
+                          <div className="rounded bg-[#e96852]/20 border border-[#e96852]/40 px-2 py-1 text-[10px] font-bold text-[#ff8a75]">
+                            ❌ У вас недостаточно средств ({trade.myMoney.toLocaleString("ru-RU")} К &gt; {player.money.toLocaleString("ru-RU")} К)
+                          </div>
+                        )}
+                        {notEnoughTheir && (
+                          <div className="mt-1 rounded bg-[#e96852]/20 border border-[#e96852]/40 px-2 py-1 text-[10px] font-bold text-[#ff8a75]">
+                            ❌ У {tradeTarget.name} недостаточно средств ({trade.theirMoney.toLocaleString("ru-RU")} К &gt; {tradeTarget.money.toLocaleString("ru-RU")} К)
+                          </div>
+                        )}
+                        {overLimit && (
+                          <div className="mt-1 rounded bg-[#e96852]/20 border border-[#e96852]/40 px-2 py-1 text-[10px] font-bold text-[#ff8a75]">
+                            ⚠️ Разница в стоимости превышает лимит (максимум х2). Сейчас: {myTotal.toLocaleString("ru-RU")} К ↔ {theirTotal.toLocaleString("ru-RU")} К
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                   <div className="flex gap-1 p-1.5 bg-[#0f0d1a]">
                     <button
                       onClick={() => setTrade(null)}
-                      className="flex-1 rounded py-1 text-[7px] font-bold text-white/50 border border-white/10 hover:border-white/20"
+                      className="flex-1 rounded py-1 text-[13px] font-bold text-white/50 border border-white/10 hover:border-white/20"
                     >
                       Отмена
                     </button>
                     <button
                       onClick={proposeTrade}
-                      className="flex-1 rounded py-1 text-[7px] font-bold text-white bg-[#32786d] hover:bg-[#266059]"
+                      className="flex-1 rounded py-1 text-[13px] font-bold text-white bg-[#32786d] hover:bg-[#266059]"
                     >
                       Предложить
                     </button>
@@ -5300,7 +7381,16 @@ function BoardGame({ onExit }: { onExit: () => void }) {
               )}
               <div className="min-h-0 flex-1 relative p-1.5 pt-1 text-[12px]">
                 {/* Сами логи чата (объединенный и отсортированный поток) */}
-                <div className="space-y-px overflow-y-auto h-full pb-2 [&::-webkit-scrollbar]:hidden">
+                <div
+                  ref={logContainerRef}
+                  onScroll={(e) => {
+                    const el = e.currentTarget;
+                    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+                    // 20px — небольшой допуск, чтобы «почти у низа» тоже считалось низом
+                    setChatAutoScroll(distanceFromBottom <= 20);
+                  }}
+                  className="space-y-px overflow-y-auto h-full pb-2 [&::-webkit-scrollbar]:hidden"
+                >
                   {[...log, ...chatMessages]
                     .sort((a, b) => a.timestamp - b.timestamp)
                     .map((item, i) => {
@@ -5317,9 +7407,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                       } else {
                         // Это лог игры
                         return (
-                          <div
-                            key={`l-${i}`}
-                            className={`leading-tight ${item.type === "special" ? "text-orange-400" : "italic text-white/65"}`}
+                          <div key={`l-${i}`} className={`leading-tight break-words ${item.type === "special" ? "text-orange-400" : "italic text-white/65"}`}
                             style={
                               item.type === "special"
                                 ? { color: "#f97316" }
@@ -5352,27 +7440,234 @@ function BoardGame({ onExit }: { onExit: () => void }) {
               </div>
               <form
                 onSubmit={sendChat}
-                className="shrink-0 flex gap-1 border-t border-white/10 p-1"
+                className="shrink-0 flex gap-1.5 border-t border-white/10 p-1.5"
               >
                 <input
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
                   placeholder="Сообщение…"
-                  className="min-w-0 flex-1 rounded bg-white/10 px-1.5 py-0.5 text-[8px] text-white placeholder:text-white/35 outline-none"
+                  className="min-w-0 flex-1 rounded bg-white/10 px-2.5 py-1.5 text-[12px] text-white placeholder:text-white/35 outline-none"
                 />
                 <button
                   type="submit"
-                  className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-[#e96852] text-white"
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-[#e96852] text-white"
                 >
-                  <Send size={9} />
+                  <Send size={14} />
                 </button>
               </form>
             </div>
           </div>
+                    {movingPlayer && movingCellIdx !== null && (() => {
+            // Компенсация: если в стартовой клетке было несколько фишек,
+            // летящая фишка должна стартовать с той же точки, где стояла статичная.
+            let startOffsetX = 0;
+            if (animStep === 0 && animPath && movingPlayerId) {
+              const oldPos = animPath[0];
+              const allAtOld = players.filter((p) => !p.bankrupt && p.position === oldPos);
+              const movingIdx = allAtOld.findIndex((p) => p.id === movingPlayerId);
+              if (movingIdx !== -1 && allAtOld.length > 1) {
+                // 23px — ширина фишки, 2px — gap-0.5 между ними
+                startOffsetX = (movingIdx - (allAtOld.length - 1) / 2) * 25;
+              }
+            }
+            return (
+              <div
+                className="pointer-events-none absolute z-30"
+                style={{
+                  left: `${getCellCenterPct(movingCellIdx).x}%`,
+                  top: `${getCellCenterPct(movingCellIdx).y}%`,
+                  transform: `translate(-50%, -50%) translateX(${startOffsetX}px)`,
+                  opacity: animStep === 0 ? 0 : 1,
+              transition: `left ${animPath && animPath.length - 1 <= 2 ? 550 : animPath && animPath.length - 1 <= 6 ? 416 : 320}ms linear, top 
+              ${animPath && animPath.length - 1 <= 2 ? 550 : animPath && animPath.length - 1 <= 6 ? 416 : 320}ms linear, transform 
+              ${animPath && animPath.length - 1 <= 2 ? 550 : animPath && animPath.length - 1 <= 6 ? 416 : 320}ms linear, opacity 0ms`,
+                }}
+              >
+                <div
+                  className="flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-sm"
+                  style={{
+                    backgroundColor: movingPlayer.color,
+                    fontSize: "10px",
+                    boxShadow: "0 0 0 2px #ffffff, 0 1px 4px rgba(0,0,0,0.35)",
+                  }}
+                >
+                  {movingPlayer.initials[0]}
+                </div>
+              </div>
+            );
+          })()}
+          {diagonalAnim && (() => {
+            const dp = players.find((pl) => pl.id === diagonalAnim.playerId);
+            if (!dp) return null;
+            const from = getCellCenterPct(diagonalAnim.from);
+            const to = getCellCenterPct(diagonalAnim.to);
+            return (
+              <div
+                className="pointer-events-none absolute z-30"
+                style={{
+                  left: `${from.x}%`,
+                  top: `${from.y}%`,
+                  transform: "translate(-50%, -50%)",
+                  transition: "left 1.15s ease-in-out, top 1.15s ease-in-out",
+                }}
+                ref={(el) => {
+                  if (!el) return;
+                  requestAnimationFrame(() => {
+                    el.style.left = `${to.x}%`;
+                    el.style.top = `${to.y}%`;
+                  });
+                }}
+              >
+                <div
+                  className="flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-sm"
+                  style={{
+                    backgroundColor: dp.color,
+                    fontSize: "10px",
+                    boxShadow: "0 0 0 2px #ffffff, 0 1px 4px rgba(0,0,0,0.35)",
+                  }}
+                >
+                  {dp.initials[0]}
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Огненный след при испытании (Анимированный шлейф) */}
+          {fireTrailAnim && (() => {
+            const from = getCellCenterPct(fireTrailAnim.from);
+            const to = getCellCenterPct(fireTrailAnim.to);
+            const dp = players.find((pl) => pl.id === fireTrailAnim.playerId);
+            if (!dp) return null;
+
+            // Вычисляем контрольную точку для изгиба пламени
+            const midX = (from.x + to.x) / 2 + (to.y - from.y) * 0.1;
+            const midY = (from.y + to.y) / 2 - (to.x - from.x) * 0.1;
+            const pathD = `M ${from.x} ${from.y} Q ${midX} ${midY} ${to.x} ${to.y}`;
+
+            return (
+              <div key={`fire-${fireTrailAnim.from}-${fireTrailAnim.to}`} className="pointer-events-none absolute inset-0 z-[100] overflow-visible">
+                <style>{`
+                  @keyframes flameFlicker {
+                    0% { opacity: 0.8; stroke-width: 8; }
+                    50% { opacity: 1; stroke-width: 14; }
+                    100% { opacity: 0.8; stroke-width: 8; }
+                  }
+                  @keyframes flameFlow {
+                    0% { stroke-dashoffset: 0; }
+                    100% { stroke-dashoffset: -40; }
+                  }
+                  @keyframes emberFloat {
+                    0% { transform: translate(0, 0) scale(1); opacity: 1; }
+                    100% { transform: translate(-15px, -25px) scale(0); opacity: 0; }
+                  }
+                `}</style>
+                <svg className="absolute inset-0 h-full w-full" style={{ overflow: 'visible' }}>
+                  <defs>
+                    <linearGradient id="fireGradientOuter" x1="0%" y1="0%" x2="100%" y2="100%">
+                      <stop offset="0%" stopColor="#ff0000" stopOpacity="0" />
+                      <stop offset="30%" stopColor="#ff4500" stopOpacity="0.8" />
+                      <stop offset="70%" stopColor="#ff8c00" stopOpacity="1" />
+                      <stop offset="100%" stopColor="#ffff00" stopOpacity="1" />
+                    </linearGradient>
+                    <linearGradient id="fireGradientInner" x1="0%" y1="0%" x2="100%" y2="100%">
+                      <stop offset="0%" stopColor="#ff8c00" stopOpacity="0" />
+                      <stop offset="50%" stopColor="#ffff00" stopOpacity="0.9" />
+                      <stop offset="100%" stopColor="#ffffff" stopOpacity="1" />
+                    </linearGradient>
+                    <filter id="fireGlowOuter">
+                      <feGaussianBlur stdDeviation="6" result="blur1" />
+                      <feMerge>
+                        <feMergeNode in="blur1" />
+                        <feMergeNode in="SourceGraphic" />
+                      </feMerge>
+                    </filter>
+                    <filter id="fireGlowInner">
+                      <feGaussianBlur stdDeviation="3" result="blur2" />
+                      <feMerge>
+                        <feMergeNode in="blur2" />
+                        <feMergeNode in="SourceGraphic" />
+                      </feMerge>
+                    </filter>
+                  </defs>
+
+                  {/* Внешний слой пламени (красный/оранжевый) */}
+                  <path
+                    d={pathD}
+                    fill="none"
+                    stroke="url(#fireGradientOuter)"
+                    strokeWidth="12"
+                    strokeLinecap="round"
+                    filter="url(#fireGlowOuter)"
+                    style={{ animation: "flameFlicker 0.8s infinite ease-in-out" }}
+                  />
+                  {/* Внутренний слой пламени (жёлтый/белый) */}
+                  <path
+                    d={pathD}
+                    fill="none"
+                    stroke="url(#fireGradientInner)"
+                    strokeWidth="6"
+                    strokeLinecap="round"
+                    filter="url(#fireGlowInner)"
+                    style={{ animation: "flameFlicker 0.6s infinite ease-in-out" }}
+                  />
+                  {/* Поток искр (анимированный пунктир) */}
+                  <path
+                    d={pathD}
+                    fill="none"
+                    stroke="#ffffff"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeDasharray="4 20"
+                    filter="url(#fireGlowInner)"
+                    style={{ animation: "flameFlow 0.5s infinite linear" }}
+                  />
+                </svg>
+
+                {/* Искры/частицы, летящие от следа */}
+                <div className="absolute" style={{ left: `${from.x}%`, top: `${from.y}%` }}>
+                  {[...Array(6)].map((_, i) => (
+                    <div
+                      key={i}
+                      className="absolute h-1.5 w-1.5 rounded-full bg-yellow-300"
+                      style={{
+                        left: `${(Math.random() - 0.5) * 30}px`,
+                        top: `${(Math.random() - 0.5) * 30}px`,
+                        animation: `emberFloat ${0.5 + Math.random() * 0.5}s infinite ease-out`,
+                        animationDelay: `${Math.random() * 0.5}s`,
+                        boxShadow: "0 0 8px #ff8c00",
+                      }}
+                    />
+                  ))}
+                </div>
+
+                {/* Фишка игрока (движется вместе с шлейфом) */}
+                <div
+                  className="absolute z-[110] flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-[0_0_25px_#ff8c00]"
+                  style={{
+                    left: `${from.x}%`,
+                    top: `${from.y}%`,
+                    transform: "translate(-50%, -50%)",
+                    backgroundColor: dp.color,
+                    fontSize: "10px",
+                    transition: "left 1.5s cubic-bezier(0.4, 0, 0.2, 1), top 1.5s cubic-bezier(0.4, 0, 0.2, 1)",
+                  }}
+                  ref={(el) => {
+                    if (!el) return;
+                    requestAnimationFrame(() => {
+                      el.style.left = `${to.x}%`;
+                      el.style.top = `${to.y}%`;
+                    });
+                  }}
+                >
+                  {dp.initials[0]}
+                </div>
+              </div>
+            );
+          })()}
         </div>
 
         {/* Right control panel */}
-        <div className="flex h-full w-[255px] shrink-0 flex-col gap-2 overflow-y-auto p-1.5">
+<div className="flex h-full w-[255px] shrink-0 flex-col gap-2 overflow-y-auto p-1.5">
           <div className="rounded-2xl border border-card-border bg-card p-3">
             <div className="flex items-center justify-between">
               <div>
@@ -5380,12 +7675,12 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                   ход сейчас
                 </div>
                 <h2 className="font-display text-lg font-bold leading-tight">
-                  {current.name}
+                  {player.name}
                 </h2>
               </div>
               <Avatar
-                initials={current.initials}
-                color={current.color}
+                initials={player.initials}
+                color={player.color}
                 size="sm"
               />
             </div>
@@ -5404,7 +7699,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
               <div>
                 <div className="text-[9px] text-muted-foreground">На руках</div>
                 <div className="font-mono text-sm font-bold">
-                  {current.money.toLocaleString("ru-RU")}{" "}
+                  {player.money.toLocaleString("ru-RU")}{" "}
                   <span className="text-[9px] text-muted-foreground">К</span>
                 </div>
               </div>
@@ -5415,35 +7710,58 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                 </div>
               </div>
             </div>
-            {inJail ? (
+                        {inJail ? (
               <>
+                {/* Кнопка броска видна всем, но активируется только у того, чей ход */}
                 <button
-                  onClick={roll}
-                  disabled={busy}
+                  onClick={() => {
+                    console.log("🔒 Нажата тюремная кнопка броска. Отправляем запрос на сервер...");
+                    socket.emit('roll-dice-request', { 
+                      roomId: initialRoomId, 
+                      playerId: player.id || "you" 
+                    });
+                  }}
+                  disabled={
+                    busy || 
+                    (initialRoomId ? turn !== players.findIndex(p => p.name === (currentUser?.name || player?.name)) : false)
+                  }
                   className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl bg-primary py-2.5 text-xs font-bold text-primary-foreground disabled:opacity-45"
                 >
                   <Dice5 size={13} />
                   {diceRolling ? "…бросок…" : "Бросить кубики"}
                 </button>
-                <button
-                  onClick={payBail}
-                  disabled={
-                    (!rolled && !jailPaymentPending) || // Разрешаем нажимать, если открыто окно jailPaymentPending
-                    !!vote ||
-                    !!pendingAction ||
-                    !!auction ||
-                    gameOver ||
-                    current.money < 500
-                  }
-                  className="mt-1.5 flex w-full items-center justify-center gap-1.5 rounded-xl bg-muted py-2 text-xs font-bold disabled:opacity-45"
-                >
-                  <Banknote size={13} /> Заплатить (500 К)
-                </button>
+                
+                {/* Кнопка выкупа: видна и активна только тому, кто сам в тюрьме */}
+                {players[turn]?.id === (currentUser?.id || "you") && (
+                  <button
+                    onClick={payBail}
+                    disabled={
+                      (busy && !jailPaymentPending) || // <--- ИЗМЕНИЛИ: Разблокируем при обязательном выкупе
+                      !!vote ||
+                      !!pendingAction ||
+                      !!auction ||
+                      gameOver ||
+                      player.money < 500
+                    }
+                    className="mt-1.5 flex w-full items-center justify-center gap-1.5 rounded-xl bg-muted py-2 text-xs font-bold disabled:opacity-45"
+                  >
+                    <Banknote size={13} /> Заплатить (500 К)
+                  </button>
+                )}
               </>
             ) : (
               <button
-                onClick={roll}
-                disabled={busy}
+                onClick={() => {
+                  console.log("🎲 Нажата основная кнопка броска. Отправляем запрос на сервер...");
+                  socket.emit('roll-dice-request', { 
+                    roomId: initialRoomId, 
+                    playerId: player.id || "you" 
+                  });
+                }}
+                disabled={
+                  busy || 
+                  (initialRoomId ? turn !== players.findIndex(p => p.name === (currentUser?.name || player?.name)) : false)
+                }
                 className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-primary py-2.5 text-sm font-bold text-primary-foreground disabled:opacity-45"
               >
                 <Dice5 size={15} />
@@ -5456,7 +7774,32 @@ function BoardGame({ onExit }: { onExit: () => void }) {
             )}
             <button
               onClick={() => {
-                if (!reward) finishGame();
+                const myId = currentUser?.id || "you";
+                const me = players.find(p => p.id === myId);
+
+                if (!me) { onExit(); return; }
+
+                // Игрок УЖЕ выбыл (банкрот) — показываем модалку с наградой, потом выходим
+                if (me.bankrupt && !me.leftAlive) {
+                  if (initialRoomId) socket.emit('leave-game', { roomId: initialRoomId, userId: myId });
+                  // Начисляем и показываем награду (если ещё не выдана)
+                  if (!rewardGivenRef.current) {
+                    const { place, coins, xp } = computePlaceAndReward(myId);
+                    if (place > 0) {
+                    const grant = grantRewardToLocalPlayer(place, coins, xp);
+                    const dropInfo = grant?.droppedName ? ` · Предмет: ${grant.droppedName} добавлен в инвентарь!` : "";
+                    setReward(`Вы заняли ${place} место: +${xp} XP и +${coins} Coins.${dropInfo}`);
+                    } else {
+                      rewardGivenRef.current = true;
+                      setReward("Вы покинули игру.");
+                    }
+                  }
+                  return; // модалка сама вызовет onExit по кнопке
+                }
+
+                // Игрок ЖИВОЙ — выходим без награды
+                if (initialRoomId) socket.emit('leave-game', { roomId: initialRoomId, userId: myId });
+                handleVoluntaryLeave(myId);
                 onExit();
               }}
               className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-xl border border-input py-2 text-xs font-bold text-muted-foreground hover:bg-muted"
@@ -5465,60 +7808,15 @@ function BoardGame({ onExit }: { onExit: () => void }) {
             </button>
           </div>
 
-          {/* Improvements */}
-          {rolled &&
-            monopolyGroups.length > 0 &&
-            !pendingAction &&
-            !auction &&
-            !animPath && (
-              <div className="rounded-2xl border border-card-border bg-card p-3">
-                <div className="mb-2 font-mono text-[8px] uppercase tracking-wide text-muted-foreground">
-                  Улучшение Конополий
-                </div>
-                {monopolyGroups.map(({ gIdx, group }) => {
-                  const canImprove = !improvedGroupsThisTurn.includes(gIdx);
-                  const targetCell = [...group.cells].sort(
-                    (a, b) => (improvements[a] ?? 0) - (improvements[b] ?? 0),
-                  )[0];
-                  const lvl = improvements[targetCell] ?? 0;
-                  if (lvl >= 4) return null;
-                  const cost = getImproveCost(targetCell);
-                  return (
-                    <div key={gIdx} className="mb-2 last:mb-0">
-                      <div className="flex items-center gap-1.5 mb-1">
-                        <div
-                          className="h-2 w-2 rounded-full shrink-0"
-                          style={{ backgroundColor: group.color }}
-                        />
-                        <span className="text-[10px] font-bold truncate">
-                          {group.name}
-                        </span>
-                      </div>
-                      <div className="text-[8px] text-muted-foreground mb-1 truncate">
-                        {boardCells[targetCell].name} →{" "}
-                        {IMPROVE_LABELS[lvl + 1]}
-                      </div>
-                      <button
-                        onClick={() => improveProperty(targetCell)}
-                        disabled={
-                          current.id !== players[turn].id ||
-                          !canImprove ||
-                          current.money < cost
-                        }
-                        className="w-full rounded-lg py-1.5 text-[9px] font-bold text-white disabled:opacity-40 transition-colors"
-                        style={{
-                          backgroundColor: canImprove ? group.color : "#aaa",
-                        }}
-                      >
-                        {canImprove
-                          ? `Улучшить за ${cost.toLocaleString("ru-RU")} К`
-                          : "Уже улучшено"}
-                      </button>
-                    </div>
-                  );
-                })}
+
+          {player.bankrupt && !player.leftAlive && (
+            <div className="rounded-2xl border border-[#e96852]/40 bg-[#f6dfd7] p-3 text-center">
+              <div className="font-bold text-[12px] text-primary">👀 Вы выбыли</div>
+              <div className="mt-1 text-[10px] text-muted-foreground">
+                Наблюдайте за партией. Нажмите «Покинуть игру», когда захотите выйти — награда будет показана.
               </div>
-            )}
+            </div>
+          )}
 
           {/* Players list with hover popup */}
           <div className="rounded-2xl border border-card-border bg-card p-3">
@@ -5534,8 +7832,8 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                   key={p.id}
                   className={`relative flex items-center gap-2 rounded-lg p-1.5 cursor-pointer ${i === turn ? "bg-[#f6dfd7]" : "hover:bg-muted"} ${p.bankrupt ? "opacity-40" : ""}`}
                   onClick={(e) => {
-                    e.stopPropagation();
-                    if (p.id !== current.id && !p.bankrupt) {
+  e.stopPropagation();
+  if (!p.bankrupt) {
                       const rect = e.currentTarget.getBoundingClientRect();
                       setPlayerHover({
                         pid: p.id,
@@ -5548,10 +7846,13 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                   <Avatar initials={p.initials} color={p.color} size="sm" />
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[11px] font-bold">
-                      {p.name}
-                      {p.bankrupt ? " · банкрот" : ""}
-                      {(p.jailTurns ?? 0) > 0 ? " 🔒" : ""}
-                    </div>
+  {p.name}
+  {p.vipUntil && new Date(p.vipUntil) > new Date() && (
+    <span className="ml-1 rounded bg-[#d3a247] px-1 py-0.5 text-[9px] font-bold text-white">VIP</span>
+  )}
+  {p.bankrupt ? " · банкрот" : ""}
+  {((p?.jailTurns ?? 0) > 0 ? " 🔒 " : "")}
+</div>
                     <div className="text-[9px] text-muted-foreground">
                       {p.money.toLocaleString("ru-RU")} К ·{" "}
                       {boardCells[p.position]?.name ?? "?"}
@@ -5562,7 +7863,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                       p.id ===
                       (auction
                         ? auction.participants[auction.currentIdx]
-                        : players[turn].id);
+                        : players[turn]?.id);
                     return isCurrentTurn && !p.bankrupt ? (
                       <span className="h-2 w-2 shrink-0 rounded-full bg-primary" />
                     ) : null;
@@ -5571,13 +7872,6 @@ function BoardGame({ onExit }: { onExit: () => void }) {
               ))}
             </div>
           </div>
-
-          <button
-            onClick={finishGame}
-            className="flex w-full items-center justify-center gap-2 rounded-xl border border-input bg-card py-2 text-xs font-bold"
-          >
-            <Trophy size={12} /> Завершить партию
-          </button>
 
           {/* Rating panel */}
           {showRating &&
@@ -5672,14 +7966,15 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                 {[
                   {
                     icon: "🤝",
-                    label: "Договор",
-                    action: () => openTrade(tp.id),
-                    disabled:
-                      players[turn].id !== current.id ||
-                      rolled ||
-                      inJail ||
-                      !!auction ||
-                      !!pendingAction,
+  label: "Договор",
+  action: () => openTrade(tp.id),
+  hidden: tp.id === (currentUser?.id || "you"), // скрываем на себе
+  disabled:
+    players[turn]?.id !== (currentUser?.id || "you") || // блокируем, если ход не твой
+    rolled ||
+    inJail ||
+    !!auction ||
+    !!pendingAction,
                   },
                   {
                     icon: "🗳",
@@ -5717,12 +8012,12 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                     action: () => {
                       setPlayerHover(null);
                       bankruptPlayer(
-                        players.findIndex((pl) => pl.id === current.id),
+                        players.findIndex((pl) => pl.id === player.id),
                         "добровольная сдача",
                       );
                     },
                   },
-                ].map(({ icon, label, action, disabled }) => (
+].filter(item => !item.hidden).map(({ icon, label, action, disabled }) => (
                   <button
                     key={label}
                     onClick={disabled ? undefined : action}
@@ -5739,12 +8034,17 @@ function BoardGame({ onExit }: { onExit: () => void }) {
       {/* Trade moved inline to chat center panel */}
       {/* Hover property popup */}
       {/* Selected property popup */}
-      {selectedCell !== null &&
-        selectedPos &&
-        boardCells[selectedCell].type === "property" &&
-        (() => {
-          const cell = boardCells[selectedCell];
-          const group = getCellGroup(selectedCell);
+            {selectedCell !== null &&
+  selectedPos &&
+  getCell(selectedCell).type === "property" &&
+  (() => {
+    const baseCell = getCell(selectedCell);
+    const customSkinId = globalCustomSkins[selectedCell];
+    const customSkinItem = customSkinId ? marketItems.find(m => m.id === customSkinId) : null;
+        const cell = customSkinItem
+      ? { ...baseCell, name: customSkinItem.name }
+      : baseCell;
+    const group = getCellGroup(selectedCell);
           const ownedByP = owners[selectedCell]
             ? players.find((p) => p.id === owners[selectedCell])
             : null;
@@ -5769,14 +8069,14 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                     : (group?.color ?? "#555"),
                 }}
               >
-                <div className="text-[7px] font-bold uppercase tracking-wider text-white/75">
+                <div className="text-[9px] font-bold uppercase tracking-wider text-white/75">
                   {group?.name ?? "Поле"}
                 </div>
                 <div className="font-bold text-sm text-white leading-tight">
                   {cell.name}
                 </div>
                 {ownedByP && (
-                  <div className="mt-0.5 text-[7.5px] text-white/80">
+                  <div className="mt-0.5 text-[10px] text-white/80">
                     Владелец: {ownedByP.name}
                   </div>
                 )}
@@ -5791,7 +8091,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                   return (
                     <div
                       key={lvl}
-                      className={`flex justify-between py-0.5 text-[9px] ${isCurrent ? "font-bold text-foreground" : "text-muted-foreground"}`}
+                      className={`flex justify-between py-0.5 text-[11px] ${isCurrent ? "font-bold text-foreground" : "text-muted-foreground"}`}
                     >
                       <span>
                         {lvl === 0
@@ -5807,7 +8107,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
               </div>
               <div className="border-t border-border px-3 py-2 space-y-2">
                 {isMortgaged && (
-                  <div className="flex justify-between text-[9px] text-primary border-b border-border pb-1 mb-1">
+                  <div className="flex justify-between text-[11px] text-primary border-b border-border pb-1 mb-1">
                     <span className="text-muted-foreground">
                       Стоимость выкупа
                     </span>
@@ -5823,7 +8123,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                 ].map(([label, val]) => (
                   <div
                     key={String(label)}
-                    className="flex justify-between text-[9px]"
+                    className="flex justify-between text-[11px]"
                   >
                     <span className="text-muted-foreground">{label}</span>
                     <span className="font-bold">
@@ -5833,8 +8133,8 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                 ))}
               </div>
               {/* Кнопки управления */}
-              {ownedByP && ownedByP.id === current.id && (
-                <div className="border-t border-border px-3 py-2 space-y-2">
+              {ownedByP && ownedByP.id === player.id && (currentUser?.id || "you") === player.id && (
+  <div className="border-t border-border px-3 py-2 space-y-2">
                   <div className="flex gap-1">
                     {!isMortgaged && (
                       <button
@@ -5843,7 +8143,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                           isMortgaged || (improvements[selectedCell] ?? 0) > 0
                         }
                         className="flex-1 rounded-lg bg-[#e96852] py-[4px] font-bold text-white disabled:opacity-40 hover:bg-[#d45a43] transition-colors"
-                        style={{ fontSize: "9px", lineHeight: "9px" }}
+                        style={{ fontSize: "11px", lineHeight: "11px" }}
                       >
                         Заложить
                       </button>
@@ -5851,9 +8151,9 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                     {isMortgaged && (
                       <button
                         onClick={redeemProperty}
-                        disabled={current.money < getRedeemCost(selectedCell)}
+                        disabled={player.money < getRedeemCost(selectedCell)}
                         className="flex-1 rounded-lg bg-[#32786d] py-[4px] font-bold text-white disabled:opacity-40 hover:bg-[#266059] transition-colors"
-                        style={{ fontSize: "9px", lineHeight: "9px" }}
+                        style={{ fontSize: "11px", lineHeight: "11px" }}
                       >
                         Выкупить
                       </button>
@@ -5862,7 +8162,7 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                     <button
                       onClick={() => improveProperty(selectedCell)}
                       disabled={
-                        current.id !== players[turn].id ||
+                        player.id !== players[turn]?.id ||
                         !monopolyGroups.some(
                           (g) => g.gIdx === getGroupIdx(selectedCell),
                         ) ||
@@ -5873,18 +8173,18 @@ function BoardGame({ onExit }: { onExit: () => void }) {
                         isMortgaged
                       }
                       className="flex-1 rounded-lg bg-[#32786d] py-[4px] font-bold text-white disabled:opacity-40 hover:bg-[#266059] transition-colors"
-                      style={{ fontSize: "9px", lineHeight: "9px" }}
+                      style={{ fontSize: "11px", lineHeight: "11px" }}
                     >
                       Улучшить
                     </button>
                     <button
                       onClick={() => sellProperty(selectedCell)}
                       disabled={
-                        current.id !== players[turn].id ||
+                        player.id !== players[turn]?.id ||
                         (improvements[selectedCell] ?? 0) === 0
                       }
                       className="flex-1 rounded-lg bg-[#e96852] py-[4px] font-bold text-white disabled:opacity-40 hover:bg-[#d45a43] transition-colors"
-                      style={{ fontSize: "9px", lineHeight: "9px" }}
+                      style={{ fontSize: "11px", lineHeight: "11px" }}
                     >
                       Продать
                     </button>
@@ -5986,17 +8286,24 @@ function BoardGame({ onExit }: { onExit: () => void }) {
 }
 
 function Admin({ onLogout }: { onLogout: () => void }) {
-  const [settings, setSettings] = useLocalStorage<AdminSettings>(
-    "arena-admin-settings",
-    defaultSettings,
-  );
+  const [settings, setSettings] = useServerSync<AdminSettings>(
+  "arena-admin-settings",
+  defaultSettings,
+  ['admin-settings', 'admin-settings-updated'],
+  'get-admin-settings'
+);
   const [saved, setSaved] = useState(false);
   const [adminTab, setAdminTab] = useState<"settings" | "items">("settings");
-  const [itemsTab, setItemsTab] = useState<"cards" | "dice" | "cases">("cards");
-  const [cardDesigns, setCardDesigns] = useLocalStorage<CardDesign[]>(
-    "arena-card-designs",
-    [],
-  );
+  const [itemsTab, setItemsTab] = useState<"cards" | "dice" | "cases" | "custom">("cards");
+  const [creatingMarketItem, setCreatingMarketItem] = useState(false);
+const [editingMarketItem, setEditingMarketItem] = useState<MarketItem | null>(null);
+  const [cardDesigns, setCardDesigns] = useServerSync<CardDesign[]>(
+  "arena-card-designs",
+  [],
+  ['card-designs', 'card-designs-updated'],
+  'get-card-designs'
+);
+useEffect(() => { globalCardDesigns = cardDesigns; }, [cardDesigns]);
   const [editingCard, setEditingCard] = useState<CardDesign | null>(null);
   const [editDraft, setEditDraft] = useState<CardDesign | null>(null);
   const [diceDesigns, setDiceDesigns] = useLocalStorage<DiceDesign[]>(
@@ -6008,14 +8315,32 @@ function Admin({ onLogout }: { onLogout: () => void }) {
   const [diceImageDataUrl, setDiceImageDataUrl] = useState<string | undefined>(
     undefined,
   );
-  const [cases, setCases] = useLocalStorage<CaseDesign[]>("arena-admin-cases", [
-    { id: "1", name: "Классика", rarity: "70", items: ["Кубики", "Фишки"] },
-  ]);
+  const [cases, setCases] = useServerSync<CaseDesign[]>("arena-admin-cases", [], ['admin-cases-updated'], 'get-admin-cases');
   const [caseName, setCaseName] = useState("");
-  const [caseRarity, setCaseRarity] = useState("");
-  const [caseSelectedItems, setCaseSelectedItems] = useState<string[]>([]);
+const [caseSelectedItems, setCaseSelectedItems] = useState<string[]>([]);
+const [caseDesc, setCaseDesc] = useState("");
+const [casePrice, setCasePrice] = useState("100");
+const [caseColor, setCaseColor] = useState("#e96852");
+const [caseIcon, setCaseIcon] = useState("Package");
+const [caseImageDataUrl, setCaseImageDataUrl] = useState<string | undefined>(undefined);
+const [caseCardWidth, setCaseCardWidth] = useState(String(CARD_SIZE_DEFAULTS.cardWidth));
+const [caseCardHeight, setCaseCardHeight] = useState(String(CARD_SIZE_DEFAULTS.cardHeight));
+const [caseImageHeight, setCaseImageHeight] = useState(String(CARD_SIZE_DEFAULTS.imageHeight));
+const [caseShopScale, setCaseShopScale] = useState(String(CARD_SIZE_DEFAULTS.shopScale));
+const [editingCaseId, setEditingCaseId] = useState<string | null>(null);
+
+const ICON_OPTIONS: Record<string, any> = {
+  "Кейс": Package,
+  "Подарок": Gift,
+  "Корона": Crown,
+  "Монеты": Coins,
+};
   const [isCompressing, setIsCompressing] = useState(false);
   const [compressProgress, setCompressProgress] = useState<string | null>(null);
+  const [customName, setCustomName] = useState("");
+const [customSlot, setCustomSlot] = useState("");
+const [customPrice, setCustomPrice] = useState("");
+  const [marketItems, setMarketItems] = useServerSync<MarketItem[]>("arena-market-items", [], ['custom-items-updated'], 'get-custom-items');
 
   const DROPPABLE_ITEMS = [
     "Кубики",
@@ -6024,7 +8349,7 @@ function Admin({ onLogout }: { onLogout: () => void }) {
     "Жетон удачи",
     "Скидка на аренду",
     "Бесплатный ход",
-    "Бонусные Конополки",
+    "Бонусные Монополки",
   ];
 
   const update = (key: keyof AdminSettings, value: string) =>
@@ -6032,22 +8357,66 @@ function Admin({ onLogout }: { onLogout: () => void }) {
       ...settings,
       [key]: key === "adminPassword" ? value : Number(value),
     });
-  const createCase = (e: FormEvent) => {
-    e.preventDefault();
-    if (!caseName.trim()) return;
-    setCases([
-      ...cases,
-      {
-        id: Date.now().toString(),
-        name: caseName.trim(),
-        rarity: caseRarity || "50",
-        items: caseSelectedItems,
-      },
-    ]);
+  const resetCaseForm = () => {
     setCaseName("");
-    setCaseRarity("");
     setCaseSelectedItems([]);
+    setCaseDesc("");
+    setCasePrice("100");
+    setCaseColor("#e96852");
+    setCaseIcon("Package");
+    setCaseImageDataUrl(undefined);
+    setCaseCardWidth(String(CARD_SIZE_DEFAULTS.cardWidth));
+    setCaseCardHeight(String(CARD_SIZE_DEFAULTS.cardHeight));
+    setCaseImageHeight(String(CARD_SIZE_DEFAULTS.imageHeight));
+    setCaseShopScale(String(CARD_SIZE_DEFAULTS.shopScale));
+    setEditingCaseId(null);
   };
+
+  const openEditCase = (c: CaseDesign) => {
+    setEditingCaseId(c.id);
+    setCaseName(c.name);
+    setCaseSelectedItems(c.items || []);
+    setCaseDesc(c.desc || "");
+    setCasePrice(String(c.price ?? 100));
+    setCaseColor(c.color || "#e96852");
+    // Найти ключ иконки по функции
+    const iconKey = Object.keys(ICON_OPTIONS).find(k => ICON_OPTIONS[k] === c.icon) || "Кейс";
+    setCaseIcon(iconKey);
+    setCaseImageDataUrl(c.imageDataUrl);
+    setCaseCardWidth(String(c.cardWidth ?? CARD_SIZE_DEFAULTS.cardWidth));
+    setCaseCardHeight(String(c.cardHeight ?? CARD_SIZE_DEFAULTS.cardHeight));
+    setCaseImageHeight(String(c.imageHeight ?? CARD_SIZE_DEFAULTS.imageHeight));
+    setCaseShopScale(String(c.shopScale ?? CARD_SIZE_DEFAULTS.shopScale));
+  };
+
+  const createCase = (e: FormEvent) => {
+  e.preventDefault();
+  if (!caseName.trim()) return;
+
+  const caseData: CaseDesign = {
+    id: editingCaseId || Date.now().toString(),
+    name: caseName.trim(),
+    items: caseSelectedItems,
+    desc: caseDesc,
+    price: Number(casePrice) || 100,
+    color: caseColor,
+    icon: ICON_OPTIONS[caseIcon] || Package,
+    imageDataUrl: caseImageDataUrl,
+    isActive: true,
+    cardWidth: Number(caseCardWidth) || CARD_SIZE_DEFAULTS.cardWidth,
+    cardHeight: Number(caseCardHeight) || CARD_SIZE_DEFAULTS.cardHeight,
+    imageHeight: Number(caseImageHeight) || CARD_SIZE_DEFAULTS.imageHeight,
+    shopScale: Number(caseShopScale) || CARD_SIZE_DEFAULTS.shopScale,
+  };
+
+  const updatedCases = editingCaseId
+    ? cases.map(c => c.id === editingCaseId ? caseData : c)
+    : [...cases, caseData];
+
+  setCases(updatedCases);
+  socket.emit('admin-save-cases', updatedCases);
+  resetCaseForm();
+};
   const createDice = (e: FormEvent) => {
     e.preventDefault();
     if (!diceName.trim()) return;
@@ -6133,29 +8502,55 @@ function Admin({ onLogout }: { onLogout: () => void }) {
   };
 
   const saveCard = () => {
-    if (!editDraft) return;
-    const existing = cardDesigns.findIndex(
-      (d) => d.slotIndex === editDraft.slotIndex,
-    );
-    if (existing >= 0) {
-      setCardDesigns((old) =>
-        old.map((d, i) => (i === existing ? editDraft : d)),
-      );
-    } else {
-      if (cardDesigns.length >= MAX_DESIGNS) return;
-      setCardDesigns((old) => [
-        ...old,
-        { ...editDraft, id: `card-${editDraft.slotIndex}-${Date.now()}` },
-      ]);
-    }
-    setEditingCard(null);
-    setEditDraft(null);
-  };
+  if (!editDraft) return;
+  const existing = cardDesigns.findIndex((d) => d.slotIndex === editDraft.slotIndex);
+  let updatedDesigns: CardDesign[];
+  if (existing >= 0) {
+    updatedDesigns = cardDesigns.map((d, i) => (i === existing ? editDraft : d));
+  } else {
+    if (cardDesigns.length >= MAX_DESIGNS) return;
+    updatedDesigns = [...cardDesigns, { ...editDraft, id: `card-${editDraft.slotIndex}-${Date.now()}` }];
+  }
+  setCardDesigns(updatedDesigns);
+  socket.emit('admin-update-card-designs', updatedDesigns);
+  setEditingCard(null);
+  setEditDraft(null);
+};
 
   const deleteCard = (slotIndex: number) => {
-    setCardDesigns((old) => old.filter((d) => d.slotIndex !== slotIndex));
-    setEditingCard(null);
-    setEditDraft(null);
+  const updated = cardDesigns.filter((d) => d.slotIndex !== slotIndex);
+  setCardDesigns(updated);
+  socket.emit('admin-update-card-designs', updated);
+  setEditingCard(null);
+  setEditDraft(null);
+};
+
+  // Удаление белого фона: все почти-белые пиксели становятся прозрачными
+  const removeWhiteBackground = (
+    base64: string,
+    threshold = 240,
+    onDone: (result: string) => void,
+  ) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(img, 0, 0);
+      const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const px = data.data;
+      for (let i = 0; i < px.length; i += 4) {
+        const r = px[i], g = px[i + 1], b = px[i + 2];
+        if (r > threshold && g > threshold && b > threshold) {
+          px[i + 3] = 0; // alpha
+        }
+      }
+      ctx.putImageData(data, 0, 0);
+      onDone(canvas.toDataURL("image/png"));
+    };
+    img.src = base64;
   };
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -6235,7 +8630,7 @@ function Admin({ onLogout }: { onLogout: () => void }) {
       <SectionHeading
         eyebrow="контрольная комната"
         title="Админ-панель"
-        detail="Настройки клуба, карточки поля, Кодерация."
+        detail="Настройки клуба, карточки поля, Модерация."
         action={
           <div className="flex items-center gap-2">
             <span className="flex items-center gap-2 rounded-full bg-[#dceae3] px-3 py-2 text-xs font-bold text-accent">
@@ -6392,19 +8787,20 @@ function Admin({ onLogout }: { onLogout: () => void }) {
                 />
               </label>
               <button
-                onClick={() => {
-                  setSaved(true);
-                  window.setTimeout(() => setSaved(false), 1600);
-                }}
-                className="rounded-xl bg-primary px-4 py-2.5 text-sm font-bold text-primary-foreground"
-              >
-                {saved ? "Изменения сохранены ✓" : "Сохранить настройки"}
-              </button>
+  onClick={() => {
+    socket.emit('admin-update-settings', settings);
+    setSaved(true);
+    window.setTimeout(() => setSaved(false), 1600);
+  }}
+  className="rounded-xl bg-primary px-4 py-2.5 text-sm font-bold text-primary-foreground"
+>
+  {saved ? "Изменения сохранены ✓" : "Сохранить настройки"}
+</button>
             </div>
             <div className="space-y-6">
               <div className="rounded-2xl border border-card-border bg-card p-5">
                 <h2 className="font-display text-xl font-bold">
-                  Кодерация игроков
+                  Модерация игроков
                 </h2>
                 {[
                   "Роман К. · спам в чате",
@@ -6457,6 +8853,10 @@ function Admin({ onLogout }: { onLogout: () => void }) {
                 {cases.length}
               </span>
             </button>
+            <button onClick={() => setItemsTab("custom")} 
+            className={`rounded-lg px-4 py-2 text-sm font-bold transition-colors ${itemsTab === "custom" ? "bg-card shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"}`}>
+           🃏 Товары
+            </button>
           </div>
 
           {itemsTab === "cards" && (
@@ -6464,7 +8864,7 @@ function Admin({ onLogout }: { onLogout: () => void }) {
               <div className="flex items-start justify-between gap-4 mb-4 flex-wrap">
                 <p className="text-sm text-muted-foreground flex-1">
                   Нажми на карандаш ✏️ чтобы редактировать карточку. Загрузи
-                  изображение, смени название или тип. Всего Кожно создать до{" "}
+                  изображение, смени название или тип. Всего можно создать до{" "}
                   {MAX_DESIGNS} дизайнов.
                 </p>
 
@@ -6482,15 +8882,12 @@ function Admin({ onLogout }: { onLogout: () => void }) {
                       setCompressProgress("⏳ Загрузка данных...");
 
                       try {
-                        const saved =
-                          localStorage.getItem("arena-card-designs");
-                        if (!saved) {
-                          setCompressProgress("Нет данных для сжатия.");
-                          setIsCompressing(false);
-                          return;
-                        }
-
-                        const designs: CardDesign[] = JSON.parse(saved);
+                        const designs = cardDesigns;
+if (!designs || designs.length === 0) {
+  setCompressProgress("Нет данных для сжатия.");
+  setIsCompressing(false);
+  return;
+}
                         let compressedCount = 0;
 
                         // Функция сжатия Base64 картинки (PNG с прозрачностью)
@@ -6556,10 +8953,11 @@ function Admin({ onLogout }: { onLogout: () => void }) {
 
                         // Сохраняем обратно в localStorage и обновляем стейт
                         localStorage.setItem(
-                          "arena-card-designs",
-                          JSON.stringify(updatedDesigns),
-                        );
-                        setCardDesigns(updatedDesigns);
+  "arena-card-designs",
+  JSON.stringify(updatedDesigns),
+);
+setCardDesigns(updatedDesigns);
+socket.emit('admin-update-card-designs', updatedDesigns);
 
                         setCompressProgress(
                           `✅ Готово! Сжато ${compressedCount} изображений.`,
@@ -6639,7 +9037,7 @@ function Admin({ onLogout }: { onLogout: () => void }) {
                             )}
                           </div>
                         )}
-                        <div className="flex flex-1 flex-col items-center justify-center p-1">
+                        <div className="flex flex-1 items-center justify-center p-1">
                           {design?.imageDataUrl ? (
                             <img
                               src={design.imageDataUrl}
@@ -6813,10 +9211,147 @@ function Admin({ onLogout }: { onLogout: () => void }) {
             </div>
           )}
 
+          {itemsTab === "custom" && (
+  <div className="grid gap-4">
+    <div className="rounded-2xl border border-card-border bg-card p-5">
+      <h2 className="font-display text-xl font-bold">Карточки для рынка</h2>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Создай карточку поля, которую можно будет добавить в кейс. Она заменит базовую клетку на игровом столе.
+      </p>
+      <button
+        onClick={() => setCreatingMarketItem(true)}
+        className="mt-4 rounded-xl bg-primary px-4 py-2.5 text-sm font-bold text-primary-foreground"
+      >
+        + Создать Товар
+      </button>
+    </div>
+
+    {/* Список созданных товаров */}
+    <div className="rounded-2xl border border-card-border bg-card p-5">
+      <h2 className="font-display text-xl font-bold">Управление товарами</h2>
+      <div className="mt-3 grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))" }}>
+        {marketItems.length === 0 && (
+          <div className="text-sm text-muted-foreground">Товаров пока нет</div>
+        )}
+                {marketItems.map((item) => {
+          const isCard = item.category === "card";
+          const slotNum = isCard ? Number(item.slotIndex || 0) : 0;
+          const groupColor = isCard ? getCellGroup(slotNum)?.color : null;
+          const logo = isCard ? CELL_LOGOS[slotNum] : null;
+          let stripDir = null;
+          if (isCard) {
+            if (slotNum >= 1 && slotNum <= 9) stripDir = "top";
+            else if (slotNum >= 11 && slotNum <= 19) stripDir = "right";
+            else if (slotNum >= 21 && slotNum <= 29) stripDir = "bottom";
+            else if (slotNum >= 31 && slotNum <= 39) stripDir = "left";
+          }
+
+          return (
+            <div key={item.id} className="relative overflow-hidden rounded-xl border border-card-border bg-card shadow-sm group">
+              {/* Кнопка редактирования */}
+              <button
+                onClick={() => setEditingMarketItem(item)}
+                className="absolute top-1.5 right-1.5 z-10 flex h-6 w-6 items-center justify-center rounded-lg bg-white/90 text-[#29233e] opacity-0 group-hover:opacity-100 transition-opacity shadow-sm hover:bg-[#e96852] hover:text-white"
+                title="Редактировать"
+              >
+                <Pencil size={12} />
+              </button>
+
+              {/* Превью */}
+                              <div
+                                className="relative flex h-28 items-center justify-center overflow-hidden"
+                                style={{
+                                  backgroundColor: isCard
+                                    ? cellBgColor("property")
+                                    : (item.bgColor || "#f3e7c8"),
+                                }}
+                              >
+                  <div className="flex h-full w-full items-center justify-center p-1">
+                    {item.imageDataUrl ? (
+                      <img src={item.imageDataUrl} alt={item.name} className="h-full w-full object-contain" />
+                    ) : isCard ? (
+                      <div style={{ fontSize: 28, lineHeight: 1 }}>{logo ?? "❓"}</div>
+                    ) : item.category === "dice" ? (
+                      <div style={{ fontSize: 32 }}>🎲</div>
+                    ) : (
+                      <div style={{ fontSize: 32 }}>👑</div>
+                    )}
+                  </div>
+                  {/* Цветная полоска редкости */}
+                  <div className="absolute bottom-0 left-0 right-0 h-1" style={{ backgroundColor: item.rarity === "common" ? "#b0b0b0" : item.rarity === "rare" ? "#2563eb" : "#9b5de5" }} />
+                </div>
+
+              <div className="p-2">
+                <div className="truncate text-[14px] font-bold leading-tight">{item.name}</div>
+                <div className="text-[12px] text-muted-foreground">
+                  {isCard ? `Слот: ${slotNum}` : item.category === "dice" ? "Кубик" : "VIP"} · {item.rarity}
+                </div>
+                <div className="mt-1 flex items-center justify-between gap-1">
+                  <span className="text-[12px] font-bold text-primary flex items-center gap-0.5">{item.price} <Coins size={12} /></span>
+                  <div className="flex gap-1">
+                    <button
+                      className={`rounded px-1.5 py-0.5 text-[9px] font-bold ${item.isActive ? "bg-[#dceae3] text-accent" : "bg-muted text-muted-foreground"}`}
+                      onClick={() => {
+                        const updatedItems = marketItems.map(prev => prev.id === item.id ? { ...prev, isActive: !prev.isActive } : prev);
+                        setMarketItems(updatedItems);
+                        socket.emit('save-custom-items', updatedItems);
+                      }}
+                    >
+                      {item.isActive ? "Вкл" : "Выкл"}
+                    </button>
+                    <button
+                      className="rounded bg-[#f6dfd7] px-1.5 py-0.5 text-[9px] font-bold text-primary"
+                      onClick={() => {
+                        const updatedItems = marketItems.filter(prev => prev.id !== item.id);
+                        setMarketItems(updatedItems);
+                        socket.emit('save-custom-items', updatedItems);
+                      }}
+                    >
+                      Удал.
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+
+     {/* Модальное окно создания товара */}
+    {creatingMarketItem && (
+      <MarketItemModal
+        onClose={() => setCreatingMarketItem(false)}
+        onSave={(newItem) => {
+          const updatedItems = [...marketItems, newItem];
+          setMarketItems(updatedItems);
+          socket.emit('save-custom-items', updatedItems);
+          setCreatingMarketItem(false);
+        }}
+      />
+    )}
+    {/* Модальное окно редактирования товара */}
+    {editingMarketItem && (
+      <MarketItemModal
+        initialItem={editingMarketItem}
+        onClose={() => setEditingMarketItem(null)}
+        onSave={(updatedItem) => {
+          const updatedItems = marketItems.map(item => item.id === updatedItem.id ? updatedItem : item);
+          setMarketItems(updatedItems);
+          socket.emit('save-custom-items', updatedItems);
+          setEditingMarketItem(null);
+        }}
+      />
+    )}
+  </div>
+)}
+
           {itemsTab === "cases" && (
             <div className="grid gap-6 xl:grid-cols-[380px_1fr]">
               <div className="rounded-2xl border border-card-border bg-card p-5 space-y-4">
-                <h2 className="font-display text-xl font-bold">Новый кейс</h2>
+                <h2 className="font-display text-xl font-bold">
+                  {editingCaseId ? "Редактирование кейса" : "Новый кейс"}
+                </h2>
                 <form onSubmit={createCase} className="grid gap-3">
                   <label className="text-xs font-bold">
                     Название кейса
@@ -6828,47 +9363,232 @@ function Admin({ onLogout }: { onLogout: () => void }) {
                     />
                   </label>
                   <label className="text-xs font-bold">
-                    Вероятность выпадения / Редкость, %
-                    <input
-                      type="number"
-                      min="1"
-                      max="100"
-                      value={caseRarity}
-                      onChange={(e) => setCaseRarity(e.target.value)}
-                      placeholder="Например: 70"
-                      className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
-                    />
-                  </label>
-                  <div>
-                    <div className="mb-2 text-xs font-bold">
-                      Предметы, которые Когут выпасть
+    Описание кейса
+    <input
+        value={caseDesc}
+        onChange={(e) => setCaseDesc(e.target.value)}
+        placeholder="Например: Редкий предмет"
+        className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
+    />
+</label>
+<div className="grid grid-cols-2 gap-3">
+    <label className="text-xs font-bold">
+        Цена кейса
+        <input
+            type="number"
+            value={casePrice}
+            onChange={(e) => setCasePrice(e.target.value)}
+            placeholder="100"
+            className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
+        />
+    </label>
+    <label className="text-xs font-bold">
+        Цвет фона
+        <input
+            type="color"
+            value={caseColor}
+            onChange={(e) => setCaseColor(e.target.value)}
+            className="mt-2 h-10 w-full cursor-pointer rounded-xl border border-input bg-background p-1"
+        />
+    </label>
+    <label className="text-xs font-bold">
+  Изображение кейса (JPG / PNG / GIF)
+  <div className="mt-2 flex items-center gap-3">
+    <label className="flex cursor-pointer items-center gap-2 rounded-xl border border-dashed border-input px-4 py-2.5 text-xs font-bold text-muted-foreground hover:border-primary hover:text-primary transition-colors">
+      <Upload size={14} /> Загрузить файл
+      <input
+        type="file"
+        accept=".jpg,.jpeg,.png,.gif,image/jpeg,image/png,image/gif"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = (ev) => {
+            const imageDataUrl = ev.target?.result as string;
+            // Сжимаем как в других местах? Пока сохраняем как есть
+            setCaseImageDataUrl(imageDataUrl);
+          };
+          reader.readAsDataURL(file);
+        }}
+        className="hidden"
+      />
+    </label>
+    {caseImageDataUrl && (
+      <>
+        <button
+          type="button"
+          onClick={() => {
+            if (!caseImageDataUrl) return;
+            const img = new Image();
+            img.onload = () => {
+              const canvas = document.createElement("canvas");
+              canvas.width = img.width;
+              canvas.height = img.height;
+              const ctx = canvas.getContext("2d");
+              if (!ctx) return;
+              ctx.drawImage(img, 0, 0);
+              const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+              const px = data.data;
+              for (let i = 0; i < px.length; i += 4) {
+                if (px[i] > 240 && px[i + 1] > 240 && px[i + 2] > 240) {
+                  px[i + 3] = 0;
+                }
+              }
+              ctx.putImageData(data, 0, 0);
+              setCaseImageDataUrl(canvas.toDataURL("image/png"));
+            };
+            img.src = caseImageDataUrl;
+          }}
+          className="rounded-lg bg-[#f3e7c8] px-3 py-1.5 text-[11px] font-bold text-[#7e5f1d] hover:brightness-95"
+          title="Все почти-белые пиксели станут прозрачными"
+        >
+          🧹 Убрать белый фон
+        </button>
+        <button onClick={() => setCaseImageDataUrl(undefined)} className="text-xs text-primary underline">
+          удалить
+        </button>
+      </>
+    )}
+  </div>
+</label>
+</div>
+<label className="text-xs font-bold">
+    Иконка кейса
+    <select
+        value={caseIcon}
+        onChange={(e) => setCaseIcon(e.target.value)}
+        className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
+    >
+        {Object.keys(ICON_OPTIONS).map((key) => (
+            <option key={key} value={key}>{key}</option>
+        ))}
+    </select>
+</label>
+<div className="rounded-xl border border-input bg-muted/40 p-3">
+  <div className="mb-2 text-xs font-bold text-muted-foreground uppercase tracking-wide">
+    📐 Размер карточки кейса
+  </div>
+  <div className="grid grid-cols-2 gap-3">
+    <label className="text-xs font-bold">
+      Ширина, px
+      <input type="number" value={caseCardWidth} onChange={(e) => setCaseCardWidth(e.target.value)} className="mt-1 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm font-normal" />
+    </label>
+    <label className="text-xs font-bold">
+      Высота карточки, px
+      <input type="number" value={caseCardHeight} onChange={(e) => setCaseCardHeight(e.target.value)} className="mt-1 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm font-normal" />
+    </label>
+    <label className="text-xs font-bold">
+      Высота картинки, px
+      <input type="number" value={caseImageHeight} onChange={(e) => setCaseImageHeight(e.target.value)} className="mt-1 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm font-normal" />
+    </label>
+    <label className="text-xs font-bold">
+      Масштаб картинки, %
+      <input type="number" value={caseShopScale} onChange={(e) => setCaseShopScale(e.target.value)} className="mt-1 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm font-normal" />
+    </label>
+  </div>
+</div>
+                  {/* ПРЕВЬЮ КЕЙСА КАК В МАГАЗИНЕ */}
+                  <div className="flex flex-col items-center gap-2 rounded-xl border border-input bg-muted/40 p-3">
+                    <div className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                      Превью в магазине
                     </div>
-                    <div className="grid gap-2">
-                      {DROPPABLE_ITEMS.map((item) => (
-                        <label
-                          key={item}
-                          className="flex cursor-pointer items-center gap-2 rounded-lg border border-input bg-background px-3 py-2 text-sm hover:bg-muted"
-                        >
-                          <input
-                            type="checkbox"
-                            checked={caseSelectedItems.includes(item)}
-                            onChange={(e) =>
-                              setCaseSelectedItems(
-                                e.target.checked
-                                  ? [...caseSelectedItems, item]
-                                  : caseSelectedItems.filter((i) => i !== item),
-                              )
-                            }
-                            className="h-3.5 w-3.5 accent-primary"
+                    <div
+                      className="flex flex-col rounded-2xl border border-card-border bg-card shadow-sm overflow-hidden"
+                      style={{ width: `${Number(caseCardWidth) || CARD_SIZE_DEFAULTS.cardWidth}px` }}
+                    >
+                      <div
+                        className="relative flex items-center justify-center overflow-hidden"
+                        style={{
+                          height: `${Number(caseImageHeight) || CARD_SIZE_DEFAULTS.imageHeight}px`,
+                          backgroundColor: caseColor || "#e96852",
+                        }}
+                      >
+                        {caseImageDataUrl ? (
+                          <img
+                            src={caseImageDataUrl}
+                            alt="preview"
+                            style={{
+                              maxWidth: "100%",
+                              maxHeight: "100%",
+                              width: "auto",
+                              height: "auto",
+                              objectFit: "contain",
+                              transform: `scale(${(Number(caseShopScale) || 90) / 100})`,
+                              transformOrigin: "center center",
+                            }}
                           />
-                          {item}
-                        </label>
-                      ))}
+                        ) : (
+                          <div className="text-5xl" style={{ color: caseColor || "#e96852" }}>📦</div>
+                        )}
+                      </div>
+                      <div className="p-4 flex flex-col gap-3 flex-1">
+                        <div>
+                          <h3 className="font-display text-lg font-bold">{caseName || "Название кейса"}</h3>
+                          <p className="mt-1 text-xs text-muted-foreground">{caseDesc || "Описание кейса"}</p>
+                        </div>
+                        {caseSelectedItems.length > 0 && (
+                          <div className="flex flex-wrap gap-1">
+                            {caseSelectedItems.map((id) => {
+                              const it = marketItems.find((m) => m.id === id);
+                              return it ? (
+                                <span key={id} className="rounded-md bg-muted px-2 py-0.5 text-[10px] font-medium">
+                                  {it.name}
+                                </span>
+                              ) : null;
+                            })}
+                          </div>
+                        )}
+                        <div className="mt-auto flex items-center justify-between pt-2 border-t border-border">
+                          <span className="flex items-center gap-1.5 font-mono text-sm font-bold">
+                            <Coins size={15} className="text-[#b18428]" />
+                            {Number(casePrice) || 100}
+                          </span>
+                          <button className="rounded-lg bg-primary px-3.5 py-2 text-xs font-bold text-primary-foreground">
+                            Купить
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   </div>
-                  <button className="rounded-xl bg-primary px-4 py-2.5 text-sm font-bold text-primary-foreground">
-                    Создать кейс
-                  </button>
+<div>
+  <div className="mb-2 text-xs font-bold">
+    Предметы в кейсе (макс. 10)
+  </div>
+  <div className="grid gap-2 max-h-48 overflow-y-auto">
+    {marketItems.filter(i => i.isActive).map((item) => (
+      <label key={item.id} className="flex cursor-pointer items-center gap-2 rounded-lg border border-input bg-background px-3 py-2 text-sm hover:bg-muted">
+        <input
+          type="checkbox"
+          checked={caseSelectedItems.includes(item.id)}
+          onChange={(e) => {
+            if (e.target.checked) {
+              if (caseSelectedItems.length >= 10) return;
+              setCaseSelectedItems([...caseSelectedItems, item.id]);
+            } else {
+              setCaseSelectedItems(caseSelectedItems.filter((i) => i !== item.id));
+            }
+          }}
+          className="h-3.5 w-3.5 accent-primary"
+        />
+        {item.name} (Цена: {item.price})
+      </label>
+    ))}
+  </div>
+</div>
+                  <div className="flex gap-2">
+                    <button className="flex-1 rounded-xl bg-primary px-4 py-2.5 text-sm font-bold text-primary-foreground">
+                      {editingCaseId ? "Сохранить изменения" : "Создать кейс"}
+                    </button>
+                    {editingCaseId && (
+                      <button
+                        type="button"
+                        onClick={resetCaseForm}
+                        className="rounded-xl border border-input px-4 py-2.5 text-sm font-bold text-muted-foreground hover:bg-muted"
+                      >
+                        Отмена
+                      </button>
+                    )}
+                  </div>
                 </form>
               </div>
               <div>
@@ -6883,56 +9603,119 @@ function Admin({ onLogout }: { onLogout: () => void }) {
                     Пока нет ни одного кейса. Создай первый!
                   </p>
                 )}
-                <div
+                                <div
                   className="grid gap-3"
                   style={{
                     gridTemplateColumns:
                       "repeat(auto-fill, minmax(220px, 1fr))",
                   }}
                 >
-                  {cases.map((c) => (
-                    <div
-                      key={c.id}
-                      className="relative rounded-xl border border-card-border bg-card p-4 shadow-sm"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <div className="font-bold text-sm">{c.name}</div>
-                          <div className="mt-0.5 text-[10px] text-muted-foreground">
-                            Вероятность:{" "}
-                            <span className="font-bold text-primary">
-                              {c.rarity}%
+                  {cases.map((c) => {
+                    const active = c.isActive !== false;
+                    return (
+                      <div
+                        key={c.id}
+                        className="relative flex flex-col overflow-hidden rounded-xl border border-card-border bg-card shadow-sm"
+                      >
+                        {/* Кнопки управления */}
+                        <div className="absolute top-2 right-2 z-10 flex gap-1">
+                          <button
+                            onClick={() => openEditCase(c)}
+                            className="flex h-5 w-5 items-center justify-center rounded-md bg-white/90 text-[#29233e] hover:bg-[#e96852] hover:text-white shadow-sm"
+                            title="Редактировать"
+                          >
+                            <Pencil size={11} />
+                          </button>
+                          <button
+                            onClick={() => {
+                              const updatedCases = cases.map((x) =>
+                                x.id === c.id ? { ...x, isActive: !active } : x
+                              );
+                              setCases(updatedCases);
+                              socket.emit('admin-save-cases', updatedCases);
+                            }}
+                            className={`rounded-md px-2 py-0.5 text-[10px] font-bold ${
+                              active
+                                ? "bg-[#dceae3] text-accent"
+                                : "bg-muted text-muted-foreground"
+                            }`}
+                          >
+                            {active ? "ВКЛ" : "ВЫКЛ"}
+                          </button>
+                          <button
+                            onClick={() => {
+                              const updatedCases = cases.filter(
+                                (x) => x.id !== c.id
+                              );
+                              setCases(updatedCases);
+                              socket.emit('admin-save-cases', updatedCases);
+                            }}
+                            className="flex h-5 w-5 items-center justify-center rounded-md bg-[#f6dfd7] text-primary hover:bg-[#efcec2]"
+                            title="Удалить"
+                          >
+                            <X size={11} />
+                          </button>
+                        </div>
+
+                        {/* Картинка кейса */}
+                        <div
+                          className="flex h-36 items-center justify-center overflow-hidden"
+                          style={{ backgroundColor: (c.color || "#e96852") + "33" }}
+                        >
+                          {c.imageDataUrl ? (
+                            <img
+                              src={c.imageDataUrl}
+                              alt={c.name}
+                              className="h-full w-full object-contain p-3"
+                            />
+                          ) : (
+                            <div
+                              className="text-5xl"
+                              style={{ color: c.color || "#e96852" }}
+                            >
+                              📦
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Нижний блок с инфо */}
+                        <div className="flex flex-col gap-2 p-3">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate font-bold text-sm">
+                                {c.name}
+                              </div>
+                              {c.desc && (
+                                <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                                  {c.desc}
+                                </div>
+                              )}
+                            </div>
+                            <span className="flex shrink-0 items-center gap-0.5 text-[12px] font-bold text-primary">
+                              {c.price ?? 0} <Coins size={12} />
                             </span>
                           </div>
+
+                          <div className="flex flex-wrap gap-1">
+                            {(c.items ?? []).length > 0 ? (
+                              (c.items ?? []).map((itemId, idx) => (
+                                <span
+                                  key={`${itemId}-${idx}`}
+                                  className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[9px] font-medium"
+                                >
+                                  {itemId}
+                                </span>
+                              ))
+                            ) : (
+                              <span className="text-[10px] italic text-muted-foreground">
+                                Предметы не настроены
+                              </span>
+                            )}
+                          </div>
                         </div>
-                        <button
-                          onClick={() =>
-                            setCases(cases.filter((x) => x.id !== c.id))
-                          }
-                          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg hover:bg-primary/10 text-muted-foreground hover:text-primary"
-                        >
-                          <X size={12} />
-                        </button>
                       </div>
-                      {(c.items ?? []).length > 0 && (
-                        <div className="mt-3 flex flex-wrap gap-1">
-                          {(c.items ?? []).map((item) => (
-                            <span
-                              key={item}
-                              className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium"
-                            >
-                              {item}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                      {(c.items ?? []).length === 0 && (
-                        <div className="mt-2 text-[10px] text-muted-foreground italic">
-                          Предметы не настроены
-                        </div>
-                      )}
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             </div>
@@ -6987,7 +9770,7 @@ function Admin({ onLogout }: { onLogout: () => void }) {
                     <X size={18} />
                   </button>
                 </div>
-                <div className="grid grid-cols-[1fr_200px] gap-0">
+                <div className="grid grid-cols-[1fr_auto] gap-0">
                   <div className="p-5 space-y-4">
                     <div className="grid grid-cols-2 gap-4">
                       <label className="block text-xs font-bold text-foreground">
@@ -7115,16 +9898,31 @@ function Admin({ onLogout }: { onLogout: () => void }) {
                           />
                         </label>
                         {editDraft.imageDataUrl && (
-                          <button
-                            onClick={() =>
-                              setEditDraft((d) =>
-                                d ? { ...d, imageDataUrl: undefined } : d,
-                              )
-                            }
-                            className="text-xs text-primary underline"
-                          >
-                            удалить
-                          </button>
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (!editDraft.imageDataUrl) return;
+                                removeWhiteBackground(editDraft.imageDataUrl, 240, (res) => {
+                                  setEditDraft((d) => d ? { ...d, imageDataUrl: res } : d);
+                                });
+                              }}
+                              className="rounded-lg bg-[#f3e7c8] px-3 py-1.5 text-[11px] font-bold text-[#7e5f1d] hover:brightness-95"
+                              title="Все почти-белые пиксели станут прозрачными"
+                            >
+                              🧹 Убрать белый фон
+                            </button>
+                            <button
+                              onClick={() =>
+                                setEditDraft((d) =>
+                                  d ? { ...d, imageDataUrl: undefined } : d,
+                                )
+                              }
+                              className="text-xs text-primary underline"
+                            >
+                              удалить
+                            </button>
+                          </>
                         )}
                       </div>
                     </label>
@@ -7320,11 +10118,44 @@ function AuthModal({
   const [nickname, setNickname] = useState("");
   const [error, setError] = useState("");
   const [guestConfirm, setGuestConfirm] = useState(false);
-  const [users, setUsers] = useLocalStorage<AuthUser[]>("arena-users", []);
-  const [settings] = useLocalStorage<AdminSettings>(
-    "arena-admin-settings",
-    defaultSettings,
-  );
+  const [showLoginPw, setShowLoginPw] = useState(false);
+  const [showRegPw, setShowRegPw] = useState(false);
+  const [showRegConfirmPw, setShowRegConfirmPw] = useState(false);
+  const [rememberMe, setRememberMe] = useState(true);
+  const [savedLogins, setSavedLogins] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem("arena-saved-logins") || "[]"); } catch { return []; }
+  });
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const loginWrapperRef = useRef<HTMLDivElement>(null);
+
+  // При открытии окна — подставляем сохранённый логин/пароль, если были запомнены
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("arena-remembered");
+      if (saved) {
+        const { login: l, password: p } = JSON.parse(saved);
+        if (l) setLogin(l);
+        if (p) setPassword(p);
+      }
+    } catch {}
+  }, []);
+
+  // Закрываем выпадашку подсказок при клике вне
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (loginWrapperRef.current && !loginWrapperRef.current.contains(e.target as Node)) {
+        setShowSuggestions(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+  const [settings] = useServerSync<AdminSettings>(
+  "arena-admin-settings",
+  defaultSettings,
+  ['admin-settings', 'admin-settings-updated'],
+  'get-admin-settings'
+);
 
   const close = () => {
     setError("");
@@ -7333,81 +10164,106 @@ function AuthModal({
   };
 
   const submitLogin = (event: FormEvent) => {
-    event.preventDefault();
-    const cleanLogin = login.trim();
-    if (!cleanLogin || !password) {
-      setError("Заполни логин и пароль.");
-      return;
+  event.preventDefault();
+  const cleanLogin = login.trim();
+  if (!cleanLogin || !password) {
+    setError("Заполни логин и пароль.");
+    return;
+  }
+  if (cleanLogin.toLowerCase() === "admin") {
+    if (password === (settings.adminPassword || "admin123")) {
+      onSuccess({ kind: "admin" });
+    } else {
+      setError("Неверный пароль администратора.");
     }
-    if (cleanLogin.toLowerCase() === "admin") {
-      if (password === (settings.adminPassword || "admin123"))
-        onSuccess({ kind: "admin" });
-      else setError("Неверный пароль администратора.");
-      return;
-    }
-    const existing = users.find(
-      (u) => u.login?.toLowerCase() === cleanLogin.toLowerCase(),
-    );
-    if (!existing) {
-      setError("Пользователь не найден. Зарегистрируйся.");
-      return;
-    }
-    if (existing.password !== password) {
-      setError("Неверный пароль.");
-      return;
-    }
-    onSuccess({ kind: "player", user: existing });
-  };
+    return;
+  }
+  const timeoutId = setTimeout(() => setError("Ошибка соединения с сервером"), 5000);
+  socket.emit('login', { login: cleanLogin, password }, (response: any) => {
+  clearTimeout(timeoutId);
+  if (response?.success) {
+      const user = response.user;
+      localStorage.setItem("arena-session-user", JSON.stringify(user));
+      localStorage.setItem("arena-user-data-" + user.id, JSON.stringify(response.data));
 
-  const submitRegister = (event: FormEvent) => {
-    event.preventDefault();
-    const cleanLogin = regLogin.trim();
-    if (cleanLogin.length < 3) {
-      setError("Логин должен быть не Кенее 3 символов.");
-      return;
+      // Сохраняем логин в историю подсказок (независимо от «Запомнить пароль»)
+      const updated = [cleanLogin, ...savedLogins.filter(x => x !== cleanLogin)].slice(0, 5);
+      setSavedLogins(updated);
+      localStorage.setItem("arena-saved-logins", JSON.stringify(updated));
+
+      // Запоминаем пароль, если стоит галочка
+      if (rememberMe) {
+        localStorage.setItem("arena-remembered", JSON.stringify({ login: cleanLogin, password }));
+      } else {
+        localStorage.removeItem("arena-remembered");
+      }
+
+      onSuccess({ kind: "player", user });
+    } else {
+      setError(response?.error || "Ошибка входа");
     }
-    if (regPassword.length < 4) {
-      setError("Пароль должен быть не Кенее 4 символов.");
-      return;
+  });
+};
+
+const submitRegister = (event: FormEvent) => {
+  event.preventDefault();
+  const cleanLogin = regLogin.trim();
+  if (cleanLogin.length < 3) {
+    setError("Логин должен быть не менее 3 символов.");
+    return;
+  }
+  if (regPassword.length < 4) {
+    setError("Пароль должен быть не менее 4 символов.");
+    return;
+  }
+  if (regPassword !== regConfirm) {
+    setError("Пароли не совпадают.");
+    return;
+  }
+  const timeoutId = setTimeout(() => setError("Ошибка соединения с сервером"), 5000);
+socket.emit('register', { login: cleanLogin, password: regPassword, name: cleanLogin }, (response: any) => {
+  clearTimeout(timeoutId);
+  if (response?.success) {
+      const user = response.user;
+      localStorage.setItem("arena-session-user", JSON.stringify(user));
+      localStorage.setItem("arena-user-data-" + user.id, JSON.stringify(response.data));
+
+      // Новый логин сразу попадает в подсказки, а пароль — в «запомненные»
+      const updated = [cleanLogin, ...savedLogins.filter(x => x !== cleanLogin)].slice(0, 5);
+      setSavedLogins(updated);
+      localStorage.setItem("arena-saved-logins", JSON.stringify(updated));
+      localStorage.setItem("arena-remembered", JSON.stringify({ login: cleanLogin, password: regPassword }));
+
+      onSuccess({ kind: "player", user });
+    } else {
+      setError(response?.error || "Ошибка регистрации");
     }
-    if (regPassword !== regConfirm) {
-      setError("Пароли не совпадают.");
-      return;
-    }
-    if (
-      users.find((u) => u.login?.toLowerCase() === cleanLogin.toLowerCase())
-    ) {
-      setError("Этот логин уже занят.");
-      return;
-    }
-    const user = makeAuthUser(cleanLogin, cleanLogin, regPassword);
-    setUsers([...users, user]);
-    onSuccess({ kind: "player", user });
-  };
+  });
+};
 
   const submitGuest = (event: FormEvent) => {
-    event.preventDefault();
-    const cleanName = nickname.trim();
-    if (cleanName.length < 2) {
-      setError("Никнейм должен быть длиннее двух символов.");
-      return;
+  event.preventDefault();
+  const cleanName = nickname.trim();
+  if (cleanName.length < 2) {
+    setError("Никнейм должен быть длиннее двух символов.");
+    return;
+  }
+  socket.emit('register', { login: null, password: null, name: cleanName, guest: true }, (response: any) => {
+    if (response?.success) {
+      const user = response.user;
+      localStorage.setItem("arena-session-user", JSON.stringify(user));
+      localStorage.setItem("arena-user-data-" + user.id, JSON.stringify(response.data));
+      onSuccess({ kind: "player", user });
+    } else {
+      setError(response?.error || "Ошибка создания гостя");
     }
-    const existing = users.find(
-      (u) => u.name.toLowerCase() === cleanName.toLowerCase(),
-    );
-    if (existing && !guestConfirm) {
-      setGuestConfirm(true);
-      setError("Никнейм занят. Подтверди или выбери другой.");
-      return;
-    }
-    const user =
-      existing || makeAuthUser(cleanName, undefined, undefined, true);
-    if (!existing) setUsers([...users, user]);
-    onSuccess({ kind: "player", user });
-  };
+  });
+};
 
   const fieldCls =
     "mt-2 w-full rounded-xl border border-[#d8ccba] bg-[#fffaf1] px-3.5 py-3 text-sm outline-none focus:ring-2 focus:ring-primary/30";
+  const fieldClsNoMargin =
+    "w-full rounded-xl border border-[#d8ccba] bg-[#fffaf1] px-3.5 py-3 text-sm outline-none focus:ring-2 focus:ring-primary/30";
   const labelCls = "block text-xs font-bold text-[#29233e]";
 
   return (
@@ -7459,30 +10315,86 @@ function AuthModal({
           )}
 
           {mode === "login" && (
-            <form onSubmit={submitLogin} className="space-y-3">
+            <form onSubmit={submitLogin} className="space-y-3" autoComplete="on">
               <label className={labelCls}>
                 Логин
-                <input
-                  autoFocus
-                  value={login}
-                  onChange={(e) => setLogin(e.target.value)}
-                  placeholder="Ваш логин"
-                  className={fieldCls}
-                />
+                <div className="relative mt-2" ref={loginWrapperRef}>
+                  <input
+                    autoFocus
+                    value={login}
+                    onChange={(e) => setLogin(e.target.value)}
+                    onFocus={() => savedLogins.length > 0 && setShowSuggestions(true)}
+                    placeholder="Ваш логин"
+                    autoComplete="username"
+                    name="username"
+                    className={fieldClsNoMargin}
+                  />
+                  {showSuggestions && savedLogins.length > 0 && (() => {
+                    const filtered = savedLogins.filter(l => !login || l.toLowerCase().includes(login.toLowerCase()));
+                    return (
+                      <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-40 overflow-auto rounded-xl border border-[#d8ccba] bg-[#fffaf1] shadow-lg">
+                        {filtered.length === 0 ? (
+                          <div className="px-3 py-2 text-xs text-[#716b78]">Ничего не найдено</div>
+                        ) : (
+                          filtered.map(l => (
+                            <button
+                              key={l}
+                              type="button"
+                              onClick={() => {
+                                setLogin(l);
+                                setShowSuggestions(false);
+                                try {
+                                  const saved = localStorage.getItem("arena-remembered");
+                                  if (saved) {
+                                    const parsed = JSON.parse(saved);
+                                    if (parsed.login === l && parsed.password) setPassword(parsed.password);
+                                  }
+                                } catch {}
+                              }}
+                              className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-[#eadfce]"
+                            >
+                              <UserRound size={14} className="shrink-0 text-[#716b78]" />
+                              <span className="truncate">{l}</span>
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    );
+                  })()}
+                </div>
               </label>
               <label className={labelCls}>
                 Пароль
-                <input
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Пароль"
-                  className={fieldCls}
-                />
+                <div className="relative mt-2">
+                  <input
+                    type={showLoginPw ? "text" : "password"}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Пароль"
+                    autoComplete="current-password"
+                    name="password"
+                    className={`${fieldClsNoMargin} pr-10`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowLoginPw(v => !v)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-[#716b78] hover:text-[#29233e] transition-colors"
+                    tabIndex={-1}
+                    aria-label={showLoginPw ? "Скрыть пароль" : "Показать пароль"}
+                  >
+                    {showLoginPw ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
               </label>
-              <p className="text-[11px] leading-4 text-[#716b78]">
-                Для входа в админ-панель используй логин <b>admin</b>.
-              </p>
+              <label className="flex items-center gap-2 text-xs font-medium text-[#29233e] cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={rememberMe}
+                  onChange={(e) => setRememberMe(e.target.checked)}
+                  className="accent-[#e96852] h-3.5 w-3.5"
+                />
+                Запомнить пароль
+              </label>
               <button className="flex w-full items-center justify-center gap-2 rounded-xl bg-primary py-3 text-sm font-bold text-primary-foreground">
                 Войти <ArrowRight size={16} />
               </button>
@@ -7500,7 +10412,7 @@ function AuthModal({
           )}
 
           {mode === "register" && (
-            <form onSubmit={submitRegister} className="space-y-3">
+            <form onSubmit={submitRegister} className="space-y-3" autoComplete="off">
               <label className={labelCls}>
                 Придумай логин
                 <input
@@ -7508,28 +10420,56 @@ function AuthModal({
                   value={regLogin}
                   onChange={(e) => setRegLogin(e.target.value)}
                   placeholder="Минимум 3 символа"
+                  autoComplete="off"
+                  name="new-username"
                   className={fieldCls}
                 />
               </label>
               <label className={labelCls}>
                 Придумай пароль
-                <input
-                  type="password"
-                  value={regPassword}
-                  onChange={(e) => setRegPassword(e.target.value)}
-                  placeholder="Минимум 4 символа"
-                  className={fieldCls}
-                />
+                <div className="relative mt-2">
+                  <input
+                    type={showRegPw ? "text" : "password"}
+                    value={regPassword}
+                    onChange={(e) => setRegPassword(e.target.value)}
+                    placeholder="Минимум 4 символа"
+                    autoComplete="new-password"
+                    name="new-password"
+                    className={`${fieldClsNoMargin} pr-10`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowRegPw(v => !v)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-[#716b78] hover:text-[#29233e] transition-colors"
+                    tabIndex={-1}
+                    aria-label={showRegPw ? "Скрыть пароль" : "Показать пароль"}
+                  >
+                    {showRegPw ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
               </label>
               <label className={labelCls}>
                 Повтори пароль
-                <input
-                  type="password"
-                  value={regConfirm}
-                  onChange={(e) => setRegConfirm(e.target.value)}
-                  placeholder="Повтори пароль"
-                  className={fieldCls}
-                />
+                <div className="relative mt-2">
+                  <input
+                    type={showRegConfirmPw ? "text" : "password"}
+                    value={regConfirm}
+                    onChange={(e) => setRegConfirm(e.target.value)}
+                    placeholder="Повтори пароль"
+                    autoComplete="new-password"
+                    name="confirm-password"
+                    className={`${fieldClsNoMargin} pr-10`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowRegConfirmPw(v => !v)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-[#716b78] hover:text-[#29233e] transition-colors"
+                    tabIndex={-1}
+                    aria-label={showRegConfirmPw ? "Скрыть пароль" : "Показать пароль"}
+                  >
+                    {showRegConfirmPw ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
               </label>
               <button className="flex w-full items-center justify-center gap-2 rounded-xl bg-primary py-3 text-sm font-bold text-primary-foreground">
                 Зарегистрироваться <ArrowRight size={16} />
@@ -7559,13 +10499,29 @@ function AuthModal({
                     setGuestConfirm(false);
                     setError("");
                   }}
-                  placeholder="Например, Лада Север"
+                  placeholder="Например, Иван Иванов"
                   className={fieldCls}
                 />
               </label>
-              <p className="mt-3 text-[11px] leading-4 text-[#716b78]">
-                Профиль сохранится на этом устройстве.
-              </p>
+              <div className="mt-3 rounded-xl border border-[#e7ba68]/40 bg-[#f3e7c8] px-3 py-2.5 text-[11px] leading-4 text-[#7e5f1d]">
+                <div className="mb-1 font-bold">⚠️ Временный режим</div>
+                В гостевом режиме вы можете сыграть партию и осмотреться.
+                <br />
+                <b>Прогресс, ник, Coins, инвентарь и награды не сохраняются</b> — они исчезнут, как только вы закроете сайт.
+                <br />
+                Чтобы копить и не терять достижения,{" "}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode("register");
+                    setError("");
+                  }}
+                  className="font-bold text-primary underline"
+                >
+                  зарегистрируйтесь
+                </button>
+                .
+              </div>
               <button className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl bg-primary py-3 text-sm font-bold text-primary-foreground">
                 {guestConfirm ? "Войти под этим никнеймом" : "Войти"}{" "}
                 <ArrowRight size={16} />
@@ -7612,11 +10568,57 @@ function AppShell({
   gameMode?: boolean;
 }) {
   const [mobileNav, setMobileNav] = useState(false);
+const [notifications, setNotifications] = useState<{ text: string; timestamp: number; read: boolean }[]>([]);
+const [showNotifications, setShowNotifications] = useState(false);
+const [serverStatus, setServerStatus] = useState<"online" | "maintenance">(() => {
+  try {
+    const saved = localStorage.getItem("arena-server-status");
+    if (saved === "maintenance" || saved === "online") return saved;
+  } catch {}
+  return "online";
+});
+
+// Подписка на статус сервера напрямую — сработает мгновенно, как статус друзей
+useEffect(() => {
+  const handleStatus = (newStatus: string) => {
+    if (newStatus !== "online" && newStatus !== "maintenance") return;
+    setServerStatus(newStatus);
+    try { localStorage.setItem("arena-server-status", newStatus); } catch {}
+  };
+  socket.on('server-status', handleStatus);
+  socket.on('server-status-updated', handleStatus);
+  // Запрашиваем актуальный статус при монтировании и при переподключении
+  socket.emit('get-server-status');
+  socket.on('connect', () => socket.emit('get-server-status'));
+  return () => {
+    socket.off('server-status', handleStatus);
+    socket.off('server-status-updated', handleStatus);
+    socket.off('connect');
+  };
+}, []);
+
+const isMaintenance = serverStatus === "maintenance";
+
+useEffect(() => {
+    const storedUser = localStorage.getItem("arena-session-user");
+    if (!storedUser) return;
+    const user = JSON.parse(storedUser);
+    if (!user || user.guest) return; // <--- ДОБАВЛЕНО: !user защищает от null
+    
+    socket.emit('get-notifications', user.id, (response: any) => {
+        if (response?.success) setNotifications(response.notifications);
+    });
+    
+    socket.on('new-notification', (newNotifs) => {
+        setNotifications(newNotifs);
+    });
+    
+    return () => {
+  socket.off('new-notification');
+};
+}, []);
   const items = isAdmin
-    ? [
-        { id: "dashboard" as Tab, label: "Главная", icon: LayoutDashboard },
-        { id: "admin" as Tab, label: "Админ-панель", icon: ShieldCheck },
-      ]
+    ? navItems
     : navItems.filter((item) => item.id !== "admin");
   const initials = isAdmin
     ? "АД"
@@ -7679,11 +10681,16 @@ function AppShell({
               )}
               <div className="min-w-0 flex-1">
                 <div className="truncate text-[11px] font-bold">
-                  {name || "Гость"}
-                </div>
+  {name || "Гость"}
+  {isVipActive() && (
+    <span className="ml-1 rounded bg-[#d3a247] px-1 py-0.5 text-[9px] font-bold text-white">
+      VIP
+    </span>
+  )}
+</div>
                 <div className="font-mono text-[8px] text-[#aaa2b4]">
-                  {isAdmin ? "ADMIN" : name ? "MA-4821" : "Войди"}
-                </div>
+  {isAdmin ? "ADMIN" : name ? (JSON.parse(localStorage.getItem("arena-session-user") || "{}").id || "MA-XXXX") : "Войди"}
+</div>
               </div>
               {name ? (
                 <button
@@ -7722,20 +10729,105 @@ function AppShell({
               <PanelLeft size={17} />
             </button>
             <div className="hidden items-center gap-2 text-xs text-muted-foreground sm:flex">
-              <span className="h-2 w-2 rounded-full bg-accent" />
-              <span>
-                {isAdmin ? "Защищённая сессия" : "Сервер клуба в норме"}
-              </span>
+              {isAdmin ? (
+                // Админ — управление статусом через выпадашку
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`h-2 w-2 rounded-full ${isMaintenance ? "bg-orange-500" : "bg-accent"}`}
+                  />
+                  <select
+                    value={serverStatus}
+                    onChange={(e) => {
+                      const newStatus = e.target.value as "online" | "maintenance";
+                      setServerStatus(newStatus);
+                      try { localStorage.setItem("arena-server-status", newStatus); } catch {}
+                      socket.emit('admin-update-server-status', newStatus);
+                    }}
+                    className={`cursor-pointer rounded-lg border border-input bg-card px-2 py-1 text-xs font-bold outline-none focus:ring-2 focus:ring-primary/30 ${
+                      isMaintenance ? "text-orange-600" : "text-accent"
+                    }`}
+                  >
+                    <option value="online">Сервер Онлайн</option>
+                    <option value="maintenance">Технические работы</option>
+                  </select>
+                </div>
+              ) : (
+                // Обычный игрок — просто текст со статусом
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`h-2 w-2 rounded-full ${isMaintenance ? "bg-orange-500" : "bg-accent"}`}
+                  />
+                  <span
+                    className={`font-bold ${isMaintenance ? "text-orange-600" : "text-accent"}`}
+                  >
+                    {isMaintenance ? "Технические работы" : "Сервер Онлайн"}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
           <div className="flex items-center gap-2 ml-[20px] mr-[20px]">
             <button className="hidden rounded-lg p-1.5 text-muted-foreground hover:bg-muted sm:block">
               <CircleHelp size={16} />
             </button>
-            <button className="relative rounded-lg p-1.5 text-muted-foreground hover:bg-muted">
-              <Bell size={16} />
-              <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-primary" />
-            </button>
+            <div className="relative">
+        <button
+        onClick={() => {
+          const willOpen = !showNotifications;
+          setShowNotifications(willOpen);
+          if (willOpen && notifications.some(n => !n.read)) {
+            const storedUser = localStorage.getItem("arena-session-user");
+            if (storedUser) {
+              const u = JSON.parse(storedUser);
+              if (u && !u.guest) {
+                socket.emit('mark-notifications-read', u.id);
+                setNotifications(prev => prev.map(n => ({ ...n, read: true })));
+              }
+            }
+          }
+        }}
+        className="relative rounded-lg p-1.5 text-muted-foreground hover:bg-muted"
+    >
+        <Bell size={16} />
+        {notifications.filter(n => !n.read).length > 0 && (
+            <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-primary" />
+        )}
+    </button>
+      {showNotifications && (
+        <div className="absolute right-0 top-10 z-50 w-72 rounded-xl border border-card-border bg-card p-3 shadow-2xl">
+            <div className="mb-2 flex items-center justify-between">
+                <div className="font-bold text-sm">Уведомления</div>
+                {notifications.length > 0 && (
+                    <button
+                        onClick={() => {
+                            const storedUser = localStorage.getItem("arena-session-user");
+                            if (!storedUser) return;
+                            const u = JSON.parse(storedUser);
+                            if (!u || u.guest) return;
+                            socket.emit('clear-notifications', u.id);
+                            setNotifications([]);
+                        }}
+                        className="rounded-md px-2 py-0.5 text-[10px] font-bold text-primary hover:bg-[#f6dfd7] transition-colors"
+                        title="Очистить все уведомления"
+                    >
+                        Очистить
+                    </button>
+                )}
+            </div>
+            {notifications.length === 0 ? (
+                <div className="text-xs text-muted-foreground">Нет уведомлений</div>
+            ) : (
+                <div className="space-y-2 max-h-[300px] overflow-y-auto pr-1">
+                    {notifications.map((n, i) => (
+                        <div key={i} className="rounded-lg bg-muted p-2 text-xs">
+                            {n.text}
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    )}
+</div>
             <div className="hidden h-4 w-px bg-border sm:block" />
             <div className="flex items-center gap-2">
               {name ? (
@@ -7746,8 +10838,13 @@ function AppShell({
                     size="sm"
                   />
                   <span className="hidden text-xs font-bold sm:block">
-                    {name}
-                  </span>
+  {name}
+  {isVipActive() && (
+    <span className="ml-1 rounded bg-[#d3a247] px-1 py-0.5 text-[9px] font-bold text-white">
+      VIP
+    </span>
+  )}
+</span>
                   <button
                     onClick={onLogout}
                     className="hidden rounded-lg border border-input px-2 py-1.5 font-bold sm:block text-[14px] border-t-[1.2px] border-r-[1.2px] border-b-[1.2px] border-l-[1.2px] pl-[15px] pr-[15px]"
@@ -7822,24 +10919,30 @@ function Home() {
   );
   const [tab, setTab] = useState<Tab>("dashboard");
   const [game, setGame] = useState(false);
+const [currentRoomId, setCurrentRoomId] = useState<string | null>(null);
   const [authOpen, setAuthOpen] = useState(false);
   const [pending, setPending] = useState<"create" | "find" | "join" | null>(
     null,
   );
   const [createOpen, setCreateOpen] = useState(false);
   const [findOpen, setFindOpen] = useState(false);
-useEffect(() => {
-    // Загружаем дизайны с сервера, если их ещё нет в localStorage
-    fetch('/arena-card-designs.json')
-      .then(res => res.json())
-      .then(data => {
-        const existing = localStorage.getItem('arena-card-designs');
-        if (!existing) {
-          localStorage.setItem('arena-card-designs', JSON.stringify(data));
-        }
-      })
-      .catch(err => console.warn('Не удалось загрузить дизайны карточек:', err));
-  }, []);
+    const [pendingChatFriend, setPendingChatFriend] = useState<{ id: string; name: string; online: boolean } | null>(null);
+  const [activeGame, setActiveGame] = useState<{ roomId: string; roomName: string; disconnected: boolean } | null>(null);
+
+  // Запрашиваем активную игру при логине
+  useEffect(() => {
+    if (!player?.id) { setActiveGame(null); return; }
+    const fetchActive = () => {
+      socket.emit('get-active-game', player.id, (res: any) => {
+        if (res?.success && res.room) setActiveGame(res.room);
+        else setActiveGame(null);
+      });
+    };
+    fetchActive();
+    // Обновляем при переподключении сокета
+    socket.on('connect', fetchActive);
+    return () => { socket.off('connect', fetchActive); };
+  }, [player?.id]);
 
   const isAuthed = !!(player || adminAuthed);
 
@@ -7860,37 +10963,109 @@ useEffect(() => {
       setAuthOpen(true);
     }
   };
-  const requestJoin = () => {
-    if (isAuthed) {
-      setGame(true);
-    } else {
-      setPending("join");
-      setAuthOpen(true);
-    }
-  };
+    const gameTriggerRef = useRef<string | null>(null);
 
-  const onAuthSuccess = (result: {
-    kind: "player" | "admin";
-    user?: AuthUser;
-  }) => {
-    setAuthOpen(false);
-    if (result.kind === "admin") {
-      setAdminAuthed(true);
-      setPlayer(null);
-      setPending(null);
-      return;
+// Добавь этот useEffect после всех useState в Home
+useEffect(() => {
+    if (gameTriggerRef.current && currentRoomId) {
+        setGame(true);
+        gameTriggerRef.current = null;
     }
-    if (result.user) {
-      setPlayer(result.user);
-      setAdminAuthed(false);
-      localStorage.setItem("arena-nickname", result.user.name);
+}, [currentRoomId]);
+
+// Счётчик минут онлайн: +1 каждые 60 секунд, пока игрок авторизован
+useEffect(() => {
+  if (!player?.id) return;
+  const interval = setInterval(() => {
+    const key = "arena-user-data-" + player.id;
+    const existing = JSON.parse(localStorage.getItem(key) || "{}");
+    const current = existing.minutesOnline || 0;
+    const updated = { ...existing, minutesOnline: current + 1 };
+    localStorage.setItem(key, JSON.stringify(updated));
+    // Синхронизируем с сервером каждые 5 минут (и на каждой 1-й минуте — тоже, чтобы не терять данные при неожиданном выходе)
+    if ((current + 1) % 5 === 0 || current === 0) {
+      socket.emit('save-user-data', { userId: player.id, newData: { minutesOnline: current + 1 } });
     }
-    const action = pending;
+  }, 60_000);
+  return () => clearInterval(interval);
+}, [player?.id]);
+
+const requestJoin = (roomId?: string) => {
+    if (isAuthed) {
+        if (roomId) setCurrentRoomId(roomId);
+        // Запоминаем, что нужно запустить игру, но ждём обновления currentRoomId
+        gameTriggerRef.current = roomId || null;
+    } else {
+        setPending("join");
+        setAuthOpen(true);
+    }
+};
+
+    const onAuthSuccess = (result: {
+  kind: "player" | "admin";
+  user?: AuthUser;
+}) => {
+  setAuthOpen(false);
+  if (result.kind === "admin") {
+    setAdminAuthed(true);
+    setPlayer(null);
     setPending(null);
-    if (action === "create") setCreateOpen(true);
-    else if (action === "find") setFindOpen(true);
-    else if (action === "join") setGame(true);
-  };
+    localStorage.removeItem("arena-session-user"); // <--- ДОБАВЛЕНО: очищаем старую сессию
+    return;
+}
+  if (result.user) {
+    const user = result.user; // Сохраняем в константу
+    setPlayer(user);
+    setAdminAuthed(false);
+    localStorage.setItem("arena-nickname", user.name);
+    
+    // Загружаем данные пользователя с сервера (если их ещё нет в кэше)
+    socket.emit('get-user-data', user.id, (response: any) => {
+            if (response?.success) {
+        const data = response.data;
+        // Полная запись user-data — её читает Профиль
+        localStorage.setItem("arena-user-data-" + user.id, JSON.stringify(data));
+        localStorage.setItem("arena-coins", String(data.coins || 2400));
+        localStorage.setItem("arena-inventory", JSON.stringify(data.inventory || []));
+        localStorage.setItem("arena-stats", JSON.stringify(data.stats || {}));
+localStorage.setItem("arena-friends", JSON.stringify(data.friends || []));
+const vipUntil = data.vipUntil;
+if (vipUntil) {
+  localStorage.setItem("arena-vip-until", vipUntil);
+} else {
+  localStorage.removeItem("arena-vip-until");
+}
+// Восстанавливаем активные скины из серверных данных
+if (data.activeSkins && typeof data.activeSkins === "object") {
+  try {
+    const current = JSON.parse(localStorage.getItem("arena-active-skins") || "{}");
+    localStorage.setItem("arena-active-skins", JSON.stringify({
+      dice: current.dice || "none",
+      token: current.token || "none",
+      board: current.board || "none",
+      activeSkins: data.activeSkins,
+    }));
+  } catch {}
+}
+      } else {
+        // Если данных нет, создаём их по умолчанию и сохраняем
+        const defaultData = {
+          inventory: [],
+          coins: 2400,
+          stats: { games: 0, wins: 0, xp: 0, level: 1 },
+          friends: []
+        };
+        // ВАЖНО: здесь используем user.id, а не result.user.id
+        socket.emit('save-user-data', { userId: user.id, newData: defaultData });
+      }
+    });
+  }
+  const action = pending;
+  setPending(null);
+  if (action === "create") setCreateOpen(true);
+  else if (action === "find") setFindOpen(true);
+  else if (action === "join") setGame(true);
+};
   const logout = () => {
     setPlayer(null);
     setAdminAuthed(false);
@@ -7906,7 +11081,7 @@ useEffect(() => {
       return (
         <>
           <GameShell name="Администратор">
-            <BoardGame onExit={() => setGame(false)} />
+            <BoardGame onExit={() => setGame(false)} initialRoomId={currentRoomId} currentUser={player} />
           </GameShell>
           {authOpen && (
             <AuthModal
@@ -7924,11 +11099,16 @@ useEffect(() => {
     let adminContent: ReactNode;
     switch (tab) {
       case "dashboard":
-        adminContent = (
+                adminContent = (
           <Dashboard
             isAdmin={true}
-            onTab={setTab}
-            onJoinGame={requestJoin}
+            player={player}
+  onTab={setTab}
+  onOpenFriendChat={(friend) => {
+    setPendingChatFriend(friend);
+    setTab("friends");
+  }}
+  onJoinGame={requestJoin}
             onRequestCreate={requestCreate}
             onRequestFind={requestFind}
             createOpen={createOpen}
@@ -7940,13 +11120,17 @@ useEffect(() => {
         );
         break;
       case "friends":
-        adminContent = <Friends />;
+        adminContent = <Friends 
+  player={player}
+  pendingChatFriend={pendingChatFriend}
+  onPendingChatConsumed={() => setPendingChatFriend(null)}
+/>;
         break;
       case "shop":
         adminContent = <Shop />;
         break;
       case "profile":
-        adminContent = <Profile onInventory={() => setTab("inventory")} />;
+        adminContent = <Profile onInventory={() => setTab("inventory")} player={player} />;
         break;
       case "inventory":
         adminContent = <Inventory onMarket={() => setTab("market")} />;
@@ -7960,8 +11144,9 @@ useEffect(() => {
       default:
         adminContent = (
           <Dashboard
-            onTab={setTab}
-            onJoinGame={requestJoin}
+            player={player}
+  onTab={setTab}
+  onJoinGame={requestJoin}
             onRequestCreate={requestCreate}
             onRequestFind={requestFind}
             createOpen={createOpen}
@@ -7987,11 +11172,12 @@ useEffect(() => {
       </AppShell>
     );
   }
-  if (game)
+  // ДОБАВИЛИ ПРОВЕРКУ game && currentRoomId, чтобы не запускать игру с null ID
+  if (game && currentRoomId) {
     return (
       <>
         <GameShell name={player?.name}>
-          <BoardGame onExit={() => setGame(false)} />
+          <BoardGame onExit={() => setGame(false)} initialRoomId={currentRoomId} currentUser={player} />
         </GameShell>
         {authOpen && (
           <AuthModal
@@ -8004,11 +11190,17 @@ useEffect(() => {
         )}
       </>
     );
+  }
 
-  const dashboard = (
+    const dashboard = (
     <Dashboard
-      onTab={setTab}
-      onJoinGame={requestJoin}
+      player={player}
+  onTab={setTab}
+  onOpenFriendChat={(friend) => {
+    setPendingChatFriend(friend);
+    setTab("friends");
+  }}
+  onJoinGame={requestJoin}
       onRequestCreate={requestCreate}
       onRequestFind={requestFind}
       createOpen={createOpen}
@@ -8016,17 +11208,32 @@ useEffect(() => {
       onCloseCreate={() => setCreateOpen(false)}
       onCloseFind={() => setFindOpen(false)}
       playerName={player?.name}
+      activeGame={activeGame}
+      onReconnectGame={(roomId) => {
+        setActiveGame(null);
+        setCurrentRoomId(roomId);
+        setGame(true);
+      }}
+      onLeaveActiveGame={() => {
+        if (!activeGame || !player?.id) return;
+        socket.emit('leave-game', { roomId: activeGame.roomId, userId: player.id });
+        setActiveGame(null);
+      }}
     />
   );
   const content =
     tab === "dashboard" ? (
       dashboard
     ) : tab === "friends" ? (
-      <Friends />
+      <Friends 
+  player={player}
+  pendingChatFriend={pendingChatFriend}
+  onPendingChatConsumed={() => setPendingChatFriend(null)}
+/>
     ) : tab === "shop" ? (
       <Shop />
     ) : tab === "profile" ? (
-      <Profile onInventory={() => setTab("inventory")} />
+      <Profile onInventory={() => setTab("inventory")} player={player} />
     ) : tab === "inventory" ? (
       <Inventory onMarket={() => setTab("market")} />
     ) : tab === "market" ? (
@@ -8058,15 +11265,577 @@ useEffect(() => {
   );
 }
 
+function AccessGate({ children }: { children: ReactNode }) {
+  const [granted, setGranted] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("arena-access-granted") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [input, setInput] = useState("");
+  const [showPw, setShowPw] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    if (input === SITE_ACCESS_PASSWORD) {
+      try { localStorage.setItem("arena-access-granted", "1"); } catch {}
+      setGranted(true);
+    } else {
+      setError("Неверный пароль. Попробуйте ещё раз.");
+      setInput("");
+    }
+  };
+
+  if (granted) return <>{children}</>;
+
+  return (
+    <div className="arena-shell arena-noise flex min-h-[100dvh] items-center justify-center bg-[#f1eadc] p-4 text-foreground">
+      <div className="w-full max-w-md overflow-hidden rounded-[1.5rem] border border-card-border bg-[#f7f0e3] shadow-[0_25px_80px_rgba(41,35,62,.25)]">
+        <div className="bg-[#29233e] px-6 py-5 text-[#f7f0e3]">
+          <div className="font-mono text-[10px] uppercase tracking-[.2em] text-[#e7ba68]">
+            monopoly arena
+          </div>
+          <h2 className="mt-1 font-display text-2xl font-bold">
+            Сайт в разработке
+          </h2>
+        </div>
+        <form onSubmit={submit} className="p-6">
+          <p className="text-sm leading-6 text-[#29233e]">
+            Сайт находится в режиме тестирования.
+            <br />
+            Планируемая дата запуска —{" "}
+            <b className="text-primary">Октябрь 2026 года</b>.
+          </p>
+          <p className="mt-3 text-xs text-[#716b78]">
+            Если у вас есть пароль доступа — введите его ниже.
+          </p>
+          <label className="mt-5 block text-xs font-bold text-[#29233e]">
+            Пароль
+            <div className="relative mt-2">
+              <input
+                autoFocus
+                type={showPw ? "text" : "password"}
+                value={input}
+                onChange={(e) => { setInput(e.target.value); setError(""); }}
+                placeholder="Введите пароль"
+                className="w-full rounded-xl border border-[#d8ccba] bg-[#fffaf1] px-3.5 py-3 pr-10 text-sm outline-none focus:ring-2 focus:ring-primary/30"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPw(v => !v)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-[#716b78] hover:text-[#29233e] transition-colors"
+                tabIndex={-1}
+                aria-label={showPw ? "Скрыть пароль" : "Показать пароль"}
+              >
+                {showPw ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
+          </label>
+          {error && (
+            <div className="mt-3 rounded-lg bg-[#f6dfd7] px-3 py-2 text-xs font-medium text-primary">
+              {error}
+            </div>
+          )}
+          <button className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl bg-primary py-3 text-sm font-bold text-primary-foreground">
+            Войти на сайт <ArrowRight size={16} />
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function App() {
+  // При каждом (пере)подключении сокета сообщаем серверу,
+  // что мы всё ещё онлайн, чтобы он поставил нас в onlineUsers
+  // и уведомил друзей. Нужно после рестарта сервера или долгого отсутствия.
+  useEffect(() => {
+    const handleConnect = () => {
+      try {
+        const raw = localStorage.getItem("arena-session-user");
+        if (!raw || raw === "null") return;
+        const u = JSON.parse(raw);
+        if (u && u.id) {
+          socket.emit('reconnect-session', { userId: u.id }, (res: any) => {
+            if (res?.success) console.log("♻️ Сессия восстановлена на сервере");
+          });
+        }
+      } catch {}
+    };
+    socket.on('connect', handleConnect);
+    if (socket.connected) handleConnect();
+    return () => {
+      socket.off('connect', handleConnect);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleServerToken = (token: string) => {
+      if (!token) return;
+      const stored = sessionStorage.getItem("arena-server-token");
+      if (stored && stored !== token) {
+        // ВАЖНО: обновляем токен ДО reload, иначе после перезагрузки
+        // снова будет несовпадение и страница уйдёт в бесконечный цикл.
+        sessionStorage.setItem("arena-server-token", token);
+        console.log("🔁 Сервер перезапущен. Жёсткая перезагрузка страницы…");
+        fetch(window.location.href, { cache: "reload", mode: "no-cors" })
+          .catch(() => {})
+          .finally(() => {
+            window.location.reload();
+          });
+        return;
+      }
+      sessionStorage.setItem("arena-server-token", token);
+    };
+    socket.on("server-start-token", handleServerToken);
+    // На случай, если сервер уже успел отправить токен до монтирования
+    socket.emit("get-server-start-token");
+    return () => {
+      socket.off("server-start-token", handleServerToken);
+    };
+  }, []);
+
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <Home />
+        <AccessGate>
+          <Home />
+        </AccessGate>
         <Toaster />
       </TooltipProvider>
     </QueryClientProvider>
   );
 }
+
+function MarketItemModal({ onClose, onSave, initialItem }: { onClose: () => void; onSave: (item: MarketItem) => void; initialItem?: MarketItem | null }) {
+  const [name, setName] = useState(initialItem?.name || "");
+  const [price, setPrice] = useState(String(initialItem?.price || 500));
+  const [slot, setSlot] = useState(String(initialItem?.slotIndex || 1));
+  const [rarity, setRarity] = useState<MarketItemRarity>(initialItem?.rarity || "common");
+  const [image, setImage] = useState<string | undefined>(initialItem?.imageDataUrl);
+  const [scale, setScale] = useState(initialItem?.scale || 1);
+  const [caseId, setCaseId] = useState("");
+  const [category, setCategory] = useState<MarketItemCategory>(initialItem?.category || "card");
+  const [vipDays, setVipDays] = useState(String(initialItem?.vipDuration || 7));
+  const [description, setDescription] = useState(initialItem?.description || "");
+  const [bgColor, setBgColor] = useState(initialItem?.bgColor || "#d3a247");
+    const [cardWidth, setCardWidth] = useState(String(initialItem?.cardWidth ?? CARD_SIZE_DEFAULTS.cardWidth));
+  const [cardHeight, setCardHeight] = useState(String(initialItem?.cardHeight ?? CARD_SIZE_DEFAULTS.cardHeight));
+  const [imageHeight, setImageHeight] = useState(String(initialItem?.imageHeight ?? CARD_SIZE_DEFAULTS.imageHeight));
+  const [shopScale, setShopScale] = useState(String(initialItem?.shopScale ?? CARD_SIZE_DEFAULTS.shopScale));
+  const slotNum = Number(slot) || 1;
+  const dim = category === "card" ? getCellDimensions(slotNum) : null;
+  const MAX_PREVIEW_SIZE = 130;
+  const scaleRatio = dim ? Math.min(MAX_PREVIEW_SIZE / dim.hPx, MAX_PREVIEW_SIZE / dim.wPx) : 1;
+  const previewW = dim ? dim.wPx * scaleRatio : 100;
+  const previewH = dim ? dim.hPx * scaleRatio : 100;
+
+  let stripDir = null;
+  if (category === "card") {
+    if (slotNum >= 1 && slotNum <= 9) stripDir = "top";
+    else if (slotNum >= 11 && slotNum <= 19) stripDir = "right";
+    else if (slotNum >= 21 && slotNum <= 29) stripDir = "bottom";
+    else if (slotNum >= 31 && slotNum <= 39) stripDir = "left";
+  }
+
+  const groupColor = category === "card" ? (getCellGroup(slotNum)?.color || "#2563eb") : "#2563eb";
+
+  const CELL_TYPES_LIST: CellType[] = [
+    "property", "start", "chance", "tax", "challenge", "jail", "gotojail", "jackpot"
+  ];
+  const CELL_TYPE_LABELS: Record<CellType, string> = {
+    property: "Собственность",
+    start: "Старт",
+    chance: "Шанс",
+    tax: "Налог",
+    challenge: "Испытание",
+    jail: "Тюрьма",
+    gotojail: "В тюрьму",
+    jackpot: "Джекпот"
+  };
+
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => setImage(ev.target?.result as string);
+    reader.readAsDataURL(file);
+  };
+
+    const save = () => {
+    if (!name.trim()) return;
+    const newItem: MarketItem = {
+      id: initialItem?.id || `КТП-${Math.floor(10000 + Math.random() * 90000)}`,
+      name: name.trim(),
+      category,
+      slotIndex: category === "card" ? Number(slot) : undefined,
+      vipDuration: category === "vip" ? Number(vipDays) || 7 : undefined,
+      price: Number(price) || 100,
+      rarity,
+      imageDataUrl: image,
+      scale,
+      isActive: initialItem?.isActive ?? true,
+      description: description.trim() || undefined,
+      bgColor: category === "vip" ? bgColor : undefined,
+      cardWidth: Number(cardWidth) || CARD_SIZE_DEFAULTS.cardWidth,
+      cardHeight: Number(cardHeight) || CARD_SIZE_DEFAULTS.cardHeight,
+      imageHeight: Number(imageHeight) || CARD_SIZE_DEFAULTS.imageHeight,
+      shopScale: Number(shopScale) || CARD_SIZE_DEFAULTS.shopScale,
+    };
+    onSave(newItem);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#29233e]/60 p-4 backdrop-blur-sm">
+      <div className="w-full max-w-2xl rounded-2xl border border-card-border bg-card p-6 shadow-2xl">
+        <div className="flex items-start justify-between">
+          <h2 className="font-display text-2xl font-bold">{initialItem ? "Редактирование карточки" : "Новая карточка для рынка"}</h2>
+          <button onClick={onClose} className="rounded-lg p-2 text-muted-foreground hover:bg-muted">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="mt-5 grid grid-cols-2 gap-4">
+          <label className="text-xs font-bold">
+  Название
+  <input value={name} onChange={e => setName(e.target.value)} className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm" />
+</label>
+<label className="text-xs font-bold">
+  Категория
+  <select value={category} onChange={e => setCategory(e.target.value as MarketItemCategory)} className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm">
+    <option value="card">Карточка поля</option>
+    <option value="dice">Кубики</option>
+    <option value="vip">VIP-статус</option>
+  </select>
+</label>
+<label className="text-xs font-bold">
+  Цена (Coins)
+  <input type="number" value={price} onChange={e => setPrice(e.target.value)} className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm" />
+</label>
+{category === "vip" && (
+  <label className="text-xs font-bold">
+    Дней VIP
+    <input
+      type="number"
+      min="1"
+      value={vipDays}
+      onChange={e => setVipDays(e.target.value)}
+      className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm"
+    />
+  </label>
+)}
+{category === "card" && (
+  <label className="text-xs font-bold">
+    Заменяет слот (0-39)
+    <input type="number" min="0" max="39" value={slot} onChange={e => setSlot(e.target.value)} className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm" />
+  </label>
+)}
+<label className="text-xs font-bold">
+  Редкость
+  <select value={rarity} onChange={e => setRarity(e.target.value as MarketItemRarity)} className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm">
+    <option value="common">Белый (обычный)</option>
+    <option value="rare">Синий (редкий)</option>
+    <option value="epic">Фиолетовый (супер-редкий)</option>
+  </select>
+</label>
+<label className="text-xs font-bold">
+  Описание
+  <input
+    value={description}
+    onChange={e => setDescription(e.target.value)}
+    placeholder="Например: VIP на 7 дней с бонусами"
+    className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm"
+  />
+</label>
+{category === "vip" && (
+  <label className="text-xs font-bold">
+    Цвет фона
+    <input
+      type="color"
+      value={bgColor}
+      onChange={e => setBgColor(e.target.value)}
+      className="mt-2 h-10 w-full cursor-pointer rounded-xl border border-input bg-background p-1"
+    />
+  </label>
+)}
+<label className="text-xs font-bold">
+  Кейс (название)
+  <input value={caseId} onChange={e => setCaseId(e.target.value)} placeholder="Например: Классика" className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm" />
+</label>
+        </div>
+
+        {/* РАЗМЕРЫ КАРТОЧКИ В МАГАЗИНЕ / ИНВЕНТАРЕ / РЫНКЕ */}
+        <div className="mt-4 rounded-xl border border-input bg-muted/40 p-3">
+          <div className="mb-2 text-xs font-bold text-muted-foreground uppercase tracking-wide">
+            📐 Размер карточки (магазин / инвентарь / рынок)
+          </div>
+          <div className="grid grid-cols-4 gap-3">
+            <label className="text-xs font-bold">
+              Ширина, px
+              <input type="number" value={cardWidth} onChange={e => setCardWidth(e.target.value)} className="mt-1 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm font-normal" />
+            </label>
+            <label className="text-xs font-bold">
+              Высота карточки, px
+              <input type="number" value={cardHeight} onChange={e => setCardHeight(e.target.value)} className="mt-1 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm font-normal" />
+            </label>
+            <label className="text-xs font-bold">
+              Высота картинки, px
+              <input type="number" value={imageHeight} onChange={e => setImageHeight(e.target.value)} className="mt-1 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm font-normal" />
+            </label>
+            <label className="text-xs font-bold">
+              Масштаб картинки, %
+              <input type="number" value={shopScale} onChange={e => setShopScale(e.target.value)} className="mt-1 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm font-normal" />
+            </label>
+          </div>
+        </div>
+
+        <label className="mt-4 block text-xs font-bold">
+          Изображение карточки (JPG / PNG / GIF)
+          <div className="mt-2 flex items-center gap-3">
+            <label className="flex cursor-pointer items-center gap-2 rounded-xl border border-dashed border-input px-4 py-2.5 text-xs font-bold text-muted-foreground hover:border-primary hover:text-primary transition-colors">
+              <Upload size={14} /> Загрузить файл
+              <input type="file" accept=".jpg,.jpeg,.png,.gif,image/jpeg,image/png,image/gif" onChange={handleImageUpload} className="hidden" />
+            </label>
+            {image && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!image) return;
+                    const img = new Image();
+                    img.onload = () => {
+                      const canvas = document.createElement("canvas");
+                      canvas.width = img.width;
+                      canvas.height = img.height;
+                      const ctx = canvas.getContext("2d");
+                      if (!ctx) return;
+                      ctx.drawImage(img, 0, 0);
+                      const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                      const px = data.data;
+                      for (let i = 0; i < px.length; i += 4) {
+                        if (px[i] > 240 && px[i + 1] > 240 && px[i + 2] > 240) {
+                          px[i + 3] = 0;
+                        }
+                      }
+                      ctx.putImageData(data, 0, 0);
+                      setImage(canvas.toDataURL("image/png"));
+                    };
+                    img.src = image;
+                  }}
+                  className="rounded-lg bg-[#f3e7c8] px-3 py-1.5 text-[11px] font-bold text-[#7e5f1d] hover:brightness-95"
+                  title="Все почти-белые пиксели станут прозрачными"
+                >
+                  🧹 Убрать белый фон
+                </button>
+                <button onClick={() => setImage(undefined)} className="text-xs text-primary underline">
+                  удалить
+                </button>
+              </>
+            )}
+          </div>
+        </label>
+
+        {image && (
+          <div className="mt-3">
+            <div className="text-xs font-bold mb-1">Масштаб: {Math.round(scale * 100)}%</div>
+            <input
+              type="range"
+              min="0.5"
+              max="2.0"
+              step="0.05"
+              value={scale}
+              onChange={e => setScale(parseFloat(e.target.value))}
+              className="w-full"
+            />
+          </div>
+        )}
+
+                <div className="flex gap-2 pt-2">
+          <button onClick={onClose} className="rounded-xl border border-input px-4 py-2.5 text-xs font-bold text-muted-foreground hover:bg-muted">
+            Отмена
+          </button>
+          <button onClick={save} className="rounded-xl bg-primary px-4 py-2.5 text-xs font-bold text-primary-foreground">
+  {initialItem ? "Сохранить изменения" : "Сохранить"}
+</button>
+        </div>
+      </div>
+
+      {/* ПРАВАЯ ПАНЕЛЬ ПРЕВЬЮ */}
+      <div className="border-l border-border bg-muted/50 p-4 flex gap-4 overflow-auto">
+        {/* ЛЕВОЕ ПРЕВЬЮ — как на игровом столе */}
+        <div className="flex flex-col items-center gap-2">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground whitespace-nowrap">
+            Как на столе
+          </div>
+          {category === "card" ? (
+            <div
+              className="relative overflow-hidden rounded-sm shadow-md shrink-0"
+              style={{
+                width: previewW,
+                height: previewH,
+                backgroundColor: cellBgColor("property"),
+              }}
+            >
+              {stripDir && (
+                <div
+                  style={{
+                    position: "absolute",
+                    top: stripDir === "top" ? 0 : stripDir === "bottom" ? undefined : 0,
+                    bottom: stripDir === "bottom" ? 0 : undefined,
+                    left: stripDir === "left" ? 0 : stripDir === "right" ? undefined : 0,
+                    right: stripDir === "right" ? 0 : undefined,
+                    height: stripDir === "top" || stripDir === "bottom" ? "18%" : "100%",
+                    width: stripDir === "left" || stripDir === "right" ? "18%" : "100%",
+                    backgroundColor: groupColor,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  {Number(price) > 0 && (
+                    <span
+                      style={{
+                        fontSize: stripDir === "top" || stripDir === "bottom" ? 18 : 15,
+                        fontWeight: 800,
+                        color: "#fff",
+                        writingMode: stripDir === "left" || stripDir === "right" ? "vertical-rl" : undefined,
+                        transform: stripDir === "left" ? "rotate(180deg)" : undefined,
+                      }}
+                    >
+                      {Math.round(Number(price) / 1000)}k
+                    </span>
+                  )}
+                </div>
+              )}
+              <div
+                style={{
+                  position: "absolute",
+                  top: stripDir === "top" ? "18%" : 0,
+                  bottom: stripDir === "bottom" ? "18%" : 0,
+                  left: stripDir === "left" ? "18%" : 0,
+                  right: stripDir === "right" ? "18%" : 0,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  overflow: "hidden",
+                }}
+              >
+                {image ? (
+                  <img
+                    src={image}
+                    alt=""
+                    style={{
+                      maxWidth: "100%",
+                      maxHeight: "100%",
+                      width: "auto",
+                      height: "auto",
+                      objectFit: "contain",
+                      transform: `scale(${scale})`,
+                      transformOrigin: "center center",
+                    }}
+                  />
+                ) : (
+                  <div style={{ fontSize: 36 }}>
+                    {CELL_LOGOS[slotNum] ?? SPECIAL_ICONS["property"] ?? "❓"}
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : category === "dice" ? (
+            <div className="flex flex-col items-center">
+              {image ? (
+                <img src={image} alt="preview" className="h-20 w-20 object-contain" />
+              ) : (
+                <div className="text-4xl" style={{ color: "#e96852" }}>🎲</div>
+              )}
+            </div>
+          ) : (
+            <div className="flex flex-col items-center w-full">
+              <div
+                className="flex h-32 w-full items-center justify-center overflow-hidden rounded-xl"
+                style={{ backgroundColor: bgColor }}
+              >
+                {image ? (
+                  <img src={image} alt="preview" className="h-full w-full object-contain p-2" />
+                ) : (
+                  <Crown size={48} style={{ color: bgColor }} />
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* ПРАВОЕ ПРЕВЬЮ — как в магазине (полная карточка с ценой и кнопкой) */}
+        <div className="flex flex-col items-center gap-2">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground whitespace-nowrap">
+            Как в магазине
+          </div>
+          <div
+            className="flex flex-col rounded-2xl border border-card-border bg-card shadow-sm overflow-hidden shrink-0"
+            style={{
+              width: `${Number(cardWidth) || CARD_SIZE_DEFAULTS.cardWidth}px`,
+            }}
+          >
+            <div
+              className="relative flex items-center justify-center overflow-hidden"
+              style={{
+                height: `${Number(imageHeight) || CARD_SIZE_DEFAULTS.imageHeight}px`,
+                backgroundColor: category === "vip" ? bgColor : "#fdfaf5",
+              }}
+            >
+              {image ? (
+                <img
+                  src={image}
+                  alt=""
+                  style={{
+                    maxWidth: "100%",
+                    maxHeight: "100%",
+                    width: "auto",
+                    height: "auto",
+                    objectFit: "contain",
+                    transform: `scale(${(Number(shopScale) || 90) / 100})`,
+                    transformOrigin: "center center",
+                  }}
+                />
+              ) : (
+                <div className="text-3xl">❓</div>
+              )}
+              <div
+                className="absolute bottom-0 left-0 right-0 h-1"
+                style={{
+                  backgroundColor:
+                    rarity === "common" ? "#b0b0b0" :
+                    rarity === "rare" ? "#2563eb" :
+                    rarity === "epic" ? "#9b5de5" : "#b0b0b0",
+                }}
+              />
+            </div>
+            <div className="p-4 flex flex-col gap-2 flex-1">
+              <div>
+                <h3 className="font-display text-lg font-bold">{name || "Название"}</h3>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {category === "card" ? `Заменяет слот: ${slotNum} · ${rarity}` :
+                   category === "dice" ? `Кубики · ${rarity}` :
+                   `VIP на ${vipDays} дней`}
+                </p>
+              </div>
+              <div className="mt-auto flex items-center justify-between pt-2 border-t border-border">
+                <span className="flex items-center gap-1.5 font-mono text-sm font-bold">
+                  <Coins size={15} className="text-[#b18428]" />
+                  {price}
+                </span>
+                <button className="rounded-lg bg-primary px-3.5 py-2 text-xs font-bold text-primary-foreground">
+                  Купить
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 
 export default App;

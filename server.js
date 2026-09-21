@@ -943,6 +943,58 @@ socket.on('get-user-data', (userId, callback) => {
       buyLocks.delete(userId);
     }
   });
+  
+  // ---- ПОКУПКА VIP-СТАТУСА ----
+  socket.on('shop-buy-vip', async ({ userId, marketItemId }, callback) => {
+    if (!userId || !marketItemId) return callback?.({ success: false, error: 'Некорректный запрос' });
+    if (!userData[userId]) return callback?.({ success: false, error: 'Игрок не найден' });
+    if (buyLocks.has(userId)) return callback?.({ success: false, error: 'Подождите, обрабатывается другая покупка' });
+    buyLocks.add(userId);
+    try {
+      const item = marketItems.find((m) => m.id === marketItemId && m.isActive !== false);
+      if (!item || item.category !== 'vip') {
+        return callback?.({ success: false, error: 'VIP-товар недоступен' });
+      }
+
+      const days = Number(item.vipDuration) || 7;
+      const price = Number(item.price) || 0;
+
+      const change = await changeBalance(userId, 'shop_buy', -price, {
+        itemId: item.id,
+        itemName: item.name,
+        category: 'vip',
+        days,
+      });
+      if (!change.success) {
+        return callback?.({ success: false, error: change.error });
+      }
+
+      // Продлеваем VIP: если уже активен — прибавляем к текущей дате
+      const now = Date.now();
+      const currentUntil = userData[userId].vipUntil ? new Date(userData[userId].vipUntil).getTime() : 0;
+      const baseTime = currentUntil > now ? currentUntil : now;
+      const vipEnd = new Date(baseTime + days * 24 * 60 * 60 * 1000);
+      userData[userId].vipUntil = vipEnd.toISOString();
+
+      saveUserData(userId);
+
+      console.log(`👑 ${userId} купил VIP «${item.name}» на ${days} дн. за ${price} (до ${vipEnd.toISOString()})`);
+
+      const sId = onlineUsers.get(userId);
+      if (sId) {
+        io.to(sId).emit('user-data-updated', userData[userId]);
+      }
+
+      callback?.({
+        success: true,
+        newBalance: change.newBalance,
+        vipUntil: userData[userId].vipUntil,
+      });
+    } finally {
+      buyLocks.delete(userId);
+    }
+  });
+
   // --- РЫНОК / ОБЪЯВЛЕНИЯ ---
 socket.on('get-market-listings', () => {
   socket.emit('market-listings', marketListings);

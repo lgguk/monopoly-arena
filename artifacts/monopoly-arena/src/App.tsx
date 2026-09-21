@@ -3061,7 +3061,23 @@ const buyVip = (vip: MarketItem) => {
                           setTimeout(() => setNotice(""), 10000);
                           return;
                         }
-                        buyVip(vip);
+                        const userId = getSessionUserId();
+                        if (!userId) {
+                          setNotice("Ошибка: не найден ID игрока");
+                          return;
+                        }
+                        socket.emit('shop-buy-vip', { userId, marketItemId: vip.id }, (res: any) => {
+                          if (res?.success) {
+                            localStorage.setItem("arena-coins", String(res.newBalance));
+                            if (res.vipUntil) localStorage.setItem("arena-vip-until", res.vipUntil);
+                            const untilDate = new Date(res.vipUntil).toLocaleDateString("ru-RU");
+                            setNotice(`👑 VIP активирован до ${untilDate}!`);
+                            setTimeout(() => setNotice(""), 5000);
+                          } else {
+                            setNotice(`❌ ${res?.error || 'Не удалось купить'}`);
+                            setTimeout(() => setNotice(""), 6000);
+                          }
+                        });
                       }}
                       className={`rounded-lg px-3.5 py-2 text-xs font-bold ${
                         isGuest

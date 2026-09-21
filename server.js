@@ -1130,6 +1130,99 @@ socket.on('get-user-data', (userId, callback) => {
       buyLocks.delete(userId);
     }
   });
+  
+  // ---- ОТКРЫТИЕ КЕЙСА ИЗ ИНВЕНТАРЯ ----
+  socket.on('open-case', async ({ userId, caseItemId }, callback) => {
+    if (!userId || !caseItemId) return callback?.({ success: false, error: 'Некорректный запрос' });
+    if (!userData[userId]) return callback?.({ success: false, error: 'Игрок не найден' });
+    if (buyLocks.has(userId)) return callback?.({ success: false, error: 'Подождите, обрабатывается другая операция' });
+    buyLocks.add(userId);
+    try {
+      const inv = userData[userId].inventory || [];
+      const caseIdx = inv.findIndex((it) => it.id === caseItemId && it.rarity === 'Кейс');
+      if (caseIdx === -1) return callback?.({ success: false, error: 'Кейс не найден в инвентаре' });
+
+      const caseItem = inv[caseIdx];
+      // Ищем кейс по имени (в adminCases id у кейса — timestamp, а у предмета — свой id)
+      const caseData = adminCases.find((c) => c.name === caseItem.name && c.isActive !== false);
+      if (!caseData) return callback?.({ success: false, error: 'Кейс недоступен' });
+
+      // Ищем доступные предметы для дропа
+      const availableItems = (caseData.items || [])
+        .map((id) => marketItems.find((m) => m.id === id && m.isActive !== false))
+        .filter(Boolean);
+      if (availableItems.length === 0) {
+        return callback?.({ success: false, error: 'В кейсе нет доступных предметов' });
+      }
+
+      // Рандомим дроп
+      const drop = availableItems[Math.floor(Math.random() * availableItems.length)];
+
+      let dropName = drop.name;
+      let dropItem = null;
+
+      if (drop.category === 'vip') {
+        // VIP — продлеваем, в инвентарь не кладём
+        const days = Number(drop.vipDuration) || 7;
+        const now = Date.now();
+        const currentUntil = userData[userId].vipUntil ? new Date(userData[userId].vipUntil).getTime() : 0;
+        const baseTime = currentUntil > now ? currentUntil : now;
+        const vipEnd = new Date(baseTime + days * 24 * 60 * 60 * 1000);
+        userData[userId].vipUntil = vipEnd.toISOString();
+        dropName = `${drop.name} (VIP +${days} дн.)`;
+      } else {
+        // Обычный предмет — в инвентарь
+        dropItem = {
+          id: `${drop.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          name: drop.name,
+          type: drop.category === 'dice' ? 'dice' : 'board',
+          rarity: drop.rarity,
+          color: '#29233e',
+          price: drop.price,
+          description: drop.description || (drop.category === 'dice' ? 'Скин кубиков' : 'Карточка поля'),
+          ownedAt: new Date().toISOString(),
+          slotIndex: drop.slotIndex,
+          imageDataUrl: drop.imageDataUrl,
+          marketItemId: drop.id,
+          cardWidth: drop.cardWidth,
+          cardHeight: drop.cardHeight,
+          imageHeight: drop.imageHeight,
+          shopScale: drop.shopScale,
+        };
+      }
+
+      // Убираем кейс из инвентаря
+      inv.splice(caseIdx, 1);
+      // Добавляем дроп, если это не VIP
+      if (dropItem) inv.push(dropItem);
+
+      // Логируем дроп в transactions (без изменения баланса, amount = 0)
+      await logTransaction(userId, 'case_drop', 0, {
+        caseName: caseData.name,
+        dropName: drop.name,
+        dropCategory: drop.category,
+      });
+
+      saveUserData(userId);
+
+      console.log(`🎁 ${userId} открыл кейс «${caseData.name}» → «${dropName}»`);
+
+      const sId = onlineUsers.get(userId);
+      if (sId) {
+        io.to(sId).emit('user-data-updated', userData[userId]);
+        io.to(sId).emit('user-inventory-updated', userData[userId].inventory);
+      }
+
+      callback?.({
+        success: true,
+        dropItem,
+        dropName,
+        userData: userData[userId],
+      });
+    } finally {
+      buyLocks.delete(userId);
+    }
+  });
 
   // --- РЫНОК / ОБЪЯВЛЕНИЯ ---
 socket.on('get-market-listings', () => {

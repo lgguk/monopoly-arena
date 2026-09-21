@@ -3135,105 +3135,26 @@ const getRecommendedPrice = (item: OwnedItem): number => {
   return 100;
 };
 const openCase = (caseItem: OwnedItem) => {
-  // Находим кейс по имени
-  const safeCasesData = Array.isArray(casesData) ? casesData.filter(c => c !== null && c !== undefined) : [];
-const caseData = safeCasesData.find(c => c.name === caseItem.name);
-  if (!caseData || !caseData.items || caseData.items.length === 0) {
-    setNotice("В этом кейсе нет предметов для выпадения.");
-    return;
-  }
-
-  // Выбираем случайный предмет из списка
-  const availableItems = Array.isArray(marketItems) ? marketItems.filter(item => item.isActive && caseData.items.includes(item.id)) : [];
-  if (availableItems.length === 0) {
-    setNotice("В этом кейсе нет доступных предметов.");
-    return;
-  }
-
-  const drop = availableItems[Math.floor(Math.random() * availableItems.length)];
-
-  // Создаём объект выигранного предмета
-  let dropItem: OwnedItem;
-  if (drop.category === "vip") {
-  const currentVipUntil = localStorage.getItem("arena-vip-until");
-  const now = Date.now();
-  let baseTime = now;
-  if (currentVipUntil && new Date(currentVipUntil) > new Date(now)) {
-    baseTime = new Date(currentVipUntil).getTime();
-  }
-  const vipEnd = new Date(baseTime + (drop.vipDuration || 7) * 24 * 60 * 60 * 1000);
-  localStorage.setItem("arena-vip-until", vipEnd.toISOString());
-  
-  // Отправляем на сервер
   const userId = getSessionUserId();
-  if (userId) {
-    socket.emit('save-user-data', {
-      userId,
-      newData: {
-        ...JSON.parse(localStorage.getItem("arena-user-data-" + userId) || "{}"),
-        vipUntil: vipEnd.toISOString()
+  if (!userId) {
+    setNotice("Ошибка: не найден ID игрока");
+    return;
+  }
+  socket.emit('open-case', { userId, caseItemId: caseItem.id }, (res: any) => {
+    if (res?.success) {
+      setNotice(`🎉 Кейс «${caseItem.name}» открыт! Выпало: «${res.dropName}»`);
+      // Синхронизируем localStorage из свежих данных сервера
+      if (res.userData) {
+        localStorage.setItem("arena-user-data-" + userId, JSON.stringify(res.userData));
+        localStorage.setItem("arena-inventory", JSON.stringify(res.userData.inventory || []));
+        if (res.userData.vipUntil) {
+          localStorage.setItem("arena-vip-until", res.userData.vipUntil);
+        }
       }
-    });
-  }
-  
-  setNotice(`VIP продлён до ${vipEnd.toLocaleDateString("ru-RU")}!`);
-  return; // Не добавляем в инвентарь
-
-      } else if (drop.category === "dice") {
-    dropItem = {
-      id: `dice-${Date.now()}`,
-      name: drop.name,
-      type: "dice",
-      rarity: drop.rarity,
-      color: "#32786d",
-      price: drop.price,
-      description: "Скин кубиков",
-      ownedAt: new Date().toISOString(),
-      imageDataUrl: drop.imageDataUrl,
-      marketItemId: drop.id,
-      cardWidth: drop.cardWidth,
-      cardHeight: drop.cardHeight,
-      imageHeight: drop.imageHeight,
-      shopScale: drop.shopScale,
-    } as any;
-  } else {
-    dropItem = {
-      id: `card-${Date.now()}`,
-      name: drop.name,
-      type: "board",
-      rarity: drop.rarity,
-      color: "#29233e",
-      price: drop.price,
-      description: "Карточка поля",
-      ownedAt: new Date().toISOString(),
-      slotIndex: drop.slotIndex,
-      imageDataUrl: drop.imageDataUrl,
-      marketItemId: drop.id,
-      cardWidth: drop.cardWidth,
-      cardHeight: drop.cardHeight,
-      imageHeight: drop.imageHeight,
-      shopScale: drop.shopScale,
-    } as any;
-  }
-
-  // Убираем кейс из инвентаря, добавляем выигранный предмет
-  const updatedInventory = inventory.filter(i => i.id !== caseItem.id);
-  const newInventory = [...updatedInventory, dropItem];
-  setInventory(newInventory);
-
-  // Отправляем на сервер
-  const userId = getSessionUserId();
-  if (userId) {
-    socket.emit('save-user-data', { 
-      userId, 
-      newData: { 
-        ...JSON.parse(localStorage.getItem("arena-user-data-" + userId) || "{}"),
-        inventory: newInventory
-      } 
-    });
-  }
-
-  setNotice(`🎉 Кейс «${caseItem.name}» открыт! Выпал предмет: «${dropItem.name}»!`);
+    } else {
+      setNotice(`❌ ${res?.error || 'Не удалось открыть кейс'}`);
+    }
+  });
 };
       const apply = (item: OwnedItem) => {
   const newSkins = { ...active.activeSkins };
@@ -4272,6 +4193,9 @@ resolveGameDesigns(cleanPlayers);
             localStorage.setItem("arena-inventory", JSON.stringify(res.data.inventory || []));
             localStorage.setItem("arena-stats", JSON.stringify(res.data.stats || {}));
             if (res.data.vipUntil) localStorage.setItem("arena-vip-until", res.data.vipUntil);
+            else localStorage.removeItem("arena-vip-until");
+            // Сообщаем шапке, что кошелёк изменился
+            window.dispatchEvent(new Event("arena-wallet-updated"));
           }
         });
       }
@@ -10462,6 +10386,48 @@ function AppShell({
   const [mobileNav, setMobileNav] = useState(false);
 const [notifications, setNotifications] = useState<{ text: string; timestamp: number; read: boolean }[]>([]);
 const [showNotifications, setShowNotifications] = useState(false);
+
+// Кошелёк и VIP для плашки в шапке
+const [walletCoins, setWalletCoins] = useState<number>(() => {
+  try { return Number(localStorage.getItem("arena-coins") || 0); } catch { return 0; }
+});
+const [walletVipUntil, setWalletVipUntil] = useState<string | null>(() => {
+  try { return localStorage.getItem("arena-vip-until"); } catch { return null; }
+});
+
+useEffect(() => {
+  const refresh = () => {
+    try {
+      setWalletCoins(Number(localStorage.getItem("arena-coins") || 0));
+      setWalletVipUntil(localStorage.getItem("arena-vip-until"));
+    } catch {}
+  };
+  // 1) изменения в этой же вкладке (эмитим вручную)
+  window.addEventListener("arena-wallet-updated", refresh);
+  // 2) изменения в других вкладках
+  window.addEventListener("storage", refresh);
+  // 3) приходят с сервера после покупок/квестов/рынка
+  const onUserData = (data: any) => {
+    if (!data) return;
+    try {
+      if (typeof data.coins === "number") {
+        localStorage.setItem("arena-coins", String(data.coins));
+      }
+      if (data.vipUntil !== undefined) {
+        if (data.vipUntil) localStorage.setItem("arena-vip-until", data.vipUntil);
+        else localStorage.removeItem("arena-vip-until");
+      }
+    } catch {}
+    refresh();
+  };
+  socket.on("user-data-updated", onUserData);
+  refresh();
+  return () => {
+    window.removeEventListener("arena-wallet-updated", refresh);
+    window.removeEventListener("storage", refresh);
+    socket.off("user-data-updated", onUserData);
+  };
+}, []);
 const [serverStatus, setServerStatus] = useState<"online" | "maintenance">(() => {
   try {
     const saved = localStorage.getItem("arena-server-status");
@@ -10659,6 +10625,25 @@ useEffect(() => {
             </div>
           </div>
           <div className="flex items-center gap-2 ml-[20px] mr-[20px]">
+            {name && !isAdmin && (
+              <div className="hidden items-center gap-1.5 rounded-xl bg-[#f3e7c8] px-3 py-1.5 text-xs font-bold text-[#7e5f1d] sm:flex">
+                <Coins size={14} />
+                <span className="font-mono">{walletCoins.toLocaleString("ru-RU")}</span>
+                {(() => {
+                  if (!walletVipUntil) return null;
+                  const end = new Date(walletVipUntil);
+                  if (end < new Date()) return null;
+                  const daysLeft = Math.ceil((end.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+                  return (
+                    <>
+                      <span className="mx-1 text-[#7e5f1d]/40">·</span>
+                      <Crown size={14} />
+                      <span className="font-mono">{daysLeft}д</span>
+                    </>
+                  );
+                })()}
+              </div>
+            )}
             <button className="hidden rounded-lg p-1.5 text-muted-foreground hover:bg-muted sm:block">
               <CircleHelp size={16} />
             </button>

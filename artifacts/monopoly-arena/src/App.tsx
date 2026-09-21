@@ -2962,34 +2962,21 @@ const buyVip = (vip: MarketItem) => {
                           setTimeout(() => setNotice(""), 10000);
                           return;
                         }
-                        const price = item.price;
-                        const coinsNow = Number(localStorage.getItem("arena-coins") || 2400);
-                        if (coinsNow < price) { setNotice("Не хватает Coins."); return; }
-                         const owned: OwnedItem = {
-                          id: `${item.id}-${Date.now()}`,
-                          name: item.name,
-                          type: "board",
-                          rarity: item.rarity,
-                          color: "#29233e",
-                          price: item.price,
-                          description: `Заменяет слот ${slotNum}`,
-                          ownedAt: new Date().toISOString(),
-                          slotIndex: slotNum,
-                          imageDataUrl: item.imageDataUrl,
-                          marketItemId: item.id,
-                          cardWidth: item.cardWidth,
-                          cardHeight: item.cardHeight,
-                          imageHeight: item.imageHeight,
-                          shopScale: item.shopScale,
-                        } as any;
-                        const inv = JSON.parse(localStorage.getItem("arena-inventory") || "[]");
-                        localStorage.setItem("arena-inventory", JSON.stringify([...inv, owned]));
-                        localStorage.setItem("arena-coins", String(coinsNow - price));
-                        const uid = getSessionUserId();
-                        if (uid) {
-                          socket.emit('save-user-data', { userId: uid, newData: { ...JSON.parse(localStorage.getItem("arena-user-data-" + uid) || "{}"), inventory: [...inv, owned], coins: coinsNow - price } });
+                        const userId = getSessionUserId();
+                        if (!userId) {
+                          setNotice("Ошибка: не найден ID игрока");
+                          return;
                         }
-                        setNotice(`«${item.name}» добавлен в инвентарь!`);
+                        socket.emit('shop-buy-card', { userId, marketItemId: item.id }, (res: any) => {
+                          if (res?.success) {
+                            localStorage.setItem("arena-coins", String(res.newBalance));
+                            setNotice(`«${item.name}» добавлен в инвентарь!`);
+                            setTimeout(() => setNotice(""), 4000);
+                          } else {
+                            setNotice(`❌ ${res?.error || 'Не удалось купить'}`);
+                            setTimeout(() => setNotice(""), 6000);
+                          }
+                        });
                       }}
                       className={`rounded-lg px-3.5 py-2 text-xs font-bold ${
                         isGuest

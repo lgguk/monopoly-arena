@@ -137,13 +137,99 @@ try {
   }
 })();
 
-try {
-  if (fs.existsSync(USER_DATA_FILE)) {
-    userData = JSON.parse(fs.readFileSync(USER_DATA_FILE, 'utf8'));
-    console.log(`✅ Данные пользователей загружены: ${Object.keys(userData).length}`);
+async function loadUserDataFromDb() {
+  try {
+    const usersRes = await db.query('SELECT id FROM users');
+    const userIds = usersRes.rows.map((r) => r.id);
+
+    for (const uid of userIds) {
+      // Основные поля
+      const udRes = await db.query('SELECT * FROM user_data WHERE user_id = $1', [uid]);
+      const base = udRes.rows[0] || {};
+
+      // Инвентарь
+      const invRes = await db.query(
+        'SELECT market_item_id, item_data, owned_at FROM inventory WHERE user_id = $1',
+        [uid]
+      );
+      const inventory = invRes.rows.map((r) => ({
+        ...r.item_data,
+        marketItemId: r.market_item_id || r.item_data?.marketItemId,
+        ownedAt: r.owned_at ? new Date(r.owned_at).toISOString() : undefined,
+      }));
+
+      // Активные скины
+      const skinsRes = await db.query(
+        'SELECT slot_index, market_item_id FROM active_skins WHERE user_id = $1',
+        [uid]
+      );
+      const activeSkins = {};
+      skinsRes.rows.forEach((r) => { activeSkins[r.slot_index] = r.market_item_id; });
+
+      // Друзья (accepted)
+      const friendsRes = await db.query(
+        "SELECT friend_id FROM friendships WHERE user_id = $1 AND status = 'accepted'",
+        [uid]
+      );
+      const friends = friendsRes.rows.map((r) => r.friend_id);
+
+      // Входящие заявки (pending, где я — получатель)
+      const reqsRes = await db.query(
+        "SELECT user_id, created_at FROM friendships WHERE friend_id = $1 AND status = 'pending'",
+        [uid]
+      );
+      const friendRequests = reqsRes.rows.map((r) => ({
+        fromId: r.user_id,
+        timestamp: new Date(r.created_at).getTime(),
+      }));
+
+      // Квесты
+      const questsRes = await db.query(
+        'SELECT day_key, quest_id, done, claimed FROM quest_progress WHERE user_id = $1',
+        [uid]
+      );
+      let quests = null;
+      if (questsRes.rows.length > 0) {
+        const dayKey = questsRes.rows[0].day_key;
+        const items = {};
+        questsRes.rows.forEach((r) => { items[r.quest_id] = { done: r.done, claimed: r.claimed }; });
+        quests = { dayKey, items };
+      }
+
+      // Уведомления
+      const notifRes = await db.query(
+        'SELECT text, read, created_at FROM notifications WHERE user_id = $1 ORDER BY created_at DESC',
+        [uid]
+      );
+      const notifications = notifRes.rows.map((r) => ({
+        text: r.text,
+        read: r.read,
+        timestamp: new Date(r.created_at).getTime(),
+      }));
+
+      userData[uid] = {
+        coins: Number(base.coins) || 2400,
+        stats: base.stats || { games: 0, wins: 0, xp: 0, level: 0 },
+        vipUntil: base.vip_until ? new Date(base.vip_until).toISOString() : null,
+        minutesOnline: Number(base.minutes_online) || 0,
+        inventory,
+        activeSkins,
+        friends,
+        friendRequests,
+        quests,
+        notifications,
+      };
+    }
+    console.log(`✅ Данные пользователей загружены из БД: ${Object.keys(userData).length}`);
+  } catch (err) {
+    console.error('❌ Ошибка загрузки userData из БД, fallback на JSON:', err.message);
+    try {
+      if (fs.existsSync(USER_DATA_FILE)) {
+        userData = JSON.parse(fs.readFileSync(USER_DATA_FILE, 'utf8'));
+        console.log(`⚠️  Данные пользователей загружены из JSON (fallback): ${Object.keys(userData).length}`);
+      }
+    } catch (e) {}
   }
-} catch (err) {
-  console.error('Ошибка загрузки данных пользователей:', err);
 }
 
 // Сохранение users в БД. Всё, что было в памяти, синхронизируется через UPSERT.
@@ -295,6 +381,26 @@ async function logTransaction(userId, type, amount, metadata = {}) {
   } catch (err) {
     console.error(`❌ Ошибка записи транзакции (${type} для ${userId}):`, err);
   }
+}
+
+// Единая точка изменения баланса Coins.
+// Все операции (квесты, магазин, рынок, VIP, будущие депозиты) идут через неё.
+// Возвращает { success, newBalance } или { success: false, error }.
+async function changeBalance(userId, type, amount, metadata = {}) {
+  const d = userData[userId];
+  if (!d) return { success: false, error: 'Игрок не найден' };
+
+  const current = Number(d.coins) || 0;
+  const next = current + amount;
+
+  // Не даём уйти в минус (для списаний). Для начислений — без ограничений.
+  if (next < 0) {
+    return { success: false, error: 'Недостаточно Coins' };
+  }
+
+  d.coins = next;
+  await logTransaction(userId, type, amount, metadata);
+  return { success: true, newBalance: next };
 }
 
 // Загрузка admin_settings из БД. JSON остаётся fallback'ом, если БД недоступна.
@@ -684,33 +790,128 @@ socket.on('get-user-data', (userId, callback) => {
     io.emit('custom-items-updated', marketItems);
     console.log(`🛍  Админ обновил товары (${marketItems.length})`);
   });
+  
+  // ---- ПОКУПКА КАРТОЧКИ ИЗ МАГАЗИНА ----
+  socket.on('shop-buy-card', async ({ userId, marketItemId }, callback) => {
+    if (!userId || !marketItemId) return callback?.({ success: false, error: 'Некорректный запрос' });
+    if (!userData[userId]) return callback?.({ success: false, error: 'Игрок не найден' });
+
+    // Проверяем, что товар есть и активен
+    const item = marketItems.find((m) => m.id === marketItemId && m.isActive !== false);
+    if (!item || item.category !== 'card') {
+      return callback?.({ success: false, error: 'Товар недоступен' });
+    }
+
+    // Проверяем, что слот свободен (нельзя дважды купить одну карточку на один слот)
+    const slot = Number(item.slotIndex);
+    const alreadyOwned = (userData[userId].inventory || []).some(
+      (it) => Number(it.slotIndex) === slot && it.marketItemId === item.id
+    );
+    if (alreadyOwned) {
+      return callback?.({ success: false, error: 'Эта карточка уже есть в инвентаре' });
+    }
+
+    // Списываем Coins через changeBalance
+    const change = await changeBalance(userId, 'shop_buy', -item.price, {
+      itemId: item.id,
+      itemName: item.name,
+      category: 'card',
+    });
+    if (!change.success) {
+      return callback?.({ success: false, error: change.error });
+    }
+
+    // Добавляем предмет в инвентарь
+    const ownedItem = {
+      id: `${item.id}-${Date.now()}`,
+      name: item.name,
+      type: 'board',
+      rarity: item.rarity,
+      color: '#29233e',
+      price: item.price,
+      description: `Заменяет слот ${slot}`,
+      ownedAt: new Date().toISOString(),
+      slotIndex: slot,
+      imageDataUrl: item.imageDataUrl,
+      marketItemId: item.id,
+      cardWidth: item.cardWidth,
+      cardHeight: item.cardHeight,
+      imageHeight: item.imageHeight,
+      shopScale: item.shopScale,
+    };
+    if (!userData[userId].inventory) userData[userId].inventory = [];
+    userData[userId].inventory.push(ownedItem);
+
+    saveUserData(userId);
+
+    console.log(`🛍  ${userId} купил карточку «${item.name}» за ${item.price} (баланс: ${change.newBalance})`);
+
+    // Обновляем клиента
+    const sId = onlineUsers.get(userId);
+    if (sId) {
+      io.to(sId).emit('user-data-updated', userData[userId]);
+      io.to(sId).emit('user-inventory-updated', userData[userId].inventory);
+    }
+
+    callback?.({
+      success: true,
+      newBalance: change.newBalance,
+      ownedItem,
+      userData: userData[userId],
+    });
+  });
   // --- РЫНОК / ОБЪЯВЛЕНИЯ ---
 socket.on('get-market-listings', () => {
   socket.emit('market-listings', marketListings);
 });
 
 socket.on('add-market-listing', async (data, callback) => {
-  if (!data || !data.item || !data.price) return;
-  // data: { item, price, seller, sellerId }
+  if (!data || !data.item || !data.price || !data.sellerId) {
+    return callback?.({ success: false, error: 'Некорректные данные' });
+  }
+  const sellerId = data.sellerId;
+  if (!userData[sellerId]) return callback?.({ success: false, error: 'Продавец не найден' });
+
+  // Ищем предмет в инвентаре продавца
+  const inv = userData[sellerId].inventory || [];
+  const idx = inv.findIndex((it) => it.id === data.item.id);
+  if (idx === -1) {
+    return callback?.({ success: false, error: 'Предмет не найден в инвентаре' });
+  }
+
+  // Удаляем из инвентаря в памяти (сервер — источник правды)
+  inv.splice(idx, 1);
+  saveUserData(sellerId);
+
   const newListing = {
     id: `listing-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     item: data.item,
     seller: data.seller,
-    sellerId: data.sellerId,
+    sellerId,
     price: data.price,
     createdAt: Date.now()
   };
   marketListings.push(newListing);
+
   try {
     await db.query(
       `INSERT INTO market_listings (id, seller_id, item_data, price, created_at)
        VALUES ($1,$2,$3,$4,$5)`,
-      [newListing.id, newListing.sellerId || null, JSON.stringify(newListing.item), newListing.price, newListing.createdAt]
+      [newListing.id, newListing.sellerId, JSON.stringify(newListing.item), newListing.price, newListing.createdAt]
     );
   } catch (err) {
     console.error('Ошибка сохранения объявления в БД:', err);
   }
+
+  // Обновляем инвентарь продавца на клиенте
+  const sId = onlineUsers.get(sellerId);
+  if (sId) {
+    io.to(sId).emit('user-inventory-updated', inv);
+    io.to(sId).emit('user-data-updated', userData[sellerId]);
+  }
+
   io.emit('market-listings-updated', marketListings);
+  console.log(`📦 ${sellerId} выставил на рынок «${data.item.name}» за ${data.price}`);
   if (callback) callback({ success: true, listing: newListing });
 });
 
@@ -766,13 +967,27 @@ socket.on('buy-market-listing', async (data, callback) => {
   const seller = userData[sellerId];
   if (!seller) return callback?.({ success: false, error: 'Продавец не найден' });
 
-  // Переводим монеты
-  buyer.coins -= listing.price;
-  seller.coins += listing.price;
+  // Переводим монеты через changeBalance (единая точка + проверки)
+  const buyResult = await changeBalance(buyerId, 'market_buy', -listing.price, {
+    listingId: listing.id,
+    itemName: listing.item?.name,
+  });
+  if (!buyResult.success) {
+    return callback?.({ success: false, error: buyResult.error });
+  }
 
-  // Пишем транзакции: у покупателя списание, у продавца начисление
-  logTransaction(buyerId, 'market_buy', -listing.price, { listingId: listing.id, itemName: listing.item?.name });
-  logTransaction(sellerId, 'market_sell', listing.price, { listingId: listing.id, itemName: listing.item?.name });
+  const sellResult = await changeBalance(sellerId, 'market_sell', listing.price, {
+    listingId: listing.id,
+    itemName: listing.item?.name,
+  });
+  if (!sellResult.success) {
+    // Откатываем списание покупателя — редко, но возможно
+    await changeBalance(buyerId, 'market_buy_refund', listing.price, {
+      reason: 'seller_credit_failed',
+      listingId: listing.id,
+    });
+    return callback?.({ success: false, error: sellResult.error });
+  }
 
   // Если это VIP-товар, продлеваем VIP, иначе добавляем в инвентарь
   if (listing.item.category === "vip") {
@@ -1208,7 +1423,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     callback?.({ success: true, dayKey: q.dayKey, items });
   });
 
-  socket.on('claim-quest', ({ userId, questId }, callback) => {
+  socket.on('claim-quest', async ({ userId, questId }, callback) => {
     if (!userId || !questId || !userData[userId]) return callback?.({ success: false });
     ensureQuestsFresh(userId);
     const q = userData[userId].quests;
@@ -1220,10 +1435,12 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     if (!def) return callback?.({ success: false, error: 'Квест не найден' });
 
     item.claimed = true;
-    userData[userId].coins = (userData[userId].coins || 0) + def.reward;
+    const change = await changeBalance(userId, 'quest_claim', def.reward, { questId });
+    if (!change.success) {
+      return callback?.({ success: false, error: change.error });
+    }
     saveUserData();
-    logTransaction(userId, 'quest_claim', def.reward, { questId });
-    console.log(`💰 ${userId} забрал ${def.reward} Coins за "${questId}" (баланс: ${userData[userId].coins})`);
+    console.log(`💰 ${userId} забрал ${def.reward} Coins за "${questId}" (баланс: ${change.newBalance})`);
 
     // Уведомляем клиента об обновлении данных и квестов
     const sId = onlineUsers.get(userId);
@@ -1352,6 +1569,7 @@ const PORT = process.env.PORT || 8080;
   await loadMarketItems();
   await loadCardDesigns();
   await loadMarketListings();
+  await loadUserDataFromDb();
 
   try {
     const res = await db.query('SELECT * FROM users ORDER BY created_at');
@@ -1367,6 +1585,15 @@ const PORT = process.env.PORT || 8080;
         createdAt: Number(r.created_at),
       }));
       console.log(`✅ Пользователи загружены из БД: ${users.length}`);
+
+      // Чистим userData от «сирот» — тех, кого нет в users.
+      // Иначе saveUserData() без параметра падает на FK constraint.
+      const validIds = new Set(users.map((u) => u.id));
+      const orphans = Object.keys(userData).filter((id) => !validIds.has(id));
+      if (orphans.length > 0) {
+        orphans.forEach((id) => delete userData[id]);
+        console.log(`🧹 Удалено «сирот» из userData: ${orphans.length}`);
+      }
     } else {
       console.log('⚠️  БД пуста — используем JSON-данные');
     }

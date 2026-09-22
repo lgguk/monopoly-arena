@@ -1570,6 +1570,88 @@ socket.on('get-user-data', (userId, callback) => {
 
     callback?.({ success: true });
   });
+  
+  // ============ КОШЕЛЁК (ИСТОРИЯ ТРАНЗАКЦИЙ) ============
+
+  // UI-фильтры маппятся в SQL-условия по типу транзакции.
+  const WALLET_FILTER_MAP = {
+    all: null,
+    rewards: ['quest_claim', 'game_reward'],
+    shop: ['shop_buy'],
+    market: ['market_buy', 'market_sell', 'market_buy_refund'],
+    deposit: ['deposit'],
+  };
+
+  socket.on('get-transactions', ({ userId, filter = 'all', limit = 20, offset = 0 }, callback) => {
+    if (!userId) return callback?.({ success: false, error: 'Нет userId' });
+    (async () => {
+      try {
+        const params = [userId];
+        let where = "user_id = $1 AND type != 'case_drop'"; // дропы — не в кошельке
+
+        const typeList = WALLET_FILTER_MAP[filter];
+        if (Array.isArray(typeList)) {
+          params.push(typeList);
+          where += ` AND type = ANY($${params.length})`;
+        }
+
+        const res = await db.query(
+          `SELECT id, type, amount, metadata, created_at
+           FROM transactions
+           WHERE ${where}
+           ORDER BY created_at DESC
+           LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+          [...params, Number(limit) || 20, Number(offset) || 0]
+        );
+
+        const countRes = await db.query(
+          `SELECT COUNT(*) FROM transactions WHERE ${where}`,
+          params
+        );
+
+        callback?.({
+          success: true,
+          transactions: res.rows.map((r) => ({
+            id: String(r.id),
+            type: r.type,
+            amount: Number(r.amount),
+            metadata: r.metadata || {},
+            createdAt: new Date(r.created_at).getTime(),
+          })),
+          total: Number(countRes.rows[0].count),
+        });
+      } catch (err) {
+        console.error('❌ Ошибка get-transactions:', err);
+        callback?.({ success: false, error: 'Ошибка загрузки' });
+      }
+    })();
+  });
+
+  socket.on('get-wallet-summary', (userId, callback) => {
+    if (!userId) return callback?.({ success: false });
+    (async () => {
+      try {
+        const res = await db.query(
+          `SELECT
+             COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS income,
+             COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0) AS expense
+           FROM transactions
+           WHERE user_id = $1
+             AND type != 'case_drop'
+             AND created_at > NOW() - INTERVAL '30 days'`,
+          [userId]
+        );
+        callback?.({
+          success: true,
+          income: Number(res.rows[0].income),
+          expense: Number(res.rows[0].expense),
+        });
+      } catch (err) {
+        console.error('❌ Ошибка get-wallet-summary:', err);
+        callback?.({ success: false });
+      }
+    })();
+  });
 
   // --- РЫНОК / ОБЪЯВЛЕНИЯ ---
 socket.on('get-market-listings', () => {

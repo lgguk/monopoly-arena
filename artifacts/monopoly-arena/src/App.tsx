@@ -3187,6 +3187,287 @@ function TradeItemMiniCard({
     </div>
   );
 }
+type WalletTransaction = {
+  id: string;
+  type: string;
+  amount: number;
+  metadata: any;
+  createdAt: number;
+};
+
+function WalletModal({ onClose }: { onClose: () => void }) {
+  const [coins, setCoins] = useState<number>(() => {
+    try { return Number(localStorage.getItem("arena-coins") || 0); } catch { return 0; }
+  });
+  const [filter, setFilter] = useState<"all" | "rewards" | "shop" | "market" | "deposit">("all");
+  const [transactions, setTransactions] = useState<WalletTransaction[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [summary, setSummary] = useState<{ income: number; expense: number }>({ income: 0, expense: 0 });
+  const [showDepositStub, setShowDepositStub] = useState(false);
+
+  const PAGE_SIZE = 20;
+  const userId = getSessionUserId();
+
+  const fetchTransactions = (offset = 0, replace = true) => {
+    if (!userId) return;
+    setLoading(true);
+    socket.emit(
+      "get-transactions",
+      { userId, filter, limit: PAGE_SIZE, offset },
+      (res: any) => {
+        setLoading(false);
+        if (res?.success) {
+          setTotal(res.total || 0);
+          setTransactions((prev) => (replace ? res.transactions : [...prev, ...res.transactions]));
+        }
+      }
+    );
+  };
+
+  const fetchSummary = () => {
+    if (!userId) return;
+    socket.emit("get-wallet-summary", userId, (res: any) => {
+      if (res?.success) {
+        setSummary({ income: res.income, expense: res.expense });
+      }
+    });
+  };
+
+  useEffect(() => {
+    fetchTransactions(0, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter]);
+
+  useEffect(() => {
+    fetchSummary();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const refresh = () => {
+      try { setCoins(Number(localStorage.getItem("arena-coins") || 0)); } catch {}
+    };
+    window.addEventListener("arena-wallet-updated", refresh);
+    window.addEventListener("storage", refresh);
+    const onUserData = (data: any) => {
+      if (data && typeof data.coins === "number") {
+        try { localStorage.setItem("arena-coins", String(data.coins)); } catch {}
+      }
+      refresh();
+    };
+    socket.on("user-data-updated", onUserData);
+    return () => {
+      window.removeEventListener("arena-wallet-updated", refresh);
+      window.removeEventListener("storage", refresh);
+      socket.off("user-data-updated", onUserData);
+    };
+  }, []);
+
+  const formatDate = (ts: number) => {
+    const d = new Date(ts);
+    return d.toLocaleDateString("ru-RU", { day: "numeric", month: "long" }) +
+      ", " +
+      d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  };
+
+  const txIcon = (t: string) => {
+    switch (t) {
+      case "quest_claim": return "💰";
+      case "game_reward": return "🏆";
+      case "shop_buy": return "🛍";
+      case "market_buy": return "🛒";
+      case "market_sell": return "💵";
+      case "market_buy_refund": return "↩️";
+      case "deposit": return "🏦";
+      default: return "•";
+    }
+  };
+
+  const txTitle = (tx: WalletTransaction) => {
+    const m = tx.metadata || {};
+    switch (tx.type) {
+      case "quest_claim": {
+        const names: Record<string, string> = {
+          dailyLogin: "Заход в игру",
+          playGame: "Сыграна партия",
+          winGame: "Победа в партии",
+          buyProperty: "Куплено поле",
+          improveProperty: "Улучшено поле",
+        };
+        return `Квест: ${names[m.questId] || m.questId || "выполнен"}`;
+      }
+      case "game_reward":
+        return m.place === 1 ? "🏆 1 место в партии" : `🏆 ${m.place}-е место в партии`;
+      case "shop_buy":
+        return `Магазин: ${m.itemName || "покупка"}${m.category === "vip" ? ` (VIP ${m.days || 7} дн.)` : ""}`;
+      case "market_buy":
+        return `Рынок: покупка «${m.itemName || "?"}»`;
+      case "market_sell":
+        return `Рынок: продажа «${m.itemName || "?"}»`;
+      case "market_buy_refund":
+        return `Возврат за «${m.itemName || "?"}»`;
+      case "deposit":
+        return "Пополнение кошелька";
+      default:
+        return tx.type;
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#29233e]/60 p-4 backdrop-blur-sm">
+      <div className="flex max-h-[calc(100dvh-2rem)] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-card-border bg-card shadow-2xl">
+        {/* Заголовок */}
+        <div className="flex items-start justify-between border-b border-border px-6 py-4">
+          <div>
+            <div className="font-mono text-[10px] uppercase tracking-[.2em] text-primary">
+              кошелёк
+            </div>
+            <h2 className="mt-1 font-display text-2xl font-bold">История транзакций</h2>
+          </div>
+          <button onClick={onClose} className="rounded-lg p-2 text-muted-foreground hover:bg-muted">
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Баланс + пополнение + сводка */}
+        <div className="border-b border-border px-6 py-4">
+          <div className="flex flex-wrap items-stretch gap-3">
+            <div className="flex-1 rounded-xl bg-[#f3e7c8] px-4 py-3">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-[#7e5f1d]">
+                Баланс
+              </div>
+              <div className="mt-1 flex items-center gap-2 font-mono text-2xl font-bold text-[#7e5f1d]">
+                <Coins size={20} />
+                {coins.toLocaleString("ru-RU")}
+              </div>
+            </div>
+            <button
+              onClick={() => setShowDepositStub(true)}
+              className="flex shrink-0 items-center gap-2 rounded-xl bg-primary px-5 text-sm font-bold text-primary-foreground hover:brightness-95"
+            >
+              <Plus size={16} />
+              Пополнить
+            </button>
+          </div>
+
+          <div className="mt-3 grid grid-cols-2 gap-3">
+            <div className="rounded-xl bg-[#dceae3]/60 px-3 py-2">
+              <div className="text-[9px] font-bold uppercase text-accent">Приход · 30 дней</div>
+              <div className="font-mono text-lg font-bold text-accent">
+                +{summary.income.toLocaleString("ru-RU")}
+              </div>
+            </div>
+            <div className="rounded-xl bg-[#f6dfd7]/60 px-3 py-2">
+              <div className="text-[9px] font-bold uppercase text-primary">Расход · 30 дней</div>
+              <div className="font-mono text-lg font-bold text-primary">
+                −{summary.expense.toLocaleString("ru-RU")}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Фильтры */}
+        <div className="border-b border-border px-6 py-3">
+          <div className="flex flex-wrap gap-1.5">
+            {[
+              ["all", "Все"],
+              ["rewards", "Награды"],
+              ["shop", "Магазин"],
+              ["market", "Рынок"],
+              ["deposit", "Пополнения"],
+            ].map(([id, label]) => (
+              <button
+                key={id}
+                onClick={() => setFilter(id as any)}
+                className={`rounded-lg px-3 py-1.5 text-xs font-bold transition-colors ${
+                  filter === id
+                    ? "bg-[#29233e] text-white"
+                    : "bg-muted text-muted-foreground hover:bg-muted/70"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Список транзакций */}
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-3">
+          {transactions.length === 0 && !loading && (
+            <div className="py-12 text-center text-sm text-muted-foreground">
+              Пока транзакций нет
+            </div>
+          )}
+
+          <div className="space-y-1">
+            {transactions.map((tx) => (
+              <div
+                key={tx.id}
+                className="flex items-center gap-3 rounded-xl px-3 py-2.5 transition-colors hover:bg-muted/60"
+              >
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-lg">
+                  {txIcon(tx.type)}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-bold">{txTitle(tx)}</div>
+                  <div className="text-[10px] text-muted-foreground">{formatDate(tx.createdAt)}</div>
+                </div>
+                <div
+                  className={`shrink-0 font-mono text-sm font-bold ${
+                    tx.amount > 0 ? "text-accent" : tx.amount < 0 ? "text-primary" : "text-muted-foreground"
+                  }`}
+                >
+                  {tx.amount > 0 ? "+" : ""}
+                  {tx.amount.toLocaleString("ru-RU")}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {loading && (
+            <div className="py-4 text-center text-xs text-muted-foreground">Загрузка…</div>
+          )}
+        </div>
+
+        {/* Пагинация */}
+        {transactions.length > 0 && transactions.length < total && (
+          <div className="border-t border-border px-6 py-3">
+            <button
+              onClick={() => fetchTransactions(transactions.length, false)}
+              disabled={loading}
+              className="w-full rounded-xl border border-input bg-card py-2.5 text-xs font-bold text-muted-foreground hover:bg-muted disabled:opacity-50"
+            >
+              {loading ? "Загрузка…" : `Показать ещё ${Math.min(PAGE_SIZE, total - transactions.length)}`}
+            </button>
+          </div>
+        )}
+
+        {/* Заглушка пополнения */}
+        {showDepositStub && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-[#29233e]/80 p-4 backdrop-blur-sm">
+            <div className="w-full max-w-sm rounded-2xl border border-card-border bg-card p-6 text-center shadow-2xl">
+              <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-[#f3e7c8] text-2xl">
+                🏦
+              </div>
+              <h3 className="mt-4 font-display text-xl font-bold">Пополнение скоро</h3>
+              <p className="mt-2 text-sm text-muted-foreground">
+                Мы подключаем платёжную систему. Совсем скоро вы сможете пополнять кошелёк картой и через СБП.
+              </p>
+              <button
+                onClick={() => setShowDepositStub(false)}
+                className="mt-5 w-full rounded-xl bg-primary py-2.5 text-xs font-bold text-primary-foreground"
+              >
+                Понятно
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 
 function TradeCreateModal({
   sourceItem,
@@ -4399,7 +4680,7 @@ function Market() {
   );
 }
 
-function Profile({ onInventory, player }: { onInventory: () => void; player?: AuthUser | null }) {
+function Profile({ onInventory, onOpenWallet, player }: { onInventory: () => void; onOpenWallet?: () => void; player?: AuthUser | null }) {
   const [name, setName] = useState(player?.name || "Гость");
   const [saved, setSaved] = useState(false);
   const userData = useMemo(() => {
@@ -4490,14 +4771,24 @@ function Profile({ onInventory, player }: { onInventory: () => void; player?: Au
 })()}
         </div>
         <div className="rounded-2xl border border-card-border bg-card p-6">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-2">
             <h2 className="font-display text-xl font-bold">Настройки игрока</h2>
-            <button
-              onClick={onInventory}
-              className="flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-xs font-bold"
-            >
-              <Package size={14} /> Инвентарь · {inventory.length}
-            </button>
+            <div className="flex items-center gap-2">
+              {onOpenWallet && (
+                <button
+                  onClick={onOpenWallet}
+                  className="flex items-center gap-2 rounded-lg bg-[#f3e7c8] px-3 py-2 text-xs font-bold text-[#7e5f1d] hover:brightness-95"
+                >
+                  <Coins size={14} /> Кошелёк
+                </button>
+              )}
+              <button
+                onClick={onInventory}
+                className="flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-xs font-bold"
+              >
+                <Package size={14} /> Инвентарь · {inventory.length}
+              </button>
+            </div>
           </div>
           <div className="mt-5 grid gap-4 sm:grid-cols-2">
             <label className="text-xs font-bold">
@@ -11040,6 +11331,7 @@ function AppShell({
   isAdmin = false,
   gameMode = false,
   incomingTradesCount = 0,
+  onOpenWallet,
 }: {
   tab: Tab;
   setTab: (tab: Tab) => void;
@@ -11050,10 +11342,12 @@ function AppShell({
   isAdmin?: boolean;
   gameMode?: boolean;
   incomingTradesCount?: number;
+  onOpenWallet?: () => void;
 }) {
   const [mobileNav, setMobileNav] = useState(false);
 const [notifications, setNotifications] = useState<{ text: string; timestamp: number; read: boolean }[]>([]);
 const [showNotifications, setShowNotifications] = useState(false);
+const [profileMenuOpen, setProfileMenuOpen] = useState(false);
 
 // Кошелёк и VIP для плашки в шапке
 const [walletCoins, setWalletCoins] = useState<number>(() => {
@@ -11381,25 +11675,59 @@ useEffect(() => {
             <div className="flex items-center gap-2">
               {name ? (
                 <>
-                  <Avatar
-                    initials={isAdmin ? "АД" : initials}
-                    color={isAdmin ? "#e96852" : "#32786d"}
-                    size="sm"
-                  />
-                  <span className="hidden text-xs font-bold sm:block">
-  {name}
-  {isVipActive() && (
-    <span className="ml-1 rounded bg-[#d3a247] px-1 py-0.5 text-[9px] font-bold text-white">
-      VIP
-    </span>
-  )}
-</span>
-                  <button
-                    onClick={onLogout}
-                    className="hidden rounded-lg border border-input px-2 py-1.5 font-bold sm:block text-[14px] border-t-[1.2px] border-r-[1.2px] border-b-[1.2px] border-l-[1.2px] pl-[15px] pr-[15px]"
-                  >
-                    Выйти
-                  </button>
+                  <div className="relative">
+                    <button
+                      onClick={() => setProfileMenuOpen((v) => !v)}
+                      className="flex items-center gap-2 rounded-lg px-2 py-1 transition-colors hover:bg-muted"
+                    >
+                      <Avatar
+                        initials={isAdmin ? "АД" : initials}
+                        color={isAdmin ? "#e96852" : "#32786d"}
+                        size="sm"
+                      />
+                      <span className="hidden text-xs font-bold sm:block">
+                        {name}
+                        {isVipActive() && (
+                          <span className="ml-1 rounded bg-[#d3a247] px-1 py-0.5 text-[9px] font-bold text-white">
+                            VIP
+                          </span>
+                        )}
+                      </span>
+                      <ChevronDown size={12} className="hidden text-muted-foreground sm:block" />
+                    </button>
+                    {profileMenuOpen && (
+                      <>
+                        <div
+                          className="fixed inset-0 z-40"
+                          onClick={() => setProfileMenuOpen(false)}
+                        />
+                        <div className="absolute right-0 top-full z-50 mt-1 w-48 overflow-hidden rounded-xl border border-card-border bg-card shadow-2xl">
+                          {!isAdmin && onOpenWallet && (
+                            <button
+                              onClick={() => {
+                                onOpenWallet();
+                                setProfileMenuOpen(false);
+                              }}
+                              className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs font-bold transition-colors hover:bg-muted"
+                            >
+                              <Coins size={14} className="text-[#b18428]" />
+                              Кошелёк
+                            </button>
+                          )}
+                          <button
+                            onClick={() => {
+                              setProfileMenuOpen(false);
+                              onLogout();
+                            }}
+                            className="flex w-full items-center gap-2 border-t border-border px-3 py-2.5 text-left text-xs font-bold text-muted-foreground transition-colors hover:bg-muted"
+                          >
+                            <LogOut size={14} />
+                            Выйти
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
                 </>
               ) : (
                 <button
@@ -11475,10 +11803,10 @@ const [currentRoomId, setCurrentRoomId] = useState<string | null>(null);
   );
   const [createOpen, setCreateOpen] = useState(false);
   const [findOpen, setFindOpen] = useState(false);
-    const [pendingChatFriend, setPendingChatFriend] = useState<{ id: string; name: string; online: boolean } | null>(null);
+  const [pendingChatFriend, setPendingChatFriend] = useState<{ id: string; name: string; online: boolean } | null>(null);
   const [activeGame, setActiveGame] = useState<{ roomId: string; roomName: string; disconnected: boolean } | null>(null);
-    const [incomingTradesCount, setIncomingTradesCount] = useState(0);
-
+  const [incomingTradesCount, setIncomingTradesCount] = useState(0);
+  const [walletOpen, setWalletOpen] = useState(false);
   useEffect(() => {
     if (!player?.id) {
       setIncomingTradesCount(0);
@@ -11699,7 +12027,7 @@ if (data.activeSkins && typeof data.activeSkins === "object") {
         adminContent = <Shop />;
         break;
       case "profile":
-        adminContent = <Profile onInventory={() => setTab("inventory")} player={player} />;
+        adminContent = <Profile onInventory={() => setTab("inventory")} onOpenWallet={() => setWalletOpen(true)} player={player} />;
         break;
       case "inventory":
         adminContent = <Inventory onMarket={() => setTab("market")} />;
@@ -11737,6 +12065,7 @@ if (data.activeSkins && typeof data.activeSkins === "object") {
         isAdmin={true}
         onLogout={logout}
         incomingTradesCount={incomingTradesCount}
+        onOpenWallet={() => setWalletOpen(true)}
       >
         {adminContent}
       </AppShell>
@@ -11803,7 +12132,7 @@ if (data.activeSkins && typeof data.activeSkins === "object") {
     ) : tab === "shop" ? (
       <Shop />
     ) : tab === "profile" ? (
-      <Profile onInventory={() => setTab("inventory")} player={player} />
+      <Profile onInventory={() => setTab("inventory")} onOpenWallet={() => setWalletOpen(true)} player={player} />
     ) : tab === "inventory" ? (
       <Inventory onMarket={() => setTab("market")} />
     ) : tab === "market" ? (
@@ -11820,6 +12149,7 @@ if (data.activeSkins && typeof data.activeSkins === "object") {
         onLogin={() => setAuthOpen(true)}
         onLogout={logout}
         incomingTradesCount={incomingTradesCount}
+        onOpenWallet={() => setWalletOpen(true)}
       >
         {content}
       </AppShell>
@@ -11832,6 +12162,7 @@ if (data.activeSkins && typeof data.activeSkins === "object") {
           onSuccess={onAuthSuccess}
         />
       )}
+      {walletOpen && <WalletModal onClose={() => setWalletOpen(false)} />}
     </>
   );
 }

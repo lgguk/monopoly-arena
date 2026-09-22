@@ -621,6 +621,11 @@ async function finalizeGame(roomId) {
       markQuestDone(p.id, 'playGame');
       if (place === 1) markQuestDone(p.id, 'winGame');
       await saveUserData(p.id);
+
+      // Уведомление
+      const placeWord = place === 1 ? "1 место" : `${place}-е место`;
+      const dropInfo = dropName ? ` Дроп: «${dropName}».` : "";
+      await notifyUser(p.id, `🏆 Партия завершена: ${placeWord}, +${coins} Coins, +${xp} XP.${dropInfo}`);
     }
 
     results.push({ userId: p.id, place, coins, xp, dropName, leftAlive: false });
@@ -638,6 +643,39 @@ function maybeFinalize(roomId) {
   if (players.length === 0) return;
   const aliveCount = players.filter(p => !p.bankrupt).length;
   if (aliveCount <= 1) finalizeGame(roomId);
+}
+// Отправляет игроку уведомление: пишет в БД и эмитит socket, если он онлайн.
+// Используется для событий, которые игрок не инициировал сам:
+// - награда за партию
+// - продажа предмета на рынке
+// - обмены (запрос, принятие, отклонение, отмена)
+// - друзья (заявки, принятие)
+async function notifyUser(userId, text) {
+  if (!userId || !userData[userId]) return;
+  try {
+    if (!userData[userId].notifications) userData[userId].notifications = [];
+    const notif = { text, timestamp: Date.now(), read: false };
+    userData[userId].notifications.push(notif);
+    // Держим последние 50 уведомлений
+    if (userData[userId].notifications.length > 50) {
+      userData[userId].notifications = userData[userId].notifications.slice(-50);
+    }
+
+    // Пишем в БД
+    await db.query(
+      `INSERT INTO notifications (user_id, text, read, created_at)
+       VALUES ($1, $2, false, NOW())`,
+      [userId, text]
+    );
+
+    // Эмитим онлайн-игроку
+    const sId = onlineUsers.get(userId);
+    if (sId) {
+      io.to(sId).emit('new-notification', userData[userId].notifications);
+    }
+  } catch (err) {
+    console.error(`❌ Ошибка notifyUser для ${userId}:`, err);
+  }
 }
 
 // Загрузка admin_settings из БД. JSON остаётся fallback'ом, если БД недоступна.
@@ -1441,6 +1479,14 @@ socket.on('get-user-data', (userId, callback) => {
     if (fromSocket) io.to(fromSocket).emit('trades-updated');
     if (toSocket) io.to(toSocket).emit('trades-updated');
 
+    // Уведомление получателю о новом обмене
+    const myItemsText = myItems.map((it) => it.name).join(", ") || "ничего";
+    const theirItemsText = theirItems.map((it) => it.name).join(", ") || "ничего";
+    await notifyUser(
+      toUserId,
+      `🤝 Новый обмен от ${userData[fromUserId].name}: вы отдаёте [${theirItemsText}], получаете [${myItemsText}].`
+    );
+
     callback?.({ success: true, tradeId: dbId });
   });
 
@@ -1500,6 +1546,12 @@ socket.on('get-user-data', (userId, callback) => {
 
     console.log(`✅ Обмен #${trade.id} принят`);
 
+    // Уведомление отправителю — обмен принят
+    await notifyUser(
+      trade.fromUserId,
+      `✅ Обмен принят! Предметы переехали в ваш инвентарь.`
+    );
+
     // Уведомляем обе стороны
     const fromSocket = onlineUsers.get(trade.fromUserId);
     const toSocket = onlineUsers.get(trade.toUserId);
@@ -1536,6 +1588,12 @@ socket.on('get-user-data', (userId, callback) => {
 
     console.log(`❌ Обмен #${trade.id} отклонён`);
 
+    // Уведомление отправителю
+    await notifyUser(
+      trade.fromUserId,
+      `❌ Обмен отклонён. Предметы разблокированы.`
+    );
+
     const fromSocket = onlineUsers.get(trade.fromUserId);
     const toSocket = onlineUsers.get(trade.toUserId);
     if (fromSocket) io.to(fromSocket).emit('trades-updated');
@@ -1562,6 +1620,12 @@ socket.on('get-user-data', (userId, callback) => {
     saveUserData(trade.toUserId);
 
     console.log(`🚫 Обмен #${trade.id} отменён`);
+
+    // Уведомление получателю
+    await notifyUser(
+      trade.toUserId,
+      `🚫 Отправитель отменил обмен.`
+    );
 
     const fromSocket = onlineUsers.get(trade.fromUserId);
     const toSocket = onlineUsers.get(trade.toUserId);
@@ -1648,6 +1712,73 @@ socket.on('get-user-data', (userId, callback) => {
         });
       } catch (err) {
         console.error('❌ Ошибка get-wallet-summary:', err);
+        callback?.({ success: false });
+      }
+    })();
+  });
+  
+  // ============ ИСТОРИЯ (ОБМЕНЫ + ДРОПЫ) ============
+
+  // Завершённые обмены игрока. Отдаём последние 30.
+  socket.on('get-trade-history', (userId, callback) => {
+    if (!userId) return callback?.({ success: false });
+    (async () => {
+      try {
+        const res = await db.query(
+          `SELECT id, from_user_id, to_user_id, from_items, to_items, status, created_at, resolved_at
+           FROM trades
+           WHERE (from_user_id = $1 OR to_user_id = $1)
+             AND status != 'pending'
+           ORDER BY resolved_at DESC NULLS LAST
+           LIMIT 30`,
+          [userId]
+        );
+        callback?.({
+          success: true,
+          trades: res.rows.map((r) => ({
+            id: String(r.id),
+            fromUserId: r.from_user_id,
+            toUserId: r.to_user_id,
+            fromItems: r.from_items || [],
+            toItems: r.to_items || [],
+            status: r.status,
+            createdAt: new Date(r.created_at).getTime(),
+            resolvedAt: r.resolved_at ? new Date(r.resolved_at).getTime() : null,
+          })),
+        });
+      } catch (err) {
+        console.error('❌ Ошибка get-trade-history:', err);
+        callback?.({ success: false });
+      }
+    })();
+  });
+
+  // Дропы из кейсов. Тянем из transactions (type = 'case_drop').
+  // Отдаём последние 50.
+  socket.on('get-case-drops', (userId, callback) => {
+    if (!userId) return callback?.({ success: false });
+    (async () => {
+      try {
+        const res = await db.query(
+          `SELECT id, metadata, created_at
+           FROM transactions
+           WHERE user_id = $1 AND type = 'case_drop'
+           ORDER BY created_at DESC
+           LIMIT 50`,
+          [userId]
+        );
+        callback?.({
+          success: true,
+          drops: res.rows.map((r) => ({
+            id: String(r.id),
+            caseName: r.metadata?.caseName || '?',
+            dropName: r.metadata?.dropName || '?',
+            dropCategory: r.metadata?.dropCategory || 'card',
+            createdAt: new Date(r.created_at).getTime(),
+          })),
+        });
+      } catch (err) {
+        console.error('❌ Ошибка get-case-drops:', err);
         callback?.({ success: false });
       }
     })();
@@ -1822,6 +1953,12 @@ socket.on('buy-market-listing', async (data, callback) => {
   // Уведомляем покупателя и продавца об обновлении их данных
   if (onlineUsers.has(buyerId)) io.to(onlineUsers.get(buyerId)).emit('user-data-updated', buyer);
   if (onlineUsers.has(sellerId)) io.to(onlineUsers.get(sellerId)).emit('user-data-updated', seller);
+
+  // Уведомление продавцу — кто-то купил его предмет
+  await notifyUser(
+    sellerId,
+    `💵 Ваш предмет «${listing.item?.name || "?"}» куплен за ${listing.price} Coins.`
+  );
 
   if (callback) callback({ success: true, item: listing.item });
 });

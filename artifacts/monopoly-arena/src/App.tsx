@@ -167,6 +167,7 @@ type Trade = {
   toItems: TradeItemSnapshot[];
   status: "pending" | "accepted" | "declined" | "cancelled";
   createdAt: number;
+  resolvedAt?: number | null;
 };
 type AuthUser = {
   id: string;
@@ -3816,9 +3817,26 @@ function Inventory({ onMarket }: { onMarket: () => void }) {
     const [sellTarget, setSellTarget] = useState<OwnedItem | null>(null);
   const [sellPrice, setSellPrice] = useState("");
     // ============ ОБМЕНЫ ============
-  const [inventoryTab, setInventoryTab] = useState<"items" | "trades">("items");
+  const [inventoryTab, setInventoryTab] = useState<"items" | "trades" | "history">("items");
   const [outgoingTrades, setOutgoingTrades] = useState<Trade[]>([]);
   const [incomingTrades, setIncomingTrades] = useState<Trade[]>([]);
+
+  // ============ ИСТОРИЯ ============
+  const [tradeHistory, setTradeHistory] = useState<Trade[]>([]);
+  const [caseDrops, setCaseDrops] = useState<
+    { id: string; caseName: string; dropName: string; dropCategory: string; createdAt: number }[]
+  >([]);
+
+  const fetchHistory = () => {
+    const userId = getSessionUserId();
+    if (!userId) return;
+    socket.emit("get-trade-history", userId, (res: any) => {
+      if (res?.success) setTradeHistory(res.trades || []);
+    });
+    socket.emit("get-case-drops", userId, (res: any) => {
+      if (res?.success) setCaseDrops(res.drops || []);
+    });
+  };
   const [tradeCreateOpen, setTradeCreateOpen] = useState(false);
   const [tradeSourceItem, setTradeSourceItem] = useState<OwnedItem | null>(null);
 
@@ -3841,6 +3859,12 @@ function Inventory({ onMarket }: { onMarket: () => void }) {
       socket.off("trades-updated", handler);
     };
   }, []);
+    useEffect(() => {
+    if (inventoryTab === "history") {
+      fetchHistory();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inventoryTab]);
     // Нормализация: если старый state без activeSkins — добавим пустой объект
   useEffect(() => {
     if (!active.activeSkins) {
@@ -4003,6 +4027,14 @@ const deactivate = (item: OwnedItem) => {
               {outgoingTrades.length + incomingTrades.length}
             </span>
           )}
+        </button>
+        <button
+          onClick={() => setInventoryTab("history")}
+          className={`rounded-lg px-4 py-2 text-xs font-bold transition-colors ${
+            inventoryTab === "history" ? "bg-card shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          История
         </button>
       </div>
 
@@ -4309,6 +4341,134 @@ const deactivate = (item: OwnedItem) => {
             setTimeout(() => setNotice(""), 3000);
           }}
         />
+      )}
+
+      {inventoryTab === "history" && (
+        <div className="space-y-8">
+          {/* Завершённые обмены */}
+          <div>
+            <h3 className="mb-3 font-display text-lg font-bold">
+              Обмены ({tradeHistory.length})
+            </h3>
+            {tradeHistory.length === 0 && (
+              <div className="rounded-2xl border border-dashed border-card-border bg-card p-8 text-center text-sm text-muted-foreground">
+                Здесь появятся завершённые обмены
+              </div>
+            )}
+            <div className="space-y-3">
+              {tradeHistory.map((t) => {
+                const iGave = t.fromUserId === currentUserId;
+                const iReceived = iGave ? t.toItems : t.fromItems;
+                const iSent = iGave ? t.fromItems : t.toItems;
+                const statusText =
+                  t.status === "accepted"
+                    ? "✅ Принят"
+                    : t.status === "declined"
+                      ? "❌ Отклонён"
+                      : t.status === "cancelled"
+                        ? "🚫 Отменён"
+                        : t.status;
+                const counterpart = iGave ? t.toUserId : t.fromUserId;
+                return (
+                  <div key={t.id} className="rounded-2xl border border-card-border bg-card p-4">
+                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-xs font-bold">
+                        {iGave ? "С" : "От"}{" "}
+                        <span className="font-mono">{counterpart}</span>
+                        <span className="ml-2 text-muted-foreground">
+                          ·{" "}
+                          {t.resolvedAt
+                            ? new Date(t.resolvedAt).toLocaleDateString("ru-RU", {
+                                day: "numeric",
+                                month: "short",
+                                hour: "2-digit",
+                                minute: "2-digit",
+                              })
+                            : ""}
+                        </span>
+                      </div>
+                      <span className="rounded-lg bg-muted px-2 py-1 text-[10px] font-bold">
+                        {statusText}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="rounded-lg bg-[#f6dfd7]/40 p-2">
+                        <div className="mb-2 text-[10px] font-bold uppercase text-primary">
+                          Вы отдали
+                        </div>
+                        <div
+                          className="grid gap-2"
+                          style={{ gridTemplateColumns: "repeat(auto-fill, minmax(80px, 1fr))" }}
+                        >
+                          {iSent.map((it) => (
+                            <TradeItemMiniCard key={it.id} item={it} getMarketPrice={getMarketPrice} tone="primary" />
+                          ))}
+                          {iSent.length === 0 && (
+                            <div className="text-[10px] italic text-muted-foreground">ничего</div>
+                          )}
+                        </div>
+                      </div>
+                      <div className="rounded-lg bg-[#dceae3]/40 p-2">
+                        <div className="mb-2 text-[10px] font-bold uppercase text-accent">
+                          Вы получили
+                        </div>
+                        <div
+                          className="grid gap-2"
+                          style={{ gridTemplateColumns: "repeat(auto-fill, minmax(80px, 1fr))" }}
+                        >
+                          {iReceived.map((it) => (
+                            <TradeItemMiniCard key={it.id} item={it} getMarketPrice={getMarketPrice} tone="accent" />
+                          ))}
+                          {iReceived.length === 0 && (
+                            <div className="text-[10px] italic text-muted-foreground">ничего</div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Дропы из кейсов */}
+          <div>
+            <h3 className="mb-3 font-display text-lg font-bold">
+              Дропы из кейсов ({caseDrops.length})
+            </h3>
+            {caseDrops.length === 0 && (
+              <div className="rounded-2xl border border-dashed border-card-border bg-card p-8 text-center text-sm text-muted-foreground">
+                Здесь появятся ваши дропы
+              </div>
+            )}
+            <div className="space-y-1.5">
+              {caseDrops.map((d) => (
+                <div
+                  key={d.id}
+                  className="flex items-center gap-3 rounded-xl border border-card-border bg-card px-3 py-2.5"
+                >
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-lg">
+                    {d.dropCategory === "vip" ? "👑" : d.dropCategory === "dice" ? "🎲" : "🎁"}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-bold">
+                      {d.dropName}
+                    </div>
+                    <div className="text-[10px] text-muted-foreground">
+                      Из кейса «{d.caseName}» ·{" "}
+                      {new Date(d.createdAt).toLocaleDateString("ru-RU", {
+                        day: "numeric",
+                        month: "short",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       )}
 
       {sellTarget && (
@@ -11331,6 +11491,7 @@ function AppShell({
   isAdmin = false,
   gameMode = false,
   incomingTradesCount = 0,
+  friendRequestsCount = 0,
   onOpenWallet,
 }: {
   tab: Tab;
@@ -11342,6 +11503,7 @@ function AppShell({
   isAdmin?: boolean;
   gameMode?: boolean;
   incomingTradesCount?: number;
+  friendRequestsCount?: number;
   onOpenWallet?: () => void;
 }) {
   const [mobileNav, setMobileNav] = useState(false);
@@ -11484,8 +11646,10 @@ useEffect(() => {
                     {incomingTradesCount}
                   </span>
                 )}
-                {id === "friends" && (
-                  <span className="ml-auto h-2 w-2 rounded-full bg-[#e7ba68]" />
+                {id === "friends" && friendRequestsCount > 0 && (
+                  <span className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[#e7ba68] px-1 text-[9px] font-bold text-[#29233e]">
+                    {friendRequestsCount}
+                  </span>
                 )}
               </button>
             ))}
@@ -11806,6 +11970,25 @@ const [currentRoomId, setCurrentRoomId] = useState<string | null>(null);
   const [pendingChatFriend, setPendingChatFriend] = useState<{ id: string; name: string; online: boolean } | null>(null);
   const [activeGame, setActiveGame] = useState<{ roomId: string; roomName: string; disconnected: boolean } | null>(null);
   const [incomingTradesCount, setIncomingTradesCount] = useState(0);
+  const [friendRequestsCount, setFriendRequestsCount] = useState(0);
+
+  useEffect(() => {
+    if (!player?.id || player.guest) {
+      setFriendRequestsCount(0);
+      return;
+    }
+    const fetch = () => {
+      socket.emit("get-friend-requests", player.id, (res: any) => {
+        if (res?.success) setFriendRequestsCount((res.requests || []).length);
+      });
+    };
+    fetch();
+    // Обновляем счётчик при любых событиях друзей
+    socket.on("friend-status-changed", fetch);
+    return () => {
+      socket.off("friend-status-changed", fetch);
+    };
+  }, [player?.id, player?.guest]);
   const [walletOpen, setWalletOpen] = useState(false);
   useEffect(() => {
     if (!player?.id) {
@@ -12065,6 +12248,7 @@ if (data.activeSkins && typeof data.activeSkins === "object") {
         isAdmin={true}
         onLogout={logout}
         incomingTradesCount={incomingTradesCount}
+        friendRequestsCount={friendRequestsCount}
         onOpenWallet={() => setWalletOpen(true)}
       >
         {adminContent}
@@ -12149,6 +12333,7 @@ if (data.activeSkins && typeof data.activeSkins === "object") {
         onLogin={() => setAuthOpen(true)}
         onLogout={logout}
         incomingTradesCount={incomingTradesCount}
+        friendRequestsCount={friendRequestsCount}
         onOpenWallet={() => setWalletOpen(true)}
       >
         {content}

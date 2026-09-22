@@ -1937,6 +1937,23 @@ socket.on('add-market-listing', async (data, callback) => {
     }
   }
 
+  // Проверяем лимит цены по редкости. Максимум — безлимит.
+  const PRICE_MIN_BY_RARITY = {
+    common: 25,
+    rare: 150,
+    epic: 500,
+    legendary: 2000,
+  };
+  const rarityKey = String(itemToSell.rarity || 'common').toLowerCase();
+  const minPrice = PRICE_MIN_BY_RARITY[rarityKey] || 1;
+  const priceNum = Number(data.price);
+  if (!Number.isFinite(priceNum) || priceNum < minPrice) {
+    return callback?.({
+      success: false,
+      error: `Минимальная цена для «${itemToSell.rarity}» — ${minPrice} Coins`,
+    });
+  }
+
   // Удаляем из инвентаря в памяти (сервер — источник правды)
   inv.splice(idx, 1);
   saveUserData(sellerId);

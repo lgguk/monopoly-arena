@@ -2998,20 +2998,6 @@ const buyVip = (vip: MarketItem) => {
           </button>
         </div>
       )}
-            <div className="mb-5 flex gap-2 rounded-xl bg-muted p-1 w-fit">
-  <button
-    onClick={() => setSection("cases")}
-    className={`rounded-lg px-4 py-2 text-xs font-bold ${section === "cases" ? "bg-card shadow-sm" : "text-muted-foreground"}`}
-  >
-    Кейсы
-  </button>
-  <button
-    onClick={() => setSection("cards")}
-    className={`rounded-lg px-4 py-2 text-xs font-bold ${section === "cards" ? "bg-card shadow-sm" : "text-muted-foreground"}`}
-  >
-    Карточки
-  </button>
-</div>
                   <div className="grid gap-5" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(185px, 1fr))" }}>
                 {section === "cases" &&
           cases.map((product) => {

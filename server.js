@@ -2006,10 +2006,16 @@ socket.on('remove-market-listing', async (data, callback) => {
 
 socket.on('buy-market-listing', async (data, callback) => {
   // data: { listingId, buyerId }
-  const listing = marketListings.find(l => l.id === data.listingId);
-  if (!listing) return callback?.({ success: false, error: 'Объявление не найдено' });
-
   const buyerId = data.buyerId;
+  if (!buyerId) return callback?.({ success: false, error: 'Некорректный запрос' });
+
+  // Защита от двойного клика / React StrictMode
+  if (buyLocks.has(buyerId)) return callback?.({ success: false, error: 'Подождите, обрабатывается другая операция' });
+  buyLocks.add(buyerId);
+
+  try {
+    const listing = marketListings.find(l => l.id === data.listingId);
+    if (!listing) return callback?.({ success: false, error: 'Объявление не найдено' });
   const sellerId = listing.sellerId;
 
   // Проверяем покупателя
@@ -2025,7 +2031,11 @@ socket.on('buy-market-listing', async (data, callback) => {
   const seller = userData[sellerId];
   if (!seller) return callback?.({ success: false, error: 'Продавец не найден' });
 
-  // Переводим монеты через changeBalance (единая точка + проверки)
+  // Комиссия платформы 10%. Продавец получает 90%, остальное сжигается.
+  const COMMISSION = 0.10;
+  const sellerPayout = Math.round(listing.price * (1 - COMMISSION));
+
+  // Покупатель платит полную стоимость
   const buyResult = await changeBalance(buyerId, 'market_buy', -listing.price, {
     listingId: listing.id,
     itemName: listing.item?.name,
@@ -2034,9 +2044,12 @@ socket.on('buy-market-listing', async (data, callback) => {
     return callback?.({ success: false, error: buyResult.error });
   }
 
-  const sellResult = await changeBalance(sellerId, 'market_sell', listing.price, {
+  // Продавец получает 90%
+  const sellResult = await changeBalance(sellerId, 'market_sell', sellerPayout, {
     listingId: listing.id,
     itemName: listing.item?.name,
+    commission: listing.price - sellerPayout,
+    grossPrice: listing.price,
   });
   if (!sellResult.success) {
     // Откатываем списание покупателя — редко, но возможно
@@ -2071,9 +2084,15 @@ socket.on('buy-market-listing', async (data, callback) => {
   }
   io.emit('market-listings-updated', marketListings);
 
-  // Уведомляем покупателя и продавца об обновлении их данных
-  if (onlineUsers.has(buyerId)) io.to(onlineUsers.get(buyerId)).emit('user-data-updated', buyer);
-  if (onlineUsers.has(sellerId)) io.to(onlineUsers.get(sellerId)).emit('user-data-updated', seller);
+  // Уведомляем покупателя и продавца об обновлении данных и инвентаря
+  if (onlineUsers.has(buyerId)) {
+    io.to(onlineUsers.get(buyerId)).emit('user-data-updated', buyer);
+    io.to(onlineUsers.get(buyerId)).emit('user-inventory-updated', buyer.inventory);
+  }
+  if (onlineUsers.has(sellerId)) {
+    io.to(onlineUsers.get(sellerId)).emit('user-data-updated', seller);
+    io.to(onlineUsers.get(sellerId)).emit('user-inventory-updated', seller.inventory);
+  }
 
   // Уведомление продавцу — кто-то купил его предмет
   await notifyUser(
@@ -2086,6 +2105,9 @@ socket.on('buy-market-listing', async (data, callback) => {
   markQuestProgress(sellerId, 'marketDeal');
 
   if (callback) callback({ success: true, item: listing.item });
+  } finally {
+    buyLocks.delete(buyerId);
+  }
 });
 
 socket.on('admin-save-cases', async (newCases) => {

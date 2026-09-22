@@ -4617,6 +4617,14 @@ const deactivate = (item: OwnedItem) => {
                  <span className="mt-1 block text-[10px] text-muted-foreground">
                 Рекомендуемая цена: {getRecommendedPrice(sellTarget)} Coins
               </span>
+              {Number(sellPrice) > 0 && (
+                <div className="mt-2 rounded-lg bg-[#f3e7c8]/60 px-3 py-2 text-[11px] leading-4 text-[#7e5f1d]">
+                  Выставить за <b>{Number(sellPrice).toLocaleString("ru-RU")}</b> Coins.
+                  <br />
+                  Вы получите: <b>{Math.round(Number(sellPrice) * 0.9).toLocaleString("ru-RU")}</b> Coins
+                  <span className="text-[#7e5f1d]/70"> (−10% комиссия платформы)</span>
+                </div>
+              )}
             </label>
             <div className="mt-5 flex justify-end gap-2">
               <button
@@ -4738,7 +4746,7 @@ function Market() {
   });
 };
   const buy = (listing: Listing) => {
-      if (listing.sellerId === currentUserId) return;
+  if (listing.sellerId === currentUserId) return;
   if (coins < listing.price) {
     setNotice("Недостаточно Coins для этой сделки.");
     return;
@@ -4746,42 +4754,32 @@ function Market() {
   socket.emit('buy-market-listing', { listingId: listing.id, buyerId: currentUserId || "you" }, (response: any) => {
     if (response?.success) {
       const purchasedItem = response.item;
-      // Если это VIP-товар, продлеваем VIP и не добавляем в инвентарь
-            if (purchasedItem.category === "vip") {
+      // VIP-товар — продлеваем локально, инвентарь придёт с сервера
+      if (purchasedItem.category === "vip") {
         const vipDuration = purchasedItem.vipDuration || 7;
         const currentVipUntil = localStorage.getItem("arena-vip-until");
         let baseTime = (currentVipUntil && new Date(currentVipUntil) > new Date()) ? new Date(currentVipUntil).getTime() : Date.now();
         const vipEnd = new Date(baseTime + vipDuration * 24 * 60 * 60 * 1000);
         localStorage.setItem("arena-vip-until", vipEnd.toISOString());
+        window.dispatchEvent(new Event("arena-wallet-updated"));
         setNotice(`VIP продлён до ${vipEnd.toLocaleDateString("ru-RU")}!`);
-        setCoins(coins - listing.price);
-
-        const vipItem: OwnedItem = {
-          id: `vip-${Date.now()}`,
-          name: purchasedItem.name,
-          type: "board",
-          rarity: "VIP",
-          color: "#d3a247",
-          price: purchasedItem.price,
-          description: purchasedItem.description || `VIP на ${vipDuration} дней`,
-          ownedAt: new Date().toISOString(),
-          vipDuration,
-        };
-        const updatedInv = [...inventory, vipItem];
-        setInventory(updatedInv);
-
-        if (currentUserId) {
-          socket.emit('save-user-data', { userId: currentUserId, newData: { ...JSON.parse(localStorage.getItem("arena-user-data-" + currentUserId) || "{}"), coins: coins - listing.price, vipUntil: vipEnd.toISOString(), inventory: updatedInv } });
-        }
       } else {
-        // Обычный предмет - добавляем в инвентарь
-        const updatedInventory = [...inventory, { ...purchasedItem, id: `${purchasedItem.id}-${Date.now()}`, ownedAt: new Date().toISOString() }];
-        setCoins(coins - listing.price);
-        setInventory(updatedInventory);
-        if (currentUserId) {
-          socket.emit('save-user-data', { userId: currentUserId, newData: { ...JSON.parse(localStorage.getItem("arena-user-data-" + currentUserId) || "{}"), inventory: updatedInventory, coins: coins - listing.price } });
-        }
         setNotice(`Покупка завершена: «${listing.item.name}» в инвентаре.`);
+      }
+
+      // Синхронизируем баланс и инвентарь с сервера — источник правды только он.
+      if (currentUserId) {
+        socket.emit('get-user-data', currentUserId, (res: any) => {
+          if (res?.success && res.data) {
+            localStorage.setItem("arena-user-data-" + currentUserId, JSON.stringify(res.data));
+            localStorage.setItem("arena-coins", String(res.data.coins || 0));
+            localStorage.setItem("arena-inventory", JSON.stringify(res.data.inventory || []));
+            if (res.data.vipUntil) localStorage.setItem("arena-vip-until", res.data.vipUntil);
+            setCoins(res.data.coins || 0);
+            setInventory(res.data.inventory || []);
+            window.dispatchEvent(new Event("arena-wallet-updated"));
+          }
+        });
       }
     } else {
       setNotice(response?.error || "Не удалось купить");
@@ -4847,6 +4845,12 @@ function Market() {
       <span className="mt-1 block text-[10px] text-muted-foreground">
         Рекомендуемая цена: {getRecommendedPrice(inventory.find(i => i.id === selected) || null)} Coins
       </span>
+    )}
+    {Number(price) > 0 && (
+      <div className="mt-2 rounded-lg bg-[#f3e7c8]/60 px-3 py-2 text-[11px] leading-4 text-[#7e5f1d]">
+        Вы получите: <b>{Math.round(Number(price) * 0.9).toLocaleString("ru-RU")}</b> Coins
+        <span className="text-[#7e5f1d]/70"> (−10% комиссия)</span>
+      </div>
     )}
 </label>
           <button

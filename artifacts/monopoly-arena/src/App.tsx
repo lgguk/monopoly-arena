@@ -6580,6 +6580,16 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     // Ежедневный квест "Купи 1 поле"
     if (cp.id === currentUser?.id) {
       emitQuestEvent("buyProperty");
+      // Проверяем монополию: все поля группы теперь у игрока?
+      const newOwners = { ...ownersRef.current, [cellIndex]: cp.id };
+      const gIdx = getGroupIdx(cellIndex);
+      if (gIdx !== -1) {
+        const groupCells = getDynamicGroups()[gIdx].cells as readonly number[];
+        const hasMonopoly = groupCells.every((ci) => newOwners[ci] === cp.id);
+        if (hasMonopoly) {
+          emitQuestEvent("monopoly");
+        }
+      }
     }
 
     setPendingAction(null);

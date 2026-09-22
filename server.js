@@ -101,6 +101,66 @@ async function loadMarketListings() {
   } catch (e) {}
 }
 
+// ---- ТРЕЙДЫ (ОБМЕНЫ) ----
+let trades = []; // массив в памяти, синхронизируется с БД
+
+async function loadTrades() {
+  try {
+    const res = await db.query(
+      `SELECT id, from_user_id, to_user_id, from_items, to_items, status, created_at, resolved_at
+       FROM trades
+       WHERE status = 'pending'
+       ORDER BY created_at DESC`
+    );
+    trades = res.rows.map((r) => ({
+      id: String(r.id),
+      fromUserId: r.from_user_id,
+      toUserId: r.to_user_id,
+      fromItems: r.from_items || [],
+      toItems: r.to_items || [],
+      status: r.status,
+      createdAt: new Date(r.created_at).getTime(),
+      resolvedAt: r.resolved_at ? new Date(r.resolved_at).getTime() : null,
+    }));
+    console.log(`✅ Обмены загружены из БД: ${trades.length}`);
+  } catch (err) {
+    console.error('❌ Ошибка загрузки trades из БД:', err.message);
+    trades = [];
+  }
+}
+
+async function saveTradeToDb(trade) {
+  try {
+    const res = await db.query(
+      `INSERT INTO trades (from_user_id, to_user_id, from_items, to_items, status)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [
+        trade.fromUserId,
+        trade.toUserId,
+        JSON.stringify(trade.fromItems || []),
+        JSON.stringify(trade.toItems || []),
+        trade.status || 'pending',
+      ]
+    );
+    return String(res.rows[0].id);
+  } catch (err) {
+    console.error('❌ Ошибка сохранения трейда в БД:', err);
+    return null;
+  }
+}
+
+async function updateTradeStatusInDb(tradeId, status) {
+  try {
+    await db.query(
+      `UPDATE trades SET status = $1, resolved_at = NOW() WHERE id = $2`,
+      [status, Number(tradeId)]
+    );
+  } catch (err) {
+    console.error('❌ Ошибка обновления статуса трейда в БД:', err);
+  }
+}
+
 const SETTINGS_FILE = path.join(__dirname, 'admin-settings.json');
 const DESIGNS_FILE = path.join(__dirname, 'card-designs.json');
 
@@ -411,6 +471,37 @@ async function changeBalance(userId, type, amount, metadata = {}) {
   d.coins = next;
   await logTransaction(userId, type, amount, metadata);
   return { success: true, newBalance: next };
+}
+
+// Проверяет, можно ли предмет положить в обмен.
+// Возвращает null, если всё ок, либо строку с ошибкой.
+function canItemBeTraded(userId, item) {
+  if (!item) return 'Предмет не найден';
+  if (item.lockedInTradeId) return 'Предмет уже участвует в другом обмене';
+  // Запрет на обмен предмета, полученного от обмена, в течение 2 часов
+  if (item.tradedAt) {
+    const elapsed = Date.now() - new Date(item.tradedAt).getTime();
+    if (elapsed < 2 * 60 * 60 * 1000) {
+      return 'Предмет нельзя обменять в течение 2 часов после получения';
+    }
+  }
+  return null;
+}
+
+// Блокирует предметы (ставит метку lockedInTradeId). Не сохраняет в БД.
+function lockItemsForTrade(userId, itemIds, tradeId) {
+  const inv = userData[userId]?.inventory || [];
+  inv.forEach((it) => {
+    if (itemIds.includes(it.id)) it.lockedInTradeId = tradeId;
+  });
+}
+
+// Снимает блокировку (удаляет поле lockedInTradeId)
+function unlockItemsFromTrade(userId, itemIds) {
+  const inv = userData[userId]?.inventory || [];
+  inv.forEach((it) => {
+    if (itemIds.includes(it.id)) delete it.lockedInTradeId;
+  });
 }
 
 // ============ ФИНАЛИЗАЦИЯ ПАРТИИ ============
@@ -870,6 +961,28 @@ socket.on('get-user-inventory', (userId, callback) => {
   callback?.({ success: true, inventory: userData[userId].inventory || [] });
 });
 
+// Публичная часть инвентаря — для обменов.
+// Отдаём только безопасные поля, без цен, служебных меток, дат владения.
+socket.on('get-user-inventory-public', (targetUserId, callback) => {
+  if (!targetUserId || !userData[targetUserId]) {
+    return callback?.({ success: false, error: 'Игрок не найден' });
+  }
+  const safeItems = (userData[targetUserId].inventory || []).map((it) => ({
+    id: it.id,
+    name: it.name,
+    imageDataUrl: it.imageDataUrl,
+    slotIndex: it.slotIndex,
+    rarity: it.rarity,
+    type: it.type,
+    marketItemId: it.marketItemId,
+    cardWidth: it.cardWidth,
+    cardHeight: it.cardHeight,
+    imageHeight: it.imageHeight,
+    shopScale: it.shopScale,
+  }));
+  callback?.({ success: true, inventory: safeItems });
+});
+
 // Событие для получения игровых данных (если нужно)
 socket.on('get-user-data', (userId, callback) => {
   if (userData[userId]) {
@@ -1179,7 +1292,7 @@ socket.on('get-user-data', (userId, callback) => {
           rarity: drop.rarity,
           color: '#29233e',
           price: drop.price,
-          description: drop.description || (drop.category === 'dice' ? 'Скин кубиков' : 'Карточка поля'),
+          description: drop.description || (drop.category === 'dice' ? 'Скин кубиков' : (drop.slotIndex !== undefined ? `Заменяет слот ${drop.slotIndex}` : 'Карточка поля')),
           ownedAt: new Date().toISOString(),
           slotIndex: drop.slotIndex,
           imageDataUrl: drop.imageDataUrl,
@@ -1224,6 +1337,233 @@ socket.on('get-user-data', (userId, callback) => {
     }
   });
 
+  
+  // ============ ОБМЕНЫ (ТРЕЙДЫ) ============
+
+  // Получить все мои активные обмены (отправленные + полученные)
+  socket.on('get-trades', (userId, callback) => {
+    if (!userId || !userData[userId]) return callback?.({ success: false });
+    const myTrades = trades.filter(
+      (t) => (t.fromUserId === userId || t.toUserId === userId) && t.status === 'pending'
+    );
+    const outgoing = myTrades.filter((t) => t.fromUserId === userId);
+    const incoming = myTrades.filter((t) => t.toUserId === userId);
+    callback?.({ success: true, outgoing, incoming });
+  });
+
+  // Создать предложение обмена
+  socket.on('trade-create', async (payload, callback) => {
+    const { fromUserId, toUserId, myItemIds, theirItemIds } = payload || {};
+    if (!fromUserId || !toUserId || !Array.isArray(myItemIds) || !Array.isArray(theirItemIds)) {
+      return callback?.({ success: false, error: 'Некорректный запрос' });
+    }
+    if (fromUserId === toUserId) return callback?.({ success: false, error: 'Нельзя обменяться с самим собой' });
+    if (!userData[fromUserId] || !userData[toUserId]) {
+      return callback?.({ success: false, error: 'Игрок не найден' });
+    }
+    if (myItemIds.length === 0 && theirItemIds.length === 0) {
+      return callback?.({ success: false, error: 'Обмен пустой' });
+    }
+    if (myItemIds.length > 10 || theirItemIds.length > 10) {
+      return callback?.({ success: false, error: 'Максимум 10 предметов с каждой стороны' });
+    }
+
+    const myInv = userData[fromUserId].inventory || [];
+    const theirInv = userData[toUserId].inventory || [];
+
+    const myItems = myItemIds.map((id) => myInv.find((it) => it.id === id)).filter(Boolean);
+    const theirItems = theirItemIds.map((id) => theirInv.find((it) => it.id === id)).filter(Boolean);
+
+    if (myItems.length !== myItemIds.length) {
+      return callback?.({ success: false, error: 'Некоторые ваши предметы не найдены' });
+    }
+    if (theirItems.length !== theirItemIds.length) {
+      return callback?.({ success: false, error: 'Некоторые предметы партнёра не найдены' });
+    }
+
+    // Проверяем, что все предметы можно обменять
+    for (const it of myItems) {
+      const err = canItemBeTraded(fromUserId, it);
+      if (err) return callback?.({ success: false, error: `Ваш предмет «${it.name}»: ${err}` });
+    }
+    for (const it of theirItems) {
+      const err = canItemBeTraded(toUserId, it);
+      if (err) return callback?.({ success: false, error: `Предмет партнёра «${it.name}»: ${err}` });
+    }
+
+    // Проверяем, что у игроков нет других активных обменов с теми же предметами
+    const tradeId = `t-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Блокируем предметы
+    lockItemsForTrade(fromUserId, myItemIds, tradeId);
+    lockItemsForTrade(toUserId, theirItemIds, tradeId);
+
+    const trade = {
+      id: tradeId,
+      fromUserId,
+      toUserId,
+      fromItems: myItems.map((it) => ({ id: it.id, name: it.name, imageDataUrl: it.imageDataUrl, slotIndex: it.slotIndex, rarity: it.rarity })),
+      toItems: theirItems.map((it) => ({ id: it.id, name: it.name, imageDataUrl: it.imageDataUrl, slotIndex: it.slotIndex, rarity: it.rarity })),
+      status: 'pending',
+      createdAt: Date.now(),
+      resolvedAt: null,
+    };
+
+    // Сохраняем в БД (используем реальный id из БД)
+    const dbId = await saveTradeToDb(trade);
+    if (!dbId) {
+      // Откатываем блокировку
+      unlockItemsFromTrade(fromUserId, myItemIds);
+      unlockItemsFromTrade(toUserId, theirItemIds);
+      return callback?.({ success: false, error: 'Не удалось сохранить обмен' });
+    }
+    trade.id = dbId;
+    // Обновляем lockedInTradeId на реальный id из БД
+    lockItemsForTrade(fromUserId, myItemIds, dbId);
+    lockItemsForTrade(toUserId, theirItemIds, dbId);
+    trades.push(trade);
+
+    saveUserData(fromUserId);
+    saveUserData(toUserId);
+
+    console.log(`🤝 ${fromUserId} → ${toUserId}: обмен #${dbId} (${myItems.length}/${theirItems.length})`);
+
+    // Уведомляем обе стороны в реальном времени
+    const fromSocket = onlineUsers.get(fromUserId);
+    const toSocket = onlineUsers.get(toUserId);
+    if (fromSocket) io.to(fromSocket).emit('trades-updated');
+    if (toSocket) io.to(toSocket).emit('trades-updated');
+
+    callback?.({ success: true, tradeId: dbId });
+  });
+
+  // Принять обмен (только получатель)
+  socket.on('trade-accept', async ({ userId, tradeId }, callback) => {
+    if (!userId || !tradeId) return callback?.({ success: false, error: 'Некорректный запрос' });
+    const idx = trades.findIndex((t) => t.id === String(tradeId));
+    if (idx === -1) return callback?.({ success: false, error: 'Обмен не найден' });
+    const trade = trades[idx];
+    if (trade.toUserId !== userId) return callback?.({ success: false, error: 'Нет прав' });
+    if (trade.status !== 'pending') return callback?.({ success: false, error: 'Обмен уже неактуален' });
+
+    const fromInv = userData[trade.fromUserId]?.inventory || [];
+    const toInv = userData[trade.toUserId]?.inventory || [];
+
+    // Проверяем, что все предметы на месте
+    const fromItems = trade.fromItems.map((it) => fromInv.find((x) => x.id === it.id)).filter(Boolean);
+    const toItems = trade.toItems.map((it) => toInv.find((x) => x.id === it.id)).filter(Boolean);
+    if (fromItems.length !== trade.fromItems.length || toItems.length !== trade.toItems.length) {
+      // Откатываем
+      trades.splice(idx, 1);
+      await updateTradeStatusInDb(trade.id, 'cancelled');
+      unlockItemsFromTrade(trade.fromUserId, trade.fromItems.map((i) => i.id));
+      unlockItemsFromTrade(trade.toUserId, trade.toItems.map((i) => i.id));
+      saveUserData(trade.fromUserId);
+      saveUserData(trade.toUserId);
+      return callback?.({ success: false, error: 'Предметы уже не в инвентаре' });
+    }
+
+    const now = new Date().toISOString();
+
+    // Убираем предметы из инвентарей
+    userData[trade.fromUserId].inventory = fromInv.filter((it) => !trade.fromItems.some((x) => x.id === it.id));
+    userData[trade.toUserId].inventory = toInv.filter((it) => !trade.toItems.some((x) => x.id === it.id));
+
+    // Добавляем предметы другому игроку (с флагом tradedAt и снятой блокировкой)
+    for (const it of toItems) {
+      const copy = { ...it };
+      delete copy.lockedInTradeId;
+      copy.tradedAt = now;
+      userData[trade.fromUserId].inventory.push(copy);
+    }
+    for (const it of fromItems) {
+      const copy = { ...it };
+      delete copy.lockedInTradeId;
+      copy.tradedAt = now;
+      userData[trade.toUserId].inventory.push(copy);
+    }
+
+    trade.status = 'accepted';
+    trade.resolvedAt = Date.now();
+    trades.splice(idx, 1);
+    await updateTradeStatusInDb(trade.id, 'accepted');
+
+    saveUserData(trade.fromUserId);
+    saveUserData(trade.toUserId);
+
+    console.log(`✅ Обмен #${trade.id} принят`);
+
+    // Уведомляем обе стороны
+    const fromSocket = onlineUsers.get(trade.fromUserId);
+    const toSocket = onlineUsers.get(trade.toUserId);
+    if (fromSocket) {
+      io.to(fromSocket).emit('trades-updated');
+      io.to(fromSocket).emit('user-data-updated', userData[trade.fromUserId]);
+      io.to(fromSocket).emit('user-inventory-updated', userData[trade.fromUserId].inventory);
+    }
+    if (toSocket) {
+      io.to(toSocket).emit('trades-updated');
+      io.to(toSocket).emit('user-data-updated', userData[trade.toUserId]);
+      io.to(toSocket).emit('user-inventory-updated', userData[trade.toUserId].inventory);
+    }
+
+    callback?.({ success: true });
+  });
+
+  // Отклонить обмен (только получатель)
+  socket.on('trade-decline', async ({ userId, tradeId }, callback) => {
+    if (!userId || !tradeId) return callback?.({ success: false, error: 'Некорректный запрос' });
+    const idx = trades.findIndex((t) => t.id === String(tradeId));
+    if (idx === -1) return callback?.({ success: false, error: 'Обмен не найден' });
+    const trade = trades[idx];
+    if (trade.toUserId !== userId) return callback?.({ success: false, error: 'Нет прав' });
+
+    unlockItemsFromTrade(trade.fromUserId, trade.fromItems.map((i) => i.id));
+    unlockItemsFromTrade(trade.toUserId, trade.toItems.map((i) => i.id));
+    trade.status = 'declined';
+    trade.resolvedAt = Date.now();
+    trades.splice(idx, 1);
+    await updateTradeStatusInDb(trade.id, 'declined');
+    saveUserData(trade.fromUserId);
+    saveUserData(trade.toUserId);
+
+    console.log(`❌ Обмен #${trade.id} отклонён`);
+
+    const fromSocket = onlineUsers.get(trade.fromUserId);
+    const toSocket = onlineUsers.get(trade.toUserId);
+    if (fromSocket) io.to(fromSocket).emit('trades-updated');
+    if (toSocket) io.to(toSocket).emit('trades-updated');
+
+    callback?.({ success: true });
+  });
+
+  // Отменить обмен (только отправитель)
+  socket.on('trade-cancel', async ({ userId, tradeId }, callback) => {
+    if (!userId || !tradeId) return callback?.({ success: false, error: 'Некорректный запрос' });
+    const idx = trades.findIndex((t) => t.id === String(tradeId));
+    if (idx === -1) return callback?.({ success: false, error: 'Обмен не найден' });
+    const trade = trades[idx];
+    if (trade.fromUserId !== userId) return callback?.({ success: false, error: 'Нет прав' });
+
+    unlockItemsFromTrade(trade.fromUserId, trade.fromItems.map((i) => i.id));
+    unlockItemsFromTrade(trade.toUserId, trade.toItems.map((i) => i.id));
+    trade.status = 'cancelled';
+    trade.resolvedAt = Date.now();
+    trades.splice(idx, 1);
+    await updateTradeStatusInDb(trade.id, 'cancelled');
+    saveUserData(trade.fromUserId);
+    saveUserData(trade.toUserId);
+
+    console.log(`🚫 Обмен #${trade.id} отменён`);
+
+    const fromSocket = onlineUsers.get(trade.fromUserId);
+    const toSocket = onlineUsers.get(trade.toUserId);
+    if (fromSocket) io.to(fromSocket).emit('trades-updated');
+    if (toSocket) io.to(toSocket).emit('trades-updated');
+
+    callback?.({ success: true });
+  });
+
   // --- РЫНОК / ОБЪЯВЛЕНИЯ ---
 socket.on('get-market-listings', () => {
   socket.emit('market-listings', marketListings);
@@ -1241,6 +1581,19 @@ socket.on('add-market-listing', async (data, callback) => {
   const idx = inv.findIndex((it) => it.id === data.item.id);
   if (idx === -1) {
     return callback?.({ success: false, error: 'Предмет не найден в инвентаре' });
+  }
+
+  // Проверяем блокировки
+  const itemToSell = inv[idx];
+  if (itemToSell.lockedInTradeId) {
+    return callback?.({ success: false, error: 'Предмет участвует в активном обмене' });
+  }
+  if (itemToSell.tradedAt) {
+    const elapsed = Date.now() - new Date(itemToSell.tradedAt).getTime();
+    if (elapsed < 2 * 60 * 60 * 1000) {
+      const minsLeft = Math.ceil((2 * 60 * 60 * 1000 - elapsed) / 60000);
+      return callback?.({ success: false, error: `После обмена продажа недоступна ещё ${minsLeft} мин.` });
+    }
   }
 
   // Удаляем из инвентаря в памяти (сервер — источник правды)
@@ -1970,6 +2323,7 @@ const PORT = process.env.PORT || 8080;
   await loadCardDesigns();
   await loadMarketListings();
   await loadUserDataFromDb();
+  await loadTrades();
 
   try {
     const res = await db.query('SELECT * FROM users ORDER BY created_at');

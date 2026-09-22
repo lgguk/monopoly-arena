@@ -151,6 +151,23 @@ type Listing = {
   sellerId: string;
   price: number;
 };
+type TradeItemSnapshot = {
+  id: string;
+  name: string;
+  imageDataUrl?: string;
+  slotIndex?: number;
+  rarity?: string;
+};
+
+type Trade = {
+  id: string;
+  fromUserId: string;
+  toUserId: string;
+  fromItems: TradeItemSnapshot[];
+  toItems: TradeItemSnapshot[];
+  status: "pending" | "accepted" | "declined" | "cancelled";
+  createdAt: number;
+};
 type AuthUser = {
   id: string;
   login?: string;
@@ -3099,6 +3116,375 @@ const buyVip = (vip: MarketItem) => {
     </div>
   );
 }
+function TradeItemMiniCard({
+  item,
+  getMarketPrice,
+  tone,
+}: {
+  item: TradeItemSnapshot;
+  getMarketPrice: (name: string) => number | null;
+  tone: "primary" | "accent";
+}) {
+  const price = getMarketPrice(item.name);
+  const borderCls = tone === "primary" ? "border-primary/40" : "border-accent/40";
+  const badgeCls = tone === "primary" ? "bg-primary/10 text-primary" : "bg-accent/10 text-accent";
+  return (
+    <div className={`flex flex-col items-center rounded-lg border ${borderCls} bg-card p-1.5`}>
+      <div className="flex h-14 w-full items-center justify-center overflow-hidden">
+        {item.imageDataUrl ? (
+          <img src={item.imageDataUrl} alt={item.name} className="max-h-full max-w-full object-contain" />
+        ) : (
+          <div className="text-2xl">❓</div>
+        )}
+      </div>
+      <div className="mt-1 truncate w-full text-center text-[10px] font-bold" title={item.name}>
+        {item.name}
+      </div>
+      <div className={`mt-0.5 rounded px-1 py-0.5 text-[9px] font-bold ${badgeCls}`}>
+        {price !== null ? `≈ ${price} 🪙` : "нет на рынке"}
+      </div>
+    </div>
+  );
+}
+
+function TradeCreateModal({
+  sourceItem,
+  onClose,
+  onCreated,
+}: {
+  sourceItem: OwnedItem | null;
+  onClose: () => void;
+  onCreated: () => void;
+}) {
+  const [step, setStep] = useState<"partner" | "items">("partner");
+  const [partners, setPartners] = useState<{ id: string; name: string; online: boolean }[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<{ id: string; name: string; online: boolean }[]>([]);
+  const [selectedPartner, setSelectedPartner] = useState<{ id: string; name: string } | null>(null);
+  const [theirInventory, setTheirInventory] = useState<any[]>([]);
+  const [loadingTheirInv, setLoadingTheirInv] = useState(false);
+  const [mySelected, setMySelected] = useState<string[]>(() => (sourceItem ? [sourceItem.id] : []));
+  const [theirSelected, setTheirSelected] = useState<string[]>([]);
+  const [notice, setNotice] = useState("");
+  const [sending, setSending] = useState(false);
+
+  const myUserId = getSessionUserId();
+
+  useEffect(() => {
+    if (!myUserId) return;
+    socket.emit("get-friends", myUserId, (res: any) => {
+      if (res?.success) setPartners(res.friends || []);
+    });
+  }, [myUserId]);
+
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      setSearchResults([]);
+      return;
+    }
+    const t = setTimeout(() => {
+      socket.emit("search-users", searchQuery, (res: any) => {
+        if (res?.success) setSearchResults(res.results || []);
+      });
+    }, 250);
+    return () => clearTimeout(t);
+  }, [searchQuery]);
+
+  const myInventory = useMemo(() => {
+    try {
+      const raw = localStorage.getItem("arena-inventory") || "[]";
+      const inv = JSON.parse(raw);
+      return Array.isArray(inv) ? inv : [];
+    } catch {
+      return [];
+    }
+  }, [step]);
+
+  const choosePartner = (p: { id: string; name: string }) => {
+    if (p.id === myUserId) {
+      setNotice("Нельзя выбрать себя");
+      setTimeout(() => setNotice(""), 2500);
+      return;
+    }
+    setSelectedPartner(p);
+    setLoadingTheirInv(true);
+    socket.emit("get-user-inventory-public", p.id, (res: any) => {
+      setLoadingTheirInv(false);
+      if (res?.success) {
+        setTheirInventory(res.inventory || []);
+      } else {
+        setNotice(res?.error || "Не удалось загрузить инвентарь");
+        setTimeout(() => setNotice(""), 2500);
+      }
+    });
+    setStep("items");
+  };
+
+  const toggleMy = (id: string) => {
+    setMySelected((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : prev.length >= 10 ? prev : [...prev, id]
+    );
+  };
+  const toggleTheir = (id: string) => {
+    setTheirSelected((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : prev.length >= 10 ? prev : [...prev, id]
+    );
+  };
+
+  const canSend = mySelected.length > 0 && theirSelected.length > 0 && !!selectedPartner;
+
+  const submit = () => {
+    if (!myUserId || !selectedPartner || !canSend) return;
+    setSending(true);
+    socket.emit(
+      "trade-create",
+      {
+        fromUserId: myUserId,
+        toUserId: selectedPartner.id,
+        myItemIds: mySelected,
+        theirItemIds: theirSelected,
+      },
+      (res: any) => {
+        setSending(false);
+        if (res?.success) {
+          onCreated();
+          onClose();
+        } else {
+          setNotice(res?.error || "Не удалось создать обмен");
+          setTimeout(() => setNotice(""), 3500);
+        }
+      }
+    );
+  };
+
+  const isItemLocked = (it: any) => {
+    if (it.lockedInTradeId) return true;
+    if (it.tradedAt) {
+      const elapsed = Date.now() - new Date(it.tradedAt).getTime();
+      if (elapsed < 2 * 60 * 60 * 1000) return true;
+    }
+    return false;
+  };
+
+  const renderItemGrid = (
+    items: any[],
+    selectedIds: string[],
+    onToggle: (id: string) => void,
+    tone: "primary" | "accent"
+  ) => {
+    const selCls = tone === "primary" ? "border-primary bg-[#f6dfd7]" : "border-accent bg-[#dceae3]";
+    const hoverCls = tone === "primary" ? "hover:border-primary/40" : "hover:border-accent/40";
+    return (
+      <div
+        className="grid max-h-60 gap-2 overflow-y-auto rounded-xl border border-border bg-muted/30 p-2"
+        style={{ gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))" }}
+      >
+        {items.map((it: any) => {
+          const selected = selectedIds.includes(it.id);
+          const locked = isItemLocked(it);
+          const isCase = it.rarity === "Кейс";
+          const isVip = it.rarity === "VIP";
+          return (
+            <button
+              key={it.id}
+              onClick={() => !locked && onToggle(it.id)}
+              disabled={locked}
+              className={`relative flex flex-col items-center rounded-lg border p-2 text-center transition ${
+                locked
+                  ? "cursor-not-allowed border-border bg-muted opacity-50"
+                  : selected
+                    ? selCls
+                    : `border-border bg-card ${hoverCls}`
+              }`}
+            >
+              <div className="flex h-12 w-full items-center justify-center overflow-hidden">
+                {it.imageDataUrl ? (
+                  <img src={it.imageDataUrl} alt={it.name} className="max-h-full max-w-full object-contain" />
+                ) : isCase ? (
+                  <Package size={24} className="text-muted-foreground" />
+                ) : isVip ? (
+                  <Crown size={24} className="text-[#d3a247]" />
+                ) : (
+                  <div className="text-xl">❓</div>
+                )}
+              </div>
+              <div className="mt-1 truncate text-[10px] font-bold" title={it.name}>
+                {it.name}
+              </div>
+              {locked && (
+                <div className="absolute inset-0 flex items-center justify-center rounded-lg bg-black/40 text-[9px] font-bold text-white">
+                  Занято
+                </div>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    );
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#29233e]/60 p-4 backdrop-blur-sm">
+      <div className="flex max-h-[calc(100dvh-2rem)] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-card-border bg-card shadow-2xl">
+        <div className="flex items-start justify-between border-b border-border px-6 py-4">
+          <div>
+            <div className="font-mono text-[10px] uppercase tracking-[.2em] text-primary">обмен предметами</div>
+            <h2 className="mt-1 font-display text-2xl font-bold">
+              {step === "partner" ? "Выбери партнёра" : `Обмен с ${selectedPartner?.name}`}
+            </h2>
+            {sourceItem && step === "items" && (
+              <p className="mt-1 text-xs text-muted-foreground">
+                Отправная точка: <b>{sourceItem.name}</b>
+              </p>
+            )}
+          </div>
+          <button onClick={onClose} className="rounded-lg p-2 text-muted-foreground hover:bg-muted">
+            <X size={18} />
+          </button>
+        </div>
+
+        {notice && (
+          <div className="border-b border-primary/30 bg-[#f6dfd7] px-6 py-2 text-xs font-medium text-primary">
+            {notice}
+          </div>
+        )}
+
+        <div className="min-h-0 flex-1 overflow-y-auto p-6">
+          {step === "partner" && (
+            <div className="space-y-4">
+              <div className="relative">
+                <Search size={16} className="absolute left-3 top-3 text-muted-foreground" />
+                <input
+                  autoFocus
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="ID или никнейм игрока"
+                  className="w-full rounded-xl border border-input bg-background py-2.5 pl-9 pr-3 text-sm outline-none focus:ring-2 focus:ring-primary/30"
+                />
+              </div>
+
+              {searchQuery.trim() ? (
+                <div className="space-y-1">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                    Результаты поиска
+                  </div>
+                  {searchResults.filter((r) => r.id !== myUserId).map((p) => (
+                    <button
+                      key={p.id}
+                      onClick={() => choosePartner(p)}
+                      className="flex w-full items-center gap-3 rounded-xl p-2.5 text-left transition hover:bg-muted"
+                    >
+                      <Avatar initials={p.name[0]} color="#32786d" size="sm" />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-bold">{p.name}</div>
+                        <div className="truncate text-[11px] text-muted-foreground">
+                          {p.id} · {p.online ? "В сети" : "Не в сети"}
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                  {searchResults.filter((r) => r.id !== myUserId).length === 0 && (
+                    <div className="py-3 text-center text-xs text-muted-foreground">Ничего не найдено</div>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                    Друзья ({partners.length})
+                  </div>
+                  {partners.length === 0 && (
+                    <div className="py-6 text-center text-xs text-muted-foreground">
+                      Нет друзей — найди игрока по ID в строке поиска
+                    </div>
+                  )}
+                  {partners.map((p) => (
+                    <button
+                      key={p.id}
+                      onClick={() => choosePartner(p)}
+                      className="flex w-full items-center gap-3 rounded-xl p-2.5 text-left transition hover:bg-muted"
+                    >
+                      <div className="relative">
+                        <Avatar initials={p.name[0]} color="#32786d" size="sm" />
+                        {p.online && (
+                          <span className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-card bg-accent" />
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-bold">{p.name}</div>
+                        <div className="truncate text-[11px] text-muted-foreground">
+                          {p.id} · {p.online ? "В сети" : "Не в сети"}
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {step === "items" && (
+            <div className="space-y-5">
+              <div>
+                <div className="mb-2 text-sm font-bold text-primary">
+                  Ты отдаёшь ({mySelected.length}/10)
+                </div>
+                {myInventory.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
+                    У тебя нет предметов
+                  </div>
+                ) : (
+                  renderItemGrid(myInventory, mySelected, toggleMy, "primary")
+                )}
+              </div>
+
+              <div>
+                <div className="mb-2 text-sm font-bold text-accent">
+                  Ты получаешь ({theirSelected.length}/10)
+                </div>
+                {loadingTheirInv ? (
+                  <div className="py-6 text-center text-xs text-muted-foreground">Загрузка инвентаря…</div>
+                ) : theirInventory.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
+                    У партнёра нет предметов
+                  </div>
+                ) : (
+                  renderItemGrid(theirInventory, theirSelected, toggleTheir, "accent")
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center justify-between gap-3 border-t border-border px-6 py-4">
+          {step === "partner" ? (
+            <>
+              <button onClick={onClose} className="rounded-xl border border-input px-4 py-2.5 text-xs font-bold">
+                Отмена
+              </button>
+              <div className="text-xs text-muted-foreground">Выбери игрока слева</div>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={() => setStep("partner")}
+                className="rounded-xl border border-input px-4 py-2.5 text-xs font-bold"
+              >
+                ← Назад
+              </button>
+              <button
+                onClick={submit}
+                disabled={!canSend || sending}
+                className="rounded-xl bg-primary px-4 py-2.5 text-xs font-bold text-primary-foreground disabled:opacity-40"
+              >
+                {sending ? "Отправка…" : "Предложить обмен"}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function Inventory({ onMarket }: { onMarket: () => void }) {
   const [inventory, setInventory] = useServerSync<OwnedItem[]>("arena-inventory", [], ['user-inventory-updated'], 'get-user-inventory');
@@ -3107,6 +3493,32 @@ function Inventory({ onMarket }: { onMarket: () => void }) {
   const [notice, setNotice] = useState("");
     const [sellTarget, setSellTarget] = useState<OwnedItem | null>(null);
   const [sellPrice, setSellPrice] = useState("");
+    // ============ ОБМЕНЫ ============
+  const [inventoryTab, setInventoryTab] = useState<"items" | "trades">("items");
+  const [outgoingTrades, setOutgoingTrades] = useState<Trade[]>([]);
+  const [incomingTrades, setIncomingTrades] = useState<Trade[]>([]);
+  const [tradeCreateOpen, setTradeCreateOpen] = useState(false);
+  const [tradeSourceItem, setTradeSourceItem] = useState<OwnedItem | null>(null);
+
+  const fetchTrades = () => {
+    const userId = getSessionUserId();
+    if (!userId) return;
+    socket.emit("get-trades", userId, (res: any) => {
+      if (res?.success) {
+        setOutgoingTrades(res.outgoing || []);
+        setIncomingTrades(res.incoming || []);
+      }
+    });
+  };
+
+  useEffect(() => {
+    fetchTrades();
+    const handler = () => fetchTrades();
+    socket.on("trades-updated", handler);
+    return () => {
+      socket.off("trades-updated", handler);
+    };
+  }, []);
     // Нормализация: если старый state без activeSkins — добавим пустой объект
   useEffect(() => {
     if (!active.activeSkins) {
@@ -3117,7 +3529,22 @@ function Inventory({ onMarket }: { onMarket: () => void }) {
 
   const [casesData] = useServerSync<CaseDesign[]>("arena-admin-cases", [], ['admin-cases-updated'], 'get-admin-cases');
 const [marketItems] = useServerSync<MarketItem[]>("arena-market-items", [], ['custom-items-updated'], 'get-custom-items');
+const [listings] = useServerSync<Listing[]>(
+  "arena-market",
+  [],
+  ['market-listings', 'market-listings-updated'],
+  'get-market-listings'
+);
 const currentUserId = getSessionUserId();
+
+// Средняя цена предмета на рынке (по активным объявлениям).
+// Если объявлений нет — null.
+const getMarketPrice = (itemName: string): number | null => {
+  if (!Array.isArray(listings)) return null;
+  const same = listings.filter((l) => l.item.name === itemName);
+  if (same.length === 0) return null;
+  return Math.round(same.reduce((s, l) => s + l.price, 0) / same.length);
+};
 const getRecommendedPrice = (item: OwnedItem): number => {
   if (!item) return 100;
   // 1. Ищем базовую цену в магазине по marketItemId или slotIndex
@@ -3231,6 +3658,34 @@ const deactivate = (item: OwnedItem) => {
           {notice}
         </div>
       )}
+
+      {/* Переключатель вкладок */}
+      <div className="mb-5 flex gap-2 rounded-xl bg-muted p-1 w-fit">
+        <button
+          onClick={() => setInventoryTab("items")}
+          className={`rounded-lg px-4 py-2 text-xs font-bold transition-colors ${
+            inventoryTab === "items" ? "bg-card shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          Предметы ({inventory.length})
+        </button>
+        <button
+          onClick={() => setInventoryTab("trades")}
+          className={`relative rounded-lg px-4 py-2 text-xs font-bold transition-colors ${
+            inventoryTab === "trades" ? "bg-card shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          Обмены
+          {(outgoingTrades.length + incomingTrades.length) > 0 && (
+            <span className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-white">
+              {outgoingTrades.length + incomingTrades.length}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {inventoryTab === "items" && (
+        <>
             <div className="mb-5 grid gap-2 sm:grid-cols-3">
         <div className="rounded-xl border border-card-border bg-card p-2.5">
           <div className="text-[9px] text-muted-foreground">Всего предметов</div>
@@ -3308,7 +3763,11 @@ const deactivate = (item: OwnedItem) => {
             </span>
           )}
         </div>
-        <p className="mt-1 text-xs text-muted-foreground">{item.description}</p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {item.slotIndex !== undefined && item.rarity !== "Кейс" && item.rarity !== "VIP"
+            ? `Заменяет слот ${item.slotIndex}`
+            : item.description}
+        </p>
         {isCase ? (
   <button onClick={() => openCase(item)} className="mt-4 w-full rounded-lg bg-primary py-2.5 text-xs font-bold text-primary-foreground">
     Открыть кейс
@@ -3340,10 +3799,20 @@ const deactivate = (item: OwnedItem) => {
                 </span>
                 <button
                   onClick={() => {
+                    setTradeSourceItem(item);
+                    setTradeCreateOpen(true);
+                  }}
+                  className="ml-auto shrink-0 rounded-lg bg-[#e5def0] px-2 py-1.5 text-[10px] font-bold text-[#655384]"
+                  title="Предложить обмен"
+                >
+                  Обмен
+                </button>
+                <button
+                  onClick={() => {
                     setSellTarget(item);
                     setSellPrice(String(getRecommendedPrice(item)));
                   }}
-                  className="ml-auto shrink-0 rounded-lg bg-secondary px-2 py-1.5 text-[10px] font-bold text-secondary-foreground"
+                  className="shrink-0 rounded-lg bg-secondary px-2 py-1.5 text-[10px] font-bold text-secondary-foreground"
                 >
                   Продать
                 </button>
@@ -3362,6 +3831,162 @@ const deactivate = (item: OwnedItem) => {
             Загляни в Магазин и открой первый кейс.
           </p>
         </div>
+      )}
+        </>
+      )}
+
+      {inventoryTab === "trades" && (
+        <div className="space-y-6">
+          {outgoingTrades.length === 0 && incomingTrades.length === 0 && (
+            <div className="rounded-2xl border border-dashed border-card-border bg-card p-12 text-center">
+              <Send size={28} className="mx-auto text-muted-foreground" />
+              <p className="mt-3 font-bold">Активных обменов нет</p>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Нажми «Обмен» на любом предмете, чтобы предложить его другу.
+              </p>
+            </div>
+          )}
+
+          {incomingTrades.length > 0 && (
+            <div>
+              <h3 className="mb-3 font-display text-lg font-bold">Входящие ({incomingTrades.length})</h3>
+              <div className="space-y-3">
+                {incomingTrades.map((t) => (
+                  <div key={t.id} className="rounded-2xl border border-primary/30 bg-[#f6dfd7]/40 p-4">
+                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-xs font-bold">
+                        От игрока: <span className="font-mono">{t.fromUserId}</span>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => {
+                            const userId = getSessionUserId();
+                            if (!userId) return;
+                            socket.emit("trade-accept", { userId, tradeId: t.id }, (res: any) => {
+                              if (res?.success) {
+                                setNotice("Обмен принят!");
+                                setTimeout(() => setNotice(""), 3000);
+                              } else {
+                                setNotice(res?.error || "Ошибка");
+                                setTimeout(() => setNotice(""), 3000);
+                              }
+                            });
+                          }}
+                          className="rounded-lg bg-[#32786d] px-3 py-1.5 text-xs font-bold text-white hover:bg-[#266059]"
+                        >
+                          Принять
+                        </button>
+                        <button
+                          onClick={() => {
+                            const userId = getSessionUserId();
+                            if (!userId) return;
+                            socket.emit("trade-decline", { userId, tradeId: t.id }, (res: any) => {
+                              if (res?.success) {
+                                setNotice("Обмен отклонён");
+                                setTimeout(() => setNotice(""), 3000);
+                              }
+                            });
+                          }}
+                          className="rounded-lg bg-[#f6dfd7] px-3 py-1.5 text-xs font-bold text-primary hover:bg-[#efcec2]"
+                        >
+                          Отклонить
+                        </button>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3 text-xs">
+                      <div className="rounded-lg bg-white/60 p-2">
+                        <div className="mb-2 font-bold text-accent">Он отдаёт вам:</div>
+                        <div className="grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(90px, 1fr))" }}>
+                          {t.fromItems.map((it) => (
+                            <TradeItemMiniCard key={it.id} item={it} getMarketPrice={getMarketPrice} tone="accent" />
+                          ))}
+                          {t.fromItems.length === 0 && <div className="text-muted-foreground italic text-[11px]">ничего</div>}
+                        </div>
+                      </div>
+                      <div className="rounded-lg bg-white/60 p-2">
+                        <div className="mb-2 font-bold text-primary">Вы отдаёте ему:</div>
+                        <div className="grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(90px, 1fr))" }}>
+                          {t.toItems.map((it) => (
+                            <TradeItemMiniCard key={it.id} item={it} getMarketPrice={getMarketPrice} tone="primary" />
+                          ))}
+                          {t.toItems.length === 0 && <div className="text-muted-foreground italic text-[11px]">ничего</div>}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {outgoingTrades.length > 0 && (
+            <div>
+              <h3 className="mb-3 font-display text-lg font-bold">Отправленные ({outgoingTrades.length})</h3>
+              <div className="space-y-3">
+                {outgoingTrades.map((t) => (
+                  <div key={t.id} className="rounded-2xl border border-card-border bg-card p-4">
+                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-xs font-bold">
+                        Получатель: <span className="font-mono">{t.toUserId}</span>
+                        <span className="ml-2 text-muted-foreground">· ожидает ответа</span>
+                      </div>
+                      <button
+                        onClick={() => {
+                          const userId = getSessionUserId();
+                          if (!userId) return;
+                          socket.emit("trade-cancel", { userId, tradeId: t.id }, (res: any) => {
+                            if (res?.success) {
+                              setNotice("Обмен отменён");
+                              setTimeout(() => setNotice(""), 3000);
+                            }
+                          });
+                        }}
+                        className="rounded-lg bg-muted px-3 py-1.5 text-xs font-bold text-muted-foreground hover:bg-muted/70"
+                      >
+                        Отменить
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3 text-xs">
+                      <div className="rounded-lg bg-[#dceae3]/40 p-2">
+                        <div className="mb-2 font-bold text-accent">Вы отдаёте:</div>
+                        <div className="grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(90px, 1fr))" }}>
+                          {t.fromItems.map((it) => (
+                            <TradeItemMiniCard key={it.id} item={it} getMarketPrice={getMarketPrice} tone="accent" />
+                          ))}
+                          {t.fromItems.length === 0 && <div className="text-muted-foreground italic text-[11px]">ничего</div>}
+                        </div>
+                      </div>
+                      <div className="rounded-lg bg-[#f3e7c8]/60 p-2">
+                        <div className="mb-2 font-bold text-[#7e5f1d]">Вы получаете:</div>
+                        <div className="grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(90px, 1fr))" }}>
+                          {t.toItems.map((it) => (
+                            <TradeItemMiniCard key={it.id} item={it} getMarketPrice={getMarketPrice} tone="primary" />
+                          ))}
+                          {t.toItems.length === 0 && <div className="text-muted-foreground italic text-[11px]">ничего</div>}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {tradeCreateOpen && (
+        <TradeCreateModal
+          sourceItem={tradeSourceItem}
+          onClose={() => {
+            setTradeCreateOpen(false);
+            setTradeSourceItem(null);
+          }}
+          onCreated={() => {
+            setInventoryTab("trades");
+            fetchTrades();
+            setNotice("Обмен отправлен!");
+            setTimeout(() => setNotice(""), 3000);
+          }}
+        />
       )}
 
       {sellTarget && (

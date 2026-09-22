@@ -2289,6 +2289,12 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       saveUserData();
       const tSocket = onlineUsers.get(friendId);
       if (tSocket) io.to(tSocket).emit('new-notification', userData[friendId].notifications);
+      // Обе стороны получают обновление
+      const sSocket = onlineUsers.get(userId);
+      if (tSocket) io.to(tSocket).emit('friend-requests-updated');
+      if (tSocket) io.to(tSocket).emit('friends-updated');
+      if (sSocket) io.to(sSocket).emit('friend-requests-updated');
+      if (sSocket) io.to(sSocket).emit('friends-updated');
       return callback?.({ success: true, autoAccepted: true });
     }
 
@@ -2300,15 +2306,38 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     userData[friendId].notifications.push({ text: `${initiator?.name || 'Игрок'} отправил вам запрос в друзья`, timestamp: Date.now(), read: false });
     saveUserData();
     const tSocket = onlineUsers.get(friendId);
-    if (tSocket) io.to(tSocket).emit('new-notification', userData[friendId].notifications);
+    if (tSocket) {
+      io.to(tSocket).emit('new-notification', userData[friendId].notifications);
+      io.to(tSocket).emit('friend-requests-updated');
+    }
+    // Отправителю — чтобы у него в исходящих появилась новая заявка
+    const sSocket = onlineUsers.get(userId);
+    if (sSocket) io.to(sSocket).emit('friend-requests-updated');
 
     callback?.({ success: true });
   });
 
   socket.on('get-friend-requests', (userId, callback) => {
     if (!userId || !userData[userId]) return callback?.({ success: false, error: 'User not found' });
+    // Входящие — те, что лежат у меня в friendRequests
     const requests = (userData[userId].friendRequests || []).map(r => ({ ...r, fromOnline: onlineUsers.has(r.fromId) }));
-    callback?.({ success: true, requests });
+
+    // Исходящие — я лежу в friendRequests у других. Проходим по всем users.
+    const outgoing = [];
+    for (const other of users) {
+      if (other.id === userId) continue;
+      const reqs = userData[other.id]?.friendRequests || [];
+      const mine = reqs.find(r => r.fromId === userId);
+      if (mine) {
+        outgoing.push({
+          toId: other.id,
+          toName: other.name,
+          timestamp: mine.timestamp || Date.now(),
+        });
+      }
+    }
+
+    callback?.({ success: true, requests, outgoing });
   });
 
   socket.on('accept-friend-request', ({ userId, fromId }, callback) => {
@@ -2329,7 +2358,16 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     userData[fromId].notifications.push({ text: `${accepter?.name || 'Игрок'} принял ваш запрос в друзья`, timestamp: Date.now(), read: false });
     saveUserData();
     const tSocket = onlineUsers.get(fromId);
-    if (tSocket) io.to(tSocket).emit('new-notification', userData[fromId].notifications);
+    const sSocket = onlineUsers.get(userId);
+    if (tSocket) {
+      io.to(tSocket).emit('new-notification', userData[fromId].notifications);
+      io.to(tSocket).emit('friend-requests-updated');
+      io.to(tSocket).emit('friends-updated');
+    }
+    if (sSocket) {
+      io.to(sSocket).emit('friend-requests-updated');
+      io.to(sSocket).emit('friends-updated');
+    }
 
     callback?.({ success: true });
   });
@@ -2339,23 +2377,34 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     if (!userData[userId].friendRequests) userData[userId].friendRequests = [];
     userData[userId].friendRequests = userData[userId].friendRequests.filter(r => r.fromId !== fromId);
     saveUserData();
+    const tSocket = onlineUsers.get(fromId);
+    const sSocket = onlineUsers.get(userId);
+    if (tSocket) io.to(tSocket).emit('friend-requests-updated');
+    if (sSocket) io.to(sSocket).emit('friend-requests-updated');
     callback?.({ success: true });
   });
 
-  socket.on('remove-friend', ({ userId, friendId }, callback) => {
+  socket.on('remove-friend', async ({ userId, friendId }, callback) => {
     if (!userId || !friendId || !userData[userId]) return callback?.({ success: false, error: 'Invalid request' });
+
+    // Удаляем друг у друга — взаимно
     userData[userId].friends = (userData[userId].friends || []).filter(fid => fid !== friendId);
+    if (userData[friendId]) {
+      userData[friendId].friends = (userData[friendId].friends || []).filter(fid => fid !== userId);
+    }
     saveUserData();
+
     const initiator = users.find(u => u.id === userId);
     if (userData[friendId]) {
-        userData[friendId].notifications = [
-            ...(userData[friendId].notifications || []),
-            { text: `${initiator?.name || 'Игрок'} удалил вас из друзей`, timestamp: Date.now(), read: false }
-        ];
-        saveUserData();
-        const targetSocketId = onlineUsers.get(friendId);
-        if (targetSocketId) io.to(targetSocketId).emit('new-notification', userData[friendId].notifications);
+      await notifyUser(friendId, `${initiator?.name || 'Игрок'} удалил вас из друзей`);
     }
+
+    // Обе стороны обновляют список друзей в реальном времени
+    const sSocket = onlineUsers.get(userId);
+    const tSocket = onlineUsers.get(friendId);
+    if (sSocket) io.to(sSocket).emit('friends-updated');
+    if (tSocket) io.to(tSocket).emit('friends-updated');
+
     callback?.({ success: true });
   });
 

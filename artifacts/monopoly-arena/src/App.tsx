@@ -1162,16 +1162,23 @@ function Dashboard({
     // НОВЫЙ ОТДЕЛЬНЫЙ useEffect для друзей (он остаётся снаружи)
   useEffect(() => {
     if (!player?.id || player?.guest) return;
-    socket.emit('get-friends', player.id, (response: any) => {
-      if (response?.success) setFriends(response.friends);
-    });
+    const reload = () => {
+      socket.emit('get-friends', player.id, (response: any) => {
+        if (response?.success) setFriends(response.friends);
+      });
+    };
+    reload();
     // Реальное время: друг зашёл/вышел
     const handle = ({ userId, online }: { userId: string; online: boolean }) => {
       setFriends(prev => prev.map(f => f.id === userId ? { ...f, online } : f));
       setFriendSearchResults(prev => prev.map(f => f.id === userId ? { ...f, online } : f));
     };
     socket.on('friend-status-changed', handle);
-    return () => { socket.off('friend-status-changed', handle); };
+    socket.on('friends-updated', reload);
+    return () => {
+      socket.off('friend-status-changed', handle);
+      socket.off('friends-updated', reload);
+    };
   }, [player?.id]);
 
   // Поиск игроков через сервер (работает, даже если своих друзей нет)
@@ -2483,6 +2490,7 @@ function Friends({
   const isGuest = player?.guest;
    const [friends, setFriends] = useState<{ id: string; name: string; online: boolean }[]>([]);
   const [friendRequests, setFriendRequests] = useState<{ fromId: string; fromName: string; timestamp: number; fromOnline: boolean }[]>([]);
+  const [outgoingRequests, setOutgoingRequests] = useState<{ toId: string; toName: string; timestamp: number }[]>([]);
   const [activeSubTab, setActiveSubTab] = useState<"friends" | "requests">("friends");
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<{ id: string; name: string; online: boolean }[]>([]);
@@ -2500,19 +2508,32 @@ function Friends({
 
     useEffect(() => {
     if (!userId || isGuest) return;
-    socket.emit('get-friends', userId, (response: any) => {
-      if (response?.success) setFriends(response.friends);
-    });
-    socket.emit('get-friend-requests', userId, (response: any) => {
-      if (response?.success) setFriendRequests(response.requests || []);
-    });
+    const reload = () => {
+      socket.emit('get-friends', userId, (response: any) => {
+        if (response?.success) setFriends(response.friends);
+      });
+      socket.emit('get-friend-requests', userId, (response: any) => {
+        if (response?.success) {
+          setFriendRequests(response.requests || []);
+          setOutgoingRequests(response.outgoing || []);
+        }
+      });
+    };
+    reload();
     // Реальное время: друг зашёл/вышел
     const handle = ({ userId: changedId, online }: { userId: string; online: boolean }) => {
       setFriends(prev => prev.map(f => f.id === changedId ? { ...f, online } : f));
       setSearchResults(prev => prev.map(f => f.id === changedId ? { ...f, online } : f));
     };
     socket.on('friend-status-changed', handle);
-    return () => { socket.off('friend-status-changed', handle); };
+    // Точечные события для друзей
+    socket.on('friend-requests-updated', reload);
+    socket.on('friends-updated', reload);
+    return () => {
+      socket.off('friend-status-changed', handle);
+      socket.off('friend-requests-updated', reload);
+      socket.off('friends-updated', reload);
+    };
   }, [userId, isGuest]);
 
   const handleSearch = (query: string) => {
@@ -2682,11 +2703,17 @@ function Friends({
               )}
 
               {activeSubTab === "requests" && (
-              <div className="mt-3 space-y-2">
-                {friendRequests.length === 0 && (
-                  <div className="py-6 text-center text-sm text-muted-foreground">Нет входящих запросов</div>
-                )}
-                {friendRequests.map((req) => {
+              <div className="mt-3 space-y-4">
+                {/* Входящие */}
+                <div>
+                  <div className="mb-2 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                    Входящие ({friendRequests.length})
+                  </div>
+                  <div className="space-y-2">
+                    {friendRequests.length === 0 && (
+                      <div className="py-3 text-center text-xs text-muted-foreground">Нет входящих</div>
+                    )}
+                    {friendRequests.map((req) => {
                   const initials = req.fromName.split(/\s+/).slice(0, 2).map(p => p[0]).join('').toUpperCase();
                   const colorIndex = req.fromName.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0) % PLAYER_COLORS.length;
                   const color = PLAYER_COLORS[colorIndex];
@@ -2718,7 +2745,45 @@ function Friends({
                       </div>
                     </div>
                   );
-                })}
+                    })}
+                  </div>
+                </div>
+
+                {/* Исходящие */}
+                <div>
+                  <div className="mb-2 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                    Исходящие ({outgoingRequests.length})
+                  </div>
+                  <div className="space-y-2">
+                    {outgoingRequests.length === 0 && (
+                      <div className="py-3 text-center text-xs text-muted-foreground">Нет отправленных</div>
+                    )}
+                    {outgoingRequests.map((req) => (
+                      <div key={req.toId} className="flex items-center gap-3 rounded-xl p-2.5 transition hover:bg-muted">
+                        <Avatar initials={req.toName[0] || "?"} color="#e96852" size="sm" />
+                        <div className="min-w-0 flex-1">
+                          <b className="truncate text-sm">{req.toName}</b>
+                          <div className="truncate text-[11px] text-muted-foreground">
+                            {req.toId} · ожидает ответа
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => {
+                            if (!userId || isGuest) return;
+                            socket.emit('decline-friend-request', { userId: req.toId, fromId: userId }, (response: any) => {
+                              if (response?.success) {
+                                setOutgoingRequests(prev => prev.filter(r => r.toId !== req.toId));
+                              }
+                            });
+                          }}
+                          className="rounded-lg bg-[#f6dfd7] px-3 py-1.5 text-xs font-bold text-primary hover:bg-[#efcec2]"
+                        >
+                          Отменить
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               </div>
               )}
             </>
@@ -3816,6 +3881,7 @@ function Inventory({ onMarket }: { onMarket: () => void }) {
   const [notice, setNotice] = useState("");
     const [sellTarget, setSellTarget] = useState<OwnedItem | null>(null);
   const [sellPrice, setSellPrice] = useState("");
+  const [sellError, setSellError] = useState<string>("");
     // ============ ОБМЕНЫ ============
   const [inventoryTab, setInventoryTab] = useState<"items" | "trades" | "history">("items");
   const [outgoingTrades, setOutgoingTrades] = useState<Trade[]>([]);
@@ -4165,6 +4231,7 @@ const deactivate = (item: OwnedItem) => {
                   onClick={() => {
                     setSellTarget(item);
                     setSellPrice(String(getRecommendedPrice(item)));
+                    setSellError("");
                   }}
                   className="shrink-0 rounded-lg bg-secondary px-2 py-1.5 text-[10px] font-bold text-secondary-foreground"
                 >
@@ -4480,10 +4547,15 @@ const deactivate = (item: OwnedItem) => {
                 <h2 className="mt-1 font-display text-2xl font-bold">Выставить на рынок</h2>
                 <p className="mt-1 text-xs text-muted-foreground">«{sellTarget.name}»</p>
               </div>
-              <button onClick={() => setSellTarget(null)} className="rounded-lg p-2 text-muted-foreground hover:bg-muted">
+              <button onClick={() => { setSellTarget(null); setSellError(""); }} className="rounded-lg p-2 text-muted-foreground hover:bg-muted">
                 <X size={18} />
               </button>
             </div>
+            {sellError && (
+              <div className="mt-3 rounded-lg border border-primary/30 bg-[#f6dfd7] px-3 py-2 text-xs font-medium text-primary">
+                {sellError}
+              </div>
+            )}
             <label className="mt-5 block text-xs font-bold">
               Цена в Coins
               <input
@@ -4500,16 +4572,20 @@ const deactivate = (item: OwnedItem) => {
             </label>
             <div className="mt-5 flex justify-end gap-2">
               <button
-                onClick={() => setSellTarget(null)}
+                onClick={() => {
+                  setSellTarget(null);
+                  setSellError("");
+                }}
                 className="rounded-xl border border-input px-4 py-2.5 text-xs font-bold"
               >
                 Отмена
               </button>
               <button
                 onClick={() => {
+                  setSellError("");
                   const amount = Number(sellPrice);
                   if (!Number.isFinite(amount) || amount < 1) {
-                    setNotice("Введите корректную цену");
+                    setSellError("Введите корректную цену");
                     return;
                   }
                   socket.emit('add-market-listing', {
@@ -4527,7 +4603,7 @@ const deactivate = (item: OwnedItem) => {
                       setNotice(`«${sellTarget.name}» выставлен на рынке!`);
                       setSellTarget(null);
                     } else {
-                      setNotice(response?.error || "Не удалось выставить на рынок");
+                      setSellError(response?.error || "Не удалось выставить на рынок");
                     }
                   });
                 }}
@@ -11510,6 +11586,18 @@ function AppShell({
 const [notifications, setNotifications] = useState<{ text: string; timestamp: number; read: boolean }[]>([]);
 const [showNotifications, setShowNotifications] = useState(false);
 const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+const notificationsRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!showNotifications) return;
+    const handler = (e: MouseEvent) => {
+      if (notificationsRef.current && !notificationsRef.current.contains(e.target as Node)) {
+        setShowNotifications(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [showNotifications]);
 
 // Кошелёк и VIP для плашки в шапке
 const [walletCoins, setWalletCoins] = useState<number>(() => {
@@ -11777,7 +11865,7 @@ useEffect(() => {
             <button className="hidden rounded-lg p-1.5 text-muted-foreground hover:bg-muted sm:block">
               <CircleHelp size={16} />
             </button>
-            <div className="relative">
+            <div className="relative" ref={notificationsRef}>
         <button
         onClick={() => {
           const willOpen = !showNotifications;

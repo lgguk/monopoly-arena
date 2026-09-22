@@ -1081,6 +1081,7 @@ function Dashboard({
   const [findMode, setFindMode] = useState<"Все" | LobbyMode>("Все");
   const [findNotice, setFindNotice] = useState("");
   const [lobbyDeletedNotice, setLobbyDeletedNotice] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<LobbyRoom | null>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const [userScrolled, setUserScrolled] = useState(false);
   const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -1367,7 +1368,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
 
     const refreshRooms = () => {
     socket.emit('get-rooms');
-    setNotice("Список комнат обновлён");
+    setNotice("Обновляем список…");
     setTimeout(() => setNotice(""), 1500);
   };
 
@@ -1831,9 +1832,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (confirm(`Удалить лобби "${room.name}"?`)) {
-                            socket.emit('delete-room', room.id);
-                          }
+                          setDeleteTarget(room);
                         }}
                         className="rounded-lg border border-primary/30 bg-[#f6dfd7] p-2 text-primary transition-colors hover:bg-[#efcec2]"
                         title={isAdmin ? "Удалить лобби (Админ)" : "Удалить моё лобби"}
@@ -2144,6 +2143,48 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
               </button>
             </div>
           </form>
+        </div>
+      )}
+            {deleteTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#29233e]/60 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-2xl border border-card-border bg-card p-6 shadow-2xl">
+            <div className="flex items-start justify-between">
+              <div>
+                <div className="font-mono text-[10px] uppercase tracking-[.2em] text-primary">
+                  подтверждение
+                </div>
+                <h2 className="mt-1 font-display text-2xl font-bold">
+                  Удалить лобби?
+                </h2>
+              </div>
+              <button
+                onClick={() => setDeleteTarget(null)}
+                className="rounded-lg p-2 text-muted-foreground hover:bg-muted"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <p className="mt-4 text-sm text-muted-foreground">
+              Комната <b className="text-foreground">«{deleteTarget.name}»</b> будет удалена. Игроки, которые ещё не присоединились, потеряют её из списка.
+            </p>
+            <div className="mt-6 flex justify-end gap-2">
+              <button
+                onClick={() => setDeleteTarget(null)}
+                className="rounded-xl border border-input px-4 py-2.5 text-xs font-bold"
+              >
+                Отмена
+              </button>
+              <button
+                onClick={() => {
+                  socket.emit('delete-room', deleteTarget.id);
+                  setDeleteTarget(null);
+                }}
+                className="rounded-xl bg-primary px-4 py-2.5 text-xs font-bold text-primary-foreground"
+              >
+                Удалить
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

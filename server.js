@@ -808,6 +808,13 @@ io.on('connection', (socket) => {
     });
 
     socket.emit('update-rooms', rooms);
+
+    // Клиент просит актуальный список комнат (кнопка «Обновить список»).
+    // Без этого обработчика запрос просто игнорировался.
+    socket.on('get-rooms', () => {
+      socket.emit('update-rooms', rooms);
+    });
+
     socket.on('update-user-xp', (data) => {
   const { userId, xp, stats } = data;
   if (!userId || !userData[userId]) return;

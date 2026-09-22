@@ -11039,6 +11039,7 @@ function AppShell({
   onLogout,
   isAdmin = false,
   gameMode = false,
+  incomingTradesCount = 0,
 }: {
   tab: Tab;
   setTab: (tab: Tab) => void;
@@ -11048,6 +11049,7 @@ function AppShell({
   onLogout: () => void;
   isAdmin?: boolean;
   gameMode?: boolean;
+  incomingTradesCount?: number;
 }) {
   const [mobileNav, setMobileNav] = useState(false);
 const [notifications, setNotifications] = useState<{ text: string; timestamp: number; read: boolean }[]>([]);
@@ -11176,7 +11178,6 @@ useEffect(() => {
               <button
                 key={id}
                 onClick={() => {
-                  console.log("Клик по вкладке:", id); // <--- Добавь эту строку
                   setTab(id);
                   setMobileNav(false);
                 }}
@@ -11184,6 +11185,11 @@ useEffect(() => {
               >
                 <Icon size={14} />
                 {label}
+                {id === "inventory" && incomingTradesCount > 0 && (
+                  <span className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[9px] font-bold text-white">
+                    {incomingTradesCount}
+                  </span>
+                )}
                 {id === "friends" && (
                   <span className="ml-auto h-2 w-2 rounded-full bg-[#e7ba68]" />
                 )}
@@ -11471,6 +11477,26 @@ const [currentRoomId, setCurrentRoomId] = useState<string | null>(null);
   const [findOpen, setFindOpen] = useState(false);
     const [pendingChatFriend, setPendingChatFriend] = useState<{ id: string; name: string; online: boolean } | null>(null);
   const [activeGame, setActiveGame] = useState<{ roomId: string; roomName: string; disconnected: boolean } | null>(null);
+    const [incomingTradesCount, setIncomingTradesCount] = useState(0);
+
+  useEffect(() => {
+    if (!player?.id) {
+      setIncomingTradesCount(0);
+      return;
+    }
+    const fetch = () => {
+      socket.emit("get-trades", player.id, (res: any) => {
+        if (res?.success) {
+          setIncomingTradesCount((res.incoming || []).length);
+        }
+      });
+    };
+    fetch();
+    socket.on("trades-updated", fetch);
+    return () => {
+      socket.off("trades-updated", fetch);
+    };
+  }, [player?.id]);
 
   // Запрашиваем активную игру при логине
   useEffect(() => {
@@ -11710,6 +11736,7 @@ if (data.activeSkins && typeof data.activeSkins === "object") {
         onLogin={() => setAuthOpen(true)}
         isAdmin={true}
         onLogout={logout}
+        incomingTradesCount={incomingTradesCount}
       >
         {adminContent}
       </AppShell>
@@ -11792,6 +11819,7 @@ if (data.activeSkins && typeof data.activeSkins === "object") {
         name={player?.name}
         onLogin={() => setAuthOpen(true)}
         onLogout={logout}
+        incomingTradesCount={incomingTradesCount}
       >
         {content}
       </AppShell>

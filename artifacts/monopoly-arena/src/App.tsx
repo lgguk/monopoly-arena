@@ -1063,8 +1063,10 @@ function Dashboard({
   const [friendSearchResults, setFriendSearchResults] = useState<{ id: string; name: string; online: boolean }[]>([]);
   const [isSpinning, setIsSpinning] = useState(false);
   const [jailPaymentPending, setJailPaymentPending] = useState(false);
-    type QuestItem = { id: string; title: string; reward: number; icon: string; done: boolean; claimed: boolean };
-  const [quests, setQuests] = useState<QuestItem[]>([]);
+    type QuestItem = { id: string; title: string; reward: number; icon: string; done: boolean; claimed: boolean; progress: number; target: number };
+  const [dailyQuests, setDailyQuests] = useState<QuestItem[]>([]);
+  const [weeklyQuests, setWeeklyQuests] = useState<QuestItem[]>([]);
+  const [questTab, setQuestTab] = useState<"daily" | "weekly">("daily");
   const [roomQuery, setRoomQuery] = useState("");
   const [roomMode, setRoomMode] = useState<"Все" | LobbyMode>("Все");
   const [friendQuery, setFriendQuery] = useState("");
@@ -1110,29 +1112,37 @@ function Dashboard({
     };
   }, [onJoinGame]);
 
-    // Ежедневные квесты
+    // Квесты (daily + weekly)
   useEffect(() => {
     if (!player?.id || player?.guest) return;
+
+    const convertBucket = (bucket: any) => {
+      if (!Array.isArray(bucket)) return [];
+      return bucket.map((v: any) => ({
+        id: v.id,
+        title: v.title,
+        reward: v.reward,
+        icon: v.icon,
+        done: !!v.done,
+        claimed: !!v.claimed,
+        progress: Number(v.progress) || 0,
+        target: Number(v.target) || 1,
+      }));
+    };
+
     const fetchQuests = () => {
       socket.emit('get-quests', player.id, (res: any) => {
-        if (res?.success) setQuests(res.items || []);
+        if (!res?.success) return;
+        setDailyQuests(convertBucket(res.daily));
+        setWeeklyQuests(convertBucket(res.weekly));
       });
     };
     fetchQuests();
 
     const handleUpdate = (data: any) => {
-      if (!data?.items) return;
-      const items = Object.entries(data.items).map(([id, v]: any) => {
-        const def = {
-          dailyLogin:      { title: 'Заходи каждый день', reward: 50,  icon: '📅' },
-          playGame:        { title: 'Сыграй 1 партию',    reward: 100, icon: '🎲' },
-          winGame:         { title: 'Победи в партии',    reward: 250, icon: '🏆' },
-          buyProperty:     { title: 'Купи 1 поле',        reward: 50,  icon: '🏠' },
-          improveProperty: { title: 'Улучши 1 поле',      reward: 100, icon: '⭐' },
-        }[id as string] || { title: id, reward: 0, icon: '❓' };
-        return { id, ...def, done: v.done, claimed: v.claimed };
-      });
-      setQuests(items);
+      if (!data) return;
+      if (Array.isArray(data.daily)) setDailyQuests(convertBucket(data.daily));
+      if (Array.isArray(data.weekly)) setWeeklyQuests(convertBucket(data.weekly));
     };
 
     socket.on('quests-updated', handleUpdate);
@@ -1145,10 +1155,9 @@ function Dashboard({
     if (!player?.id) return;
     socket.emit('claim-quest', { userId: player.id, questId }, (res: any) => {
       if (res?.success) {
-        // Синхронизируем баланс с localStorage — иначе Shop/Inventory
-        // читают старую сумму, пока не перезайдут на сервер.
         if (typeof res.coins === "number") {
           localStorage.setItem("arena-coins", String(res.coins));
+          window.dispatchEvent(new Event("arena-wallet-updated"));
         }
         setNotice(`Получено ${res.reward} Coins!`);
         setTimeout(() => setNotice(""), 2500);
@@ -1434,13 +1443,14 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
           <div className="rounded-2xl border border-card-border bg-card p-5">
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="font-display text-xl font-bold">Задания дня</h2>
+                <h2 className="font-display text-xl font-bold">Задания</h2>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  Обновляются каждую полночь (МСК)
+                  {questTab === "daily" ? "Обновляются каждую полночь (МСК)" : "Обновляются в ночь на понедельник (МСК)"}
                 </p>
               </div>
               <Sparkles size={16} className="text-primary" />
             </div>
+
             {player?.guest ? (
               <div className="mt-4 rounded-xl border border-dashed border-card-border bg-muted px-4 py-6 text-center">
                 <Coins size={24} className="mx-auto text-muted-foreground" />
@@ -1448,54 +1458,92 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
                   Доступно только с аккаунтом
                 </div>
                 <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
-                  Зарегистрируйтесь, чтобы получать 50–250 Coins каждый день за простые действия.
+                  Зарегистрируйтесь, чтобы получать Coins за простые действия.
                 </p>
               </div>
             ) : (
-            <div className="mt-4 space-y-2">
-              {quests.map((q) => (
-                <div
-                  key={q.id}
-                  className={`flex items-center gap-2.5 rounded-xl border px-3 py-2.5 transition-colors ${
-                    q.claimed
-                      ? "border-accent/30 bg-[#dceae3]/50 opacity-60"
-                      : q.done
-                        ? "border-primary/40 bg-[#f6dfd7]"
-                        : "border-border bg-muted"
-                  }`}
-                >
-                  <span className="shrink-0 text-base">{q.icon}</span>
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-[11px] font-bold">
-                      {q.title}
+              <>
+                <div className="mt-4 flex gap-1 rounded-xl bg-muted p-1">
+                  <button
+                    onClick={() => setQuestTab("daily")}
+                    className={`flex-1 rounded-lg px-2 py-1.5 text-[11px] font-bold transition-colors ${
+                      questTab === "daily" ? "bg-card shadow-sm text-foreground" : "text-muted-foreground"
+                    }`}
+                  >
+                    Ежедневные
+                  </button>
+                  <button
+                    onClick={() => setQuestTab("weekly")}
+                    className={`flex-1 rounded-lg px-2 py-1.5 text-[11px] font-bold transition-colors ${
+                      questTab === "weekly" ? "bg-card shadow-sm text-foreground" : "text-muted-foreground"
+                    }`}
+                  >
+                    Еженедельные
+                  </button>
+                </div>
+
+                <div className="mt-3 space-y-2">
+                  {(questTab === "daily" ? dailyQuests : weeklyQuests).map((q) => {
+                    const showProgress = q.target > 1;
+                    return (
+                      <div
+                        key={q.id}
+                        className={`flex items-center gap-2.5 rounded-xl border px-3 py-2.5 transition-colors ${
+                          q.claimed
+                            ? "border-accent/30 bg-[#dceae3]/50 opacity-60"
+                            : q.done
+                              ? "border-primary/40 bg-[#f6dfd7]"
+                              : "border-border bg-muted"
+                        }`}
+                      >
+                        <span className="shrink-0 text-base">{q.icon}</span>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-[11px] font-bold">
+                            {q.title}
+                          </div>
+                          <div className="text-[10px] text-muted-foreground">
+                            {q.claimed ? (
+                              <span className="text-accent font-bold">✓ Получено</span>
+                            ) : showProgress ? (
+                              <>
+                                {q.progress} / {q.target} · {" "}
+                                <Coins size={10} className="mr-0.5 inline text-[#b18428]" />
+                                {q.reward} Coins
+                              </>
+                            ) : (
+                              <>
+                                <Coins size={10} className="mr-0.5 inline text-[#b18428]" />
+                                {q.reward} Coins
+                              </>
+                            )}
+                          </div>
+                          {showProgress && !q.claimed && (
+                            <div className="mt-1 h-1 overflow-hidden rounded-full bg-black/10">
+                              <div
+                                className="h-full rounded-full bg-primary transition-all"
+                                style={{ width: `${Math.min(100, (q.progress / q.target) * 100)}%` }}
+                              />
+                            </div>
+                          )}
+                        </div>
+                        {q.done && !q.claimed && (
+                          <button
+                            onClick={() => claimQuest(q.id)}
+                            className="shrink-0 rounded-lg bg-primary px-2.5 py-1.5 text-[10px] font-bold text-primary-foreground hover:brightness-95 transition-all"
+                          >
+                            Забрать
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {(questTab === "daily" ? dailyQuests : weeklyQuests).length === 0 && (
+                    <div className="py-6 text-center text-[11px] text-muted-foreground">
+                      Загрузка заданий…
                     </div>
-                    <div className="text-[10px] text-muted-foreground">
-                      {q.claimed ? (
-                        <span className="text-accent font-bold">✓ Получено</span>
-                      ) : (
-                        <>
-                          <Coins size={10} className="mr-0.5 inline text-[#b18428]" />
-                          {q.reward} Coins
-                        </>
-                      )}
-                    </div>
-                  </div>
-                  {q.done && !q.claimed && (
-                    <button
-                      onClick={() => claimQuest(q.id)}
-                      className="shrink-0 rounded-lg bg-primary px-2.5 py-1.5 text-[10px] font-bold text-primary-foreground hover:brightness-95 transition-all"
-                    >
-                      Забрать
-                    </button>
                   )}
                 </div>
-              ))}
-              {quests.length === 0 && (
-                <div className="py-6 text-center text-[11px] text-muted-foreground">
-                  Загрузка заданий…
-                </div>
-              )}
-            </div>
+              </>
             )}
           </div>
           <div className="rounded-2xl border border-card-border bg-card p-5">

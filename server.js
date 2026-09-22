@@ -253,15 +253,32 @@ async function loadUserDataFromDb() {
 
       // Квесты
       const questsRes = await db.query(
-        'SELECT day_key, quest_id, done, claimed FROM quest_progress WHERE user_id = $1',
+        'SELECT day_key, quest_id, done, claimed, progress, target FROM quest_progress WHERE user_id = $1',
         [uid]
       );
       let quests = null;
       if (questsRes.rows.length > 0) {
-        const dayKey = questsRes.rows[0].day_key;
-        const items = {};
-        questsRes.rows.forEach((r) => { items[r.quest_id] = { done: r.done, claimed: r.claimed }; });
-        quests = { dayKey, items };
+        const daily = {};
+        const weekly = {};
+        let dayKey = null;
+        let weekKey = null;
+        const dailyIds = new Set(DAILY_QUESTS.map((d) => d.id));
+        questsRes.rows.forEach((r) => {
+          const item = {
+            done: r.done,
+            claimed: r.claimed,
+            progress: Number(r.progress) || 0,
+            target: Number(r.target) || 0,
+          };
+          if (dailyIds.has(r.quest_id)) {
+            daily[r.quest_id] = item;
+            dayKey = r.day_key;
+          } else {
+            weekly[r.quest_id] = item;
+            weekKey = r.day_key;
+          }
+        });
+        quests = { dayKey, weekKey, daily, weekly };
       }
 
       // Уведомления
@@ -410,16 +427,35 @@ async function saveUserData(userId = null) {
       }
 
       // ===== quest_progress =====
-      if (d.quests && d.quests.dayKey && d.quests.items) {
+      // Храним и daily, и weekly. Ключ дня — "YYYY-MM-DD", недели — "YYYY-Www".
+      if (d.quests) {
         await db.query('DELETE FROM quest_progress WHERE user_id = $1', [uid]);
-        for (const qid of Object.keys(d.quests.items)) {
-          const it = d.quests.items[qid] || {};
-          await db.query(
-            `INSERT INTO quest_progress (user_id, day_key, quest_id, done, claimed)
-             VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
-            [uid, d.quests.dayKey, qid, !!it.done, !!it.claimed]
-          );
-        }
+        const writeBucket = async (bucket, periodKey) => {
+          if (!bucket || !periodKey) return;
+          for (const qid of Object.keys(bucket)) {
+            const it = bucket[qid] || {};
+            await db.query(
+              `INSERT INTO quest_progress (user_id, day_key, quest_id, done, claimed, progress, target)
+               VALUES ($1,$2,$3,$4,$5,$6,$7)
+               ON CONFLICT (user_id, day_key, quest_id) DO UPDATE SET
+                 done = EXCLUDED.done,
+                 claimed = EXCLUDED.claimed,
+                 progress = EXCLUDED.progress,
+                 target = EXCLUDED.target`,
+              [
+                uid,
+                periodKey,
+                qid,
+                !!it.done,
+                !!it.claimed,
+                Number(it.progress) || 0,
+                Number(it.target) || 0,
+              ]
+            );
+          }
+        };
+        await writeBucket(d.quests.daily, d.quests.dayKey);
+        await writeBucket(d.quests.weekly, d.quests.weekKey);
       }
 
       // ===== notifications (delete + insert) =====
@@ -618,8 +654,8 @@ async function finalizeGame(roomId) {
       }
       // Квесты: сыграл партию — всем, кто не leftAlive (place > 0).
       // Победил — только place === 1.
-      markQuestDone(p.id, 'playGame');
-      if (place === 1) markQuestDone(p.id, 'winGame');
+      markQuestProgress(p.id, 'playGame');
+      if (place === 1) markQuestProgress(p.id, 'winGame');
       await saveUserData(p.id);
 
       // Уведомление
@@ -764,14 +800,26 @@ function notifyFriendsStatus(userId, isOnline) {
   });
 }
 
-// ============ ЕЖЕДНЕВНЫЕ КВЕСТЫ ============
-const QUEST_DEFS = [
-  { id: 'dailyLogin',      title: 'Заходи каждый день',   reward: 50,  icon: '📅' },
-  { id: 'playGame',        title: 'Сыграй 1 партию',      reward: 100, icon: '🎲' },
-  { id: 'winGame',         title: 'Победи в партии',      reward: 250, icon: '🏆' },
-  { id: 'buyProperty',     title: 'Купи 1 поле',          reward: 50,  icon: '🏠' },
-  { id: 'improveProperty', title: 'Улучши 1 поле',        reward: 100, icon: '⭐' },
+// ============ КВЕСТЫ ============
+// Ежедневные — сбрасываются в полночь (МСК).
+// Еженедельные — сбрасываются в ночь с воскресенья на понедельник.
+// target = сколько раз нужно сделать. progress = сколько сделано.
+const DAILY_QUESTS = [
+  { id: 'dailyLogin',      title: 'Заходи каждый день',   reward: 5,  icon: '📅', target: 1, event: 'login' },
+  { id: 'playGame',        title: 'Сыграй 1 партию',      reward: 10, icon: '🎲', target: 1, event: 'playGame' },
+  { id: 'winGame',         title: 'Победи в партии',      reward: 20, icon: '🏆', target: 1, event: 'winGame' },
+  { id: 'buyProperty',     title: 'Купи 1 поле',          reward: 5,  icon: '🏠', target: 1, event: 'buyProperty' },
+  { id: 'improveProperty', title: 'Улучши 1 поле',        reward: 10, icon: '⭐', target: 1, event: 'improveProperty' },
 ];
+
+const WEEKLY_QUESTS = [
+  { id: 'weeklyWin3',        title: 'Победи 3 раза',            reward: 50,  icon: '🥇', target: 3, event: 'winGame' },
+  { id: 'weeklyPlay10',      title: 'Сыграй 10 партий',         reward: 30,  icon: '🎯', target: 10, event: 'playGame' },
+  { id: 'weeklyMonopoly',    title: 'Собери монополию',         reward: 100, icon: '🏛', target: 1, event: 'monopoly' },
+  { id: 'weeklyMarketDeal',  title: 'Соверши сделку на рынке',  reward: 20,  icon: '💱', target: 1, event: 'marketDeal' },
+];
+
+const QUEST_DEFS = [...DAILY_QUESTS, ...WEEKLY_QUESTS];
 
 // Ключ дня по московскому времени (UTC+3), формат "YYYY-MM-DD"
 function getMoscowDayKey() {
@@ -780,38 +828,111 @@ function getMoscowDayKey() {
   return msk.toISOString().slice(0, 10);
 }
 
-// Lazy-сброс: если dayKey у игрока не совпадает с текущим — обнуляем
-function ensureQuestsFresh(userId) {
-  if (!userData[userId]) return;
-  const today = getMoscowDayKey();
-  const q = userData[userId].quests;
-  if (!q || q.dayKey !== today) {
-    userData[userId].quests = {
-      dayKey: today,
-      items: {
-        dailyLogin:      { done: true,  claimed: false }, // заход уже случился
-        playGame:        { done: false, claimed: false },
-        winGame:         { done: false, claimed: false },
-        buyProperty:     { done: false, claimed: false },
-        improveProperty: { done: false, claimed: false },
-      },
-    };
-    saveUserData();
-  }
+// Ключ недели по МСК. Формат "YYYY-Www" (ISO week).
+// Неделя начинается с понедельника, сбрасывается в ночь с воскресенья на понедельник.
+function getMoscowWeekKey() {
+  const now = new Date();
+  const msk = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+  // ISO week number
+  const target = new Date(msk.valueOf());
+  const dayNr = (msk.getUTCDay() + 6) % 7; // Пн=0, Вс=6
+  target.setUTCDate(target.getUTCDate() - dayNr + 3); // четверг той же недели
+  const firstThursday = new Date(Date.UTC(target.getUTCFullYear(), 0, 4));
+  const diff = target.getTime() - firstThursday.getTime();
+  const week = 1 + Math.round(diff / (7 * 24 * 60 * 60 * 1000));
+  return `${target.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
 }
 
-// Помечаем квест выполненным (если сегодня ещё не выполнен)
-function markQuestDone(userId, questId) {
-  if (!userData[userId]) return;
-  ensureQuestsFresh(userId);
+// Гарантирует, что у игрока есть свежие daily и weekly квесты.
+// Сбрасывает просроченные (по МСК).
+// НЕ сохраняет в БД сам — вызывающий код должен вызвать saveUserData после.
+function ensureQuestsFresh(userId) {
+  if (!userData[userId]) return false;
+  const dayKey = getMoscowDayKey();
+  const weekKey = getMoscowWeekKey();
   const q = userData[userId].quests;
-  if (q.items[questId] && !q.items[questId].done) {
-    q.items[questId].done = true;
-    saveUserData();
-    // Обновляем клиенту список квестов
+  let changed = false;
+
+  if (!q) {
+    userData[userId].quests = { dayKey, weekKey, daily: {}, weekly: {} };
+    changed = true;
+  } else {
+    if (q.dayKey !== dayKey) {
+      q.dayKey = dayKey;
+      q.daily = {};
+      changed = true;
+    }
+    if (q.weekKey !== weekKey) {
+      q.weekKey = weekKey;
+      q.weekly = {};
+      changed = true;
+    }
+  }
+
+  // Инициализируем отсутствующие записи.
+  // dailyLogin сразу помечаем выполненным — игрок уже зашёл.
+  const qq = userData[userId].quests;
+  for (const def of DAILY_QUESTS) {
+    if (!qq.daily[def.id]) {
+      qq.daily[def.id] = {
+        progress: def.id === 'dailyLogin' ? 1 : 0,
+        target: def.target,
+        done: def.id === 'dailyLogin',
+        claimed: false,
+      };
+      changed = true;
+    }
+  }
+  for (const def of WEEKLY_QUESTS) {
+    if (!qq.weekly[def.id]) {
+      qq.weekly[def.id] = {
+        progress: 0,
+        target: def.target,
+        done: false,
+        claimed: false,
+      };
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+// Увеличивает прогресс квеста по событию.
+// Событие — строковый идентификатор (например, 'winGame', 'playGame', 'monopoly', 'marketDeal').
+// Ищет все активные квесты (daily + weekly), у которых event совпадает, и наращивает progress.
+function markQuestProgress(userId, event) {
+  if (!userData[userId] || !event) return;
+  ensureQuestsFresh(userId);
+  const qq = userData[userId].quests;
+  let changed = false;
+
+  const applyTo = (bucket, defs) => {
+    for (const def of defs) {
+      if (def.event !== event) continue;
+      const it = bucket[def.id];
+      if (!it || it.claimed) continue;
+      if (it.done) continue;
+      it.progress = Math.min((it.progress || 0) + 1, it.target);
+      if (it.progress >= it.target) {
+        it.done = true;
+      }
+      changed = true;
+    }
+  };
+
+  applyTo(qq.daily, DAILY_QUESTS);
+  applyTo(qq.weekly, WEEKLY_QUESTS);
+
+  if (changed) {
+    saveUserData(userId);
     const socketId = onlineUsers.get(userId);
     if (socketId) {
-      io.to(socketId).emit('quests-updated', { dayKey: q.dayKey, items: q.items });
+      io.to(socketId).emit('quests-updated', {
+        dayKey: qq.dayKey,
+        weekKey: qq.weekKey,
+        daily: qq.daily,
+        weekly: qq.weekly,
+      });
     }
   }
 }
@@ -1960,6 +2081,10 @@ socket.on('buy-market-listing', async (data, callback) => {
     `💵 Ваш предмет «${listing.item?.name || "?"}» куплен за ${listing.price} Coins.`
   );
 
+  // Квест «сделка на рынке» — обеим сторонам
+  markQuestProgress(buyerId, 'marketDeal');
+  markQuestProgress(sellerId, 'marketDeal');
+
   if (callback) callback({ success: true, item: listing.item });
 });
 
@@ -2429,54 +2554,80 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     if (tSocket) io.to(tSocket).emit('new-notification', []);
   });
 
-    // ---- ЕЖЕДНЕВНЫЕ КВЕСТЫ (запрос и получение награды) ----
+    // ---- КВЕСТЫ (запрос списка) ----
   socket.on('get-quests', (userId, callback) => {
     if (!userId || !userData[userId]) return callback?.({ success: false });
-    ensureQuestsFresh(userId);
+    const changed = ensureQuestsFresh(userId);
+    if (changed) saveUserData(userId);
     const q = userData[userId].quests;
-    const items = QUEST_DEFS.map(def => ({
-      id: def.id,
-      title: def.title,
-      reward: def.reward,
-      icon: def.icon,
-      done: q.items[def.id]?.done || false,
-      claimed: q.items[def.id]?.claimed || false,
-    }));
-    callback?.({ success: true, dayKey: q.dayKey, items });
+
+    const mapBucket = (defs, bucket) =>
+      defs.map((def) => {
+        const it = bucket[def.id] || {};
+        return {
+          id: def.id,
+          title: def.title,
+          reward: def.reward,
+          icon: def.icon,
+          target: def.target,
+          progress: Number(it.progress) || 0,
+          done: !!it.done,
+          claimed: !!it.claimed,
+        };
+      });
+
+    callback?.({
+      success: true,
+      dayKey: q.dayKey,
+      weekKey: q.weekKey,
+      daily: mapBucket(DAILY_QUESTS, q.daily),
+      weekly: mapBucket(WEEKLY_QUESTS, q.weekly),
+    });
   });
 
   socket.on('claim-quest', async ({ userId, questId }, callback) => {
     if (!userId || !questId || !userData[userId]) return callback?.({ success: false });
     ensureQuestsFresh(userId);
     const q = userData[userId].quests;
-    const item = q.items[questId];
+
+    // Ищем в daily и weekly
+    let item = q.daily[questId] || q.weekly[questId];
     if (!item || !item.done || item.claimed) {
       return callback?.({ success: false, error: 'Награда недоступна' });
     }
-    const def = QUEST_DEFS.find(d => d.id === questId);
+    const def = QUEST_DEFS.find((d) => d.id === questId);
     if (!def) return callback?.({ success: false, error: 'Квест не найден' });
 
     item.claimed = true;
     const change = await changeBalance(userId, 'quest_claim', def.reward, { questId });
     if (!change.success) {
+      item.claimed = false;
       return callback?.({ success: false, error: change.error });
     }
-    saveUserData();
+    saveUserData(userId);
     console.log(`💰 ${userId} забрал ${def.reward} Coins за "${questId}" (баланс: ${change.newBalance})`);
 
-    // Уведомляем клиента об обновлении данных и квестов
     const sId = onlineUsers.get(userId);
     if (sId) {
       io.to(sId).emit('user-data-updated', userData[userId]);
-      io.to(sId).emit('quests-updated', { dayKey: q.dayKey, items: q.items });
+      io.to(sId).emit('quests-updated', {
+        dayKey: q.dayKey,
+        weekKey: q.weekKey,
+        daily: q.daily,
+        weekly: q.weekly,
+      });
     }
     if (callback) callback({ success: true, reward: def.reward, coins: userData[userId].coins });
   });
 
-  // Клиент сообщает о выполнении квеста (playGame, winGame, buyProperty, improveProperty)
-  socket.on('quest-event', ({ userId, questId }) => {
-    if (!userId || !questId) return;
-    markQuestDone(userId, questId);
+  // Клиент сообщает о событии для прогресса квестов.
+  // event: 'playGame' | 'winGame' | 'buyProperty' | 'improveProperty' | 'monopoly' | 'marketDeal'
+  socket.on('quest-event', ({ userId, event, questId }) => {
+    if (!userId) return;
+    // Поддержка старого формата (questId) для совместимости
+    const ev = event || questId;
+    if (!ev) return;
+    markQuestProgress(userId, ev);
   });
 
       socket.on('update-active-skins', ({ userId, activeSkins }) => {

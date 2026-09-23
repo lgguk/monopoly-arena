@@ -2022,7 +2022,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
       </div>
 
       {createOpen && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 p-4 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 px-4 pb-4 pt-16 backdrop-blur-sm sm:pt-20">
           <form
             onSubmit={createRoom}
             className="my-4 w-full max-w-lg rounded-2xl border border-card-border bg-card p-6 shadow-2xl"
@@ -2166,7 +2166,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
         </div>
       )}
       {findOpen && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 p-4 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 px-4 pb-4 pt-16 backdrop-blur-sm sm:pt-20">
           <form
             onSubmit={findGame}
             className="my-4 w-full max-w-md rounded-2xl border border-card-border bg-card p-6 shadow-2xl"
@@ -2242,7 +2242,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
         </div>
       )}
       {joinTarget && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 p-4 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 px-4 pb-4 pt-16 backdrop-blur-sm sm:pt-20">
           <form
             onSubmit={(event) => {
               event.preventDefault();
@@ -2294,7 +2294,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
         </div>
       )}
             {deleteTarget && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 p-4 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 px-4 pb-4 pt-16 backdrop-blur-sm sm:pt-20">
           <div className="my-4 w-full max-w-sm rounded-2xl border border-card-border bg-card p-6 shadow-2xl">
             <div className="flex items-start justify-between">
               <div>

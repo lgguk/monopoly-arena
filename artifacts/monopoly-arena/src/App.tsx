@@ -7536,6 +7536,48 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
             <div className="text-lg">🌀</div>
           </div>
         </div>
+
+        {/* Игроки — компактный список в drawer для мобилы */}
+        <div className="mt-4">
+          <div className="mb-2 flex items-center justify-between">
+            <div className="font-display text-sm font-bold">Игроки</div>
+            <span className="font-mono text-[10px] text-[#aaa2b4]">
+              {players.filter(p => !p.bankrupt).length} / {players.length}
+            </span>
+          </div>
+          <div className="space-y-1">
+            {players.map((p, i) => {
+              const isMyTurn = p.id === (auction ? auction.participants[auction.currentIdx] : players[turn]?.id) && !p.bankrupt;
+              return (
+                <div
+                  key={p.id}
+                  className={`relative flex items-center gap-2 overflow-hidden rounded-lg p-1.5 pr-3 ${p.bankrupt ? "opacity-40" : ""}`}
+                  style={isMyTurn ? { backgroundColor: "rgba(255,255,255,0.1)" } : undefined}
+                >
+                  <div
+                    className="pointer-events-none absolute right-0 top-0 bottom-0 rounded-r-lg transition-all"
+                    style={{
+                      width: isMyTurn ? 6 : 4,
+                      backgroundColor: p.color,
+                      boxShadow: isMyTurn ? `0 0 10px 2px ${p.color}cc` : "none",
+                    }}
+                    aria-hidden="true"
+                  />
+                  <Avatar initials={p.initials} color={p.color} size="sm" avatar={p.avatar} />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[11px] font-bold text-[#f7f0e3]">
+                      {p.name}
+                      {p.bankrupt ? " · банкрот" : ""}
+                    </div>
+                    <div className="text-[9px] text-[#aaa2b4]">
+                      {p.money.toLocaleString("ru-RU")} К
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
       </div>
 
       {!socketConnected && (
@@ -7575,7 +7617,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         </div>
       </div>
       {/* Board + Right panel — shared centered container */}
-      <div className="flex flex-1 items-start justify-center gap-5 overflow-hidden py-1.5 pr-2 pl-2 lg:pl-[268px] border-t-[#5e5a6e] border-r-[#5e5a6e] border-b-[#5e5a6e] border-l-[#5e5a6e] bg-foreground">
+      <div className="flex flex-1 items-start justify-between gap-2 overflow-hidden bg-[#1c1828] p-2 lg:items-start lg:justify-center lg:gap-5 lg:py-1.5 lg:pr-2 lg:pl-[268px]">
                 <div className="relative aspect-square h-full max-h-full shrink-0 shadow-[0_18px_60px_rgba(41,35,62,.35)]">
           <div
             className="grid h-full w-full gap-px bg-[#5e5a6e]"
@@ -9090,7 +9132,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         </div>
 
         {/* Right control panel */}
-<div className="flex h-full w-[255px] shrink-0 flex-col gap-2 overflow-y-auto p-1.5">
+<div className="flex h-full w-[180px] shrink-0 flex-col gap-2 overflow-y-auto p-1 lg:w-[255px] lg:p-1.5">
           <div className="rounded-2xl border border-card-border bg-card p-3">
             <div className="flex items-center justify-between">
               <div>
@@ -9231,8 +9273,8 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
             </div>
           )}
 
-          {/* Players list with hover popup */}
-          <div className="rounded-2xl border border-card-border bg-card p-3">
+          {/* Players list with hover popup — на мобиле перенесён в drawer «Инфо» */}
+          <div className="hidden rounded-2xl border border-card-border bg-card p-3 lg:block">
             <div className="mb-2 flex items-center justify-between">
               <h2 className="font-display text-sm font-bold">Игроки</h2>
               <span className="font-mono text-[9px] text-muted-foreground">
@@ -9300,7 +9342,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           </div>
 
           {/* Rating panel */}
-          {showRating &&
+          {showRating && typeof window !== "undefined" && window.matchMedia("(min-width: 1024px)").matches &&
             (() => {
               const ranked = [...players]
                 .map((p) => {
@@ -9314,7 +9356,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 })
                 .sort((a, b) => b.totalWealth - a.totalWealth);
               return (
-                <div className="rounded-2xl border border-card-border bg-card p-3">
+                <div className="hidden rounded-2xl border border-card-border bg-card p-3 lg:block">
                   <div className="mb-2 font-mono text-[8px] uppercase tracking-wide text-muted-foreground">
                     Рейтинг — богатейшие к беднейшим
                   </div>
@@ -9354,7 +9396,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
             })()}
           <button
             onClick={() => setShowRating((r) => !r)}
-            className="flex w-full items-center justify-center gap-2 rounded-xl border border-input bg-card py-2 text-xs font-bold"
+            className="hidden w-full items-center justify-center gap-2 rounded-xl border border-input bg-card py-2 text-xs font-bold lg:flex"
           >
             <Activity size={12} />{" "}
             {showRating ? "Скрыть рейтинг" : "Рейтинг игроков"}

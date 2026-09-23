@@ -2821,6 +2821,15 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
           const sId = onlineUsers.get(fid);
           if (sId) io.to(sId).emit('friends-updated');
         });
+        // Обновляем игрока во всех игровых комнатах — чтобы аватарка
+        // сразу обновилась и в списке игроков за столом.
+        for (const roomId in gameRooms) {
+          const player = gameRooms[roomId].find(p => p.id === userId);
+          if (player) {
+            player.avatar = avatar || null;
+            io.to(roomId).emit('update-game-players', gameRooms[roomId]);
+          }
+        }
         // Обновляем самого игрока в текущей сессии
         const sId = onlineUsers.get(userId);
         if (sId) {

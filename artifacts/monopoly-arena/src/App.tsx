@@ -1007,9 +1007,9 @@ function Avatar({
   avatar?: string | null;
 }) {
   const sizes = {
-    sm: "h-8 w-8 text-[10px]",
-    md: "h-10 w-10 text-xs",
-    lg: "h-16 w-16 text-lg",
+    sm: "h-8 w-8 text-[14px]",
+    md: "h-10 w-10 text-base",
+    lg: "h-16 w-16 text-2xl",
   };
   const px = { sm: 32, md: 40, lg: 64 }[size];
   return (
@@ -7948,7 +7948,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     className="flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-sm"
                      style={{
                       backgroundColor: p.color,
-                      fontSize: "10px",
+                      fontSize: "14px",
                       position: "relative",
                       zIndex: p.id === movingPlayerId ? 2 : 1,
                       boxShadow: "0 0 0 2px #ffffff, 0 1px 4px rgba(0,0,0,0.35)",
@@ -8815,7 +8815,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   className="flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-sm"
                   style={{
                     backgroundColor: movingPlayer.color,
-                    fontSize: "10px",
+                    fontSize: "14px",
                     boxShadow: "0 0 0 2px #ffffff, 0 1px 4px rgba(0,0,0,0.35)",
                   }}
                 >
@@ -8850,7 +8850,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   className="flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-sm"
                   style={{
                     backgroundColor: dp.color,
-                    fontSize: "10px",
+                    fontSize: "14px",
                     boxShadow: "0 0 0 2px #ffffff, 0 1px 4px rgba(0,0,0,0.35)",
                   }}
                 >
@@ -8976,7 +8976,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     top: `${from.y}%`,
                     transform: "translate(-50%, -50%)",
                     backgroundColor: dp.color,
-                    fontSize: "10px",
+                    fontSize: "14px",
                     transition: "left 1.5s cubic-bezier(0.4, 0, 0.2, 1), top 1.5s cubic-bezier(0.4, 0, 0.2, 1)",
                   }}
                   ref={(el) => {
@@ -9148,8 +9148,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
               {players.map((p, i) => (
                 <div
                   key={p.id}
-                  className={`relative flex items-center gap-2 rounded-lg p-1.5 pl-2 cursor-pointer ${i === turn ? "bg-[#f6dfd7]" : "hover:bg-muted"} ${p.bankrupt ? "opacity-40" : ""}`}
-                  style={{ borderLeft: `3px solid ${p.color}` }}
+                  className={`relative flex items-center gap-2 overflow-hidden rounded-lg p-1.5 pr-3 cursor-pointer ${i === turn ? "bg-[#f6dfd7]" : "hover:bg-muted"} ${p.bankrupt ? "opacity-40" : ""}`}
                   onClick={(e) => {
   e.stopPropagation();
   if (!p.bankrupt) {
@@ -9162,6 +9161,11 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     }
                   }}
                 >
+                  <div
+                    className="pointer-events-none absolute right-0 top-0 bottom-0 w-1.5"
+                    style={{ backgroundColor: p.color }}
+                    aria-hidden="true"
+                  />
                   <Avatar initials={p.initials} color={p.color} size="sm" avatar={p.avatar} />
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[11px] font-bold">

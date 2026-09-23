@@ -2337,7 +2337,11 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     io.emit('update-rooms', rooms);
 
     if (room.players === room.maxPlayers) {
+      room.started = true;
       io.to(roomId).emit('start-game', room);
+      // Убираем лобби из общего списка — игра началась.
+      rooms = rooms.filter(r => r.id !== roomId);
+      io.emit('update-rooms', rooms);
       console.log(`Игра в комнате ${room.name} начинается!`);
     }
     console.log(`Игрок присоединился к ${room.name}. Игроков: ${room.players}/${room.maxPlayers}`);
@@ -2452,6 +2456,11 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     if (roomIndex === -1) return;
     rooms.splice(roomIndex, 1);
     io.emit('update-rooms', rooms);
+    // Если в комнате кто-то был — выгоняем и её из игровых сессий.
+    if (gameRooms[roomId]) {
+      delete gameRooms[roomId];
+      delete roomTurnStart[roomId];
+    }
     console.log(`Лобби ${roomId} удалено хостом`);
   });
 
@@ -2526,7 +2535,9 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       // Финализируем — начислим награды победителю
       await maybeFinalize(roomId);
       io.to(roomId).emit('game-ended');
-      // Планируем удаление комнаты, чтобы не висел баннер переподключения
+      // Убираем лобби из списка (если оно там ещё есть) и чистим игровую сессию.
+      rooms = rooms.filter(r => r.id !== roomId);
+      io.emit('update-rooms', rooms);
       setTimeout(() => {
         delete gameRooms[roomId];
         delete roomTurnStart[roomId];

@@ -7945,22 +7945,26 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     {playersHere.map((p) => (
                         <div
                     key={p.id}
-                    className="flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-sm"
-                     style={{
+                    className="flex w-[23px] h-[23px] items-center justify-center rounded-full"
+                    style={{
                       position: "relative",
                       zIndex: p.id === movingPlayerId ? 2 : 1,
-                      background: "linear-gradient(135deg, #f0d181 0%, #d4a647 50%, #8a6d1f 100%)",
+                      background: "linear-gradient(135deg, #fbe6a0 0%, #e8c463 20%, #d4a647 50%, #b08a2d 80%, #8a6d1f 100%)",
                       padding: 2,
-                      boxShadow: "0 1px 4px rgba(0,0,0,0.35)",
+                      boxShadow: "0 1px 4px rgba(0,0,0,0.4), inset 0 0 3px rgba(255,255,255,0.7)",
                     }}
                   >
-        <div
-          className="flex h-full w-full items-center justify-center rounded-full"
-          style={{ backgroundColor: p.color }}
-        >
-          <Crown size={12} style={{ color: "#faf0c8" }} />
-        </div>
-      </div>
+                    <div
+                      className="relative flex h-full w-full items-center justify-center rounded-full overflow-hidden"
+                      style={{ backgroundColor: p.color }}
+                    >
+                      <div
+                        className="pointer-events-none absolute inset-0"
+                        style={{ background: "radial-gradient(circle at 30% 25%, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0.15) 30%, transparent 55%)" }}
+                      />
+                      <Crown size={12} style={{ color: "#faf0c8", position: "absolute" }} />
+                    </div>
+                  </div>
     ))}
   </div>
 )}
@@ -8819,16 +8823,20 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 <div
                   className="flex w-[23px] h-[23px] items-center justify-center rounded-full"
                   style={{
-                    background: "linear-gradient(135deg, #f0d181 0%, #d4a647 50%, #8a6d1f 100%)",
+                    background: "linear-gradient(135deg, #fbe6a0 0%, #e8c463 20%, #d4a647 50%, #b08a2d 80%, #8a6d1f 100%)",
                     padding: 2,
-                    boxShadow: "0 1px 4px rgba(0,0,0,0.35)",
+                    boxShadow: "0 1px 4px rgba(0,0,0,0.4), inset 0 0 3px rgba(255,255,255,0.7)",
                   }}
                 >
                   <div
-                    className="flex h-full w-full items-center justify-center rounded-full"
+                    className="relative flex h-full w-full items-center justify-center rounded-full overflow-hidden"
                     style={{ backgroundColor: movingPlayer.color }}
                   >
-                    <Crown size={12} style={{ color: "#faf0c8" }} />
+                    <div
+                      className="pointer-events-none absolute inset-0"
+                      style={{ background: "radial-gradient(circle at 30% 25%, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0.15) 30%, transparent 55%)" }}
+                    />
+                    <Crown size={12} style={{ color: "#faf0c8", position: "absolute" }} />
                   </div>
                 </div>
               </div>
@@ -8859,16 +8867,20 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 <div
                   className="flex w-[23px] h-[23px] items-center justify-center rounded-full"
                   style={{
-                    background: "linear-gradient(135deg, #f0d181 0%, #d4a647 50%, #8a6d1f 100%)",
+                    background: "linear-gradient(135deg, #fbe6a0 0%, #e8c463 20%, #d4a647 50%, #b08a2d 80%, #8a6d1f 100%)",
                     padding: 2,
-                    boxShadow: "0 1px 4px rgba(0,0,0,0.35)",
+                    boxShadow: "0 1px 4px rgba(0,0,0,0.4), inset 0 0 3px rgba(255,255,255,0.7)",
                   }}
                 >
                   <div
-                    className="flex h-full w-full items-center justify-center rounded-full"
+                    className="relative flex h-full w-full items-center justify-center rounded-full overflow-hidden"
                     style={{ backgroundColor: dp.color }}
                   >
-                    <Crown size={12} style={{ color: "#faf0c8" }} />
+                    <div
+                      className="pointer-events-none absolute inset-0"
+                      style={{ background: "radial-gradient(circle at 30% 25%, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0.15) 30%, transparent 55%)" }}
+                    />
+                    <Crown size={12} style={{ color: "#faf0c8", position: "absolute" }} />
                   </div>
                 </div>
               </div>
@@ -8990,9 +9002,9 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     left: `${from.x}%`,
                     top: `${from.y}%`,
                     transform: "translate(-50%, -50%)",
-                    background: "linear-gradient(135deg, #f0d181 0%, #d4a647 50%, #8a6d1f 100%)",
+                    background: "linear-gradient(135deg, #fbe6a0 0%, #e8c463 20%, #d4a647 50%, #b08a2d 80%, #8a6d1f 100%)",
                     padding: 2,
-                    boxShadow: "0 0 25px #ff8c00",
+                    boxShadow: "0 0 25px #ff8c00, inset 0 0 3px rgba(255,255,255,0.7)",
                     transition: "left 1.5s cubic-bezier(0.4, 0, 0.2, 1), top 1.5s cubic-bezier(0.4, 0, 0.2, 1)",
                   }}
                   ref={(el) => {
@@ -9004,10 +9016,14 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   }}
                 >
                   <div
-                    className="flex h-full w-full items-center justify-center rounded-full"
+                    className="relative flex h-full w-full items-center justify-center rounded-full overflow-hidden"
                     style={{ backgroundColor: dp.color }}
                   >
-                    <Crown size={12} style={{ color: "#faf0c8" }} />
+                    <div
+                      className="pointer-events-none absolute inset-0"
+                      style={{ background: "radial-gradient(circle at 30% 25%, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0.15) 30%, transparent 55%)" }}
+                    />
+                    <Crown size={12} style={{ color: "#faf0c8", position: "absolute" }} />
                   </div>
                 </div>
               </div>
@@ -9178,10 +9194,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   className={`relative flex items-center gap-2 overflow-hidden rounded-lg p-1.5 pr-3 cursor-pointer ${!isCurrentTurn ? "hover:bg-muted" : ""} ${p.bankrupt ? "opacity-40" : ""}`}
                   style={
                     isCurrentTurn
-                      ? {
-                          backgroundColor: "#ffffff",
-                          boxShadow: `0 0 0 2px ${p.color}, 0 0 14px ${p.color}80`,
-                        }
+                      ? { backgroundColor: "#ffffff" }
                       : undefined
                   }
                   onClick={(e) => {
@@ -9197,8 +9210,14 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   }}
                 >
                   <div
-                    className="pointer-events-none absolute right-0 top-0 bottom-0 w-1.5"
-                    style={{ backgroundColor: p.color }}
+                    className="pointer-events-none absolute right-0 top-0 bottom-0 rounded-r-lg transition-all"
+                    style={{
+                      width: isCurrentTurn ? 8 : 6,
+                      backgroundColor: p.color,
+                      boxShadow: isCurrentTurn
+                        ? `0 0 12px 3px ${p.color}cc, 0 0 24px 6px ${p.color}66`
+                        : "none",
+                    }}
                     aria-hidden="true"
                   />
                   <Avatar initials={p.initials} color={p.color} size="sm" avatar={p.avatar} />
@@ -12589,7 +12608,7 @@ if (vipUntil) {
   localStorage.removeItem("arena-vip-until");
 }
 // Восстанавливаем активные скины из серверных данных
-if (data.activeSkins && typeof data.activeSkins === "object") {
+      if (data.activeSkins && typeof data.activeSkins === "object") {
   try {
     const current = JSON.parse(localStorage.getItem("arena-active-skins") || "{}");
     localStorage.setItem("arena-active-skins", JSON.stringify({
@@ -12600,6 +12619,10 @@ if (data.activeSkins && typeof data.activeSkins === "object") {
     }));
   } catch {}
 }
+      // Обновляем все реактивные элементы шапки (аватар, кошелёк, VIP).
+      window.dispatchEvent(new Event("arena-user-updated"));
+      window.dispatchEvent(new Event("arena-wallet-updated"));
+      window.dispatchEvent(new Event("storage"));
       } else {
         // Если данных нет, создаём их по умолчанию и сохраняем
         const defaultData = {

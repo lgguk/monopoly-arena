@@ -7617,8 +7617,8 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         </div>
       </div>
       {/* Board + Right panel — shared centered container */}
-      <div className="flex flex-1 items-start justify-between gap-2 overflow-hidden bg-[#1c1828] p-2 lg:items-start lg:justify-center lg:gap-5 lg:py-1.5 lg:pr-2 lg:pl-[268px]">
-                <div className="relative aspect-square h-full max-h-full shrink-0 shadow-[0_18px_60px_rgba(41,35,62,.35)]">
+      <div className="flex flex-1 items-start justify-between gap-3 overflow-hidden bg-[#1c1828] p-2 lg:items-start lg:justify-center lg:gap-5 lg:py-1.5 lg:pr-2 lg:pl-[268px]">
+                <div className="relative aspect-square h-full max-h-full min-w-0 shrink shadow-[0_18px_60px_rgba(41,35,62,.35)]">
           <div
             className="grid h-full w-full gap-px bg-[#5e5a6e]"
             style={{
@@ -9132,7 +9132,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         </div>
 
         {/* Right control panel */}
-<div className="flex h-full w-[180px] shrink-0 flex-col gap-2 overflow-y-auto p-1 lg:w-[255px] lg:p-1.5">
+<div className="flex h-full w-[140px] shrink-0 flex-col gap-1.5 overflow-y-auto p-1 lg:w-[255px] lg:gap-2 lg:p-1.5">
           <div className="rounded-2xl border border-card-border bg-card p-3">
             <div className="flex items-center justify-between">
               <div>

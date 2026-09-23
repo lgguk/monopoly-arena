@@ -7537,8 +7537,8 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           </div>
         </div>
 
-        {/* Игроки — компактный список в drawer для мобилы */}
-        <div className="mt-4">
+        {/* Игроки в drawer — скрыто, теперь список в правой панели */}
+        <div className="mt-4 hidden">
           <div className="mb-2 flex items-center justify-between">
             <div className="font-display text-sm font-bold">Игроки</div>
             <span className="font-mono text-[10px] text-[#aaa2b4]">
@@ -7617,7 +7617,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         </div>
       </div>
       {/* Board + Right panel — shared centered container */}
-      <div className="flex flex-1 items-start gap-3 overflow-hidden bg-[#1c1828] p-2 lg:items-start lg:justify-center lg:gap-5 lg:py-1.5 lg:pr-2 lg:pl-[268px]">
+      <div className="flex flex-1 items-start justify-between gap-3 overflow-hidden bg-[#1c1828] p-2 lg:items-start lg:justify-center lg:gap-5 lg:py-1.5 lg:pr-2 lg:pl-[268px]">
                 <div className="arena-board-square relative aspect-square h-full max-h-full min-w-0 shrink shadow-[0_18px_60px_rgba(41,35,62,.35)]">
           <div
             className="grid h-full w-full gap-px bg-[#5e5a6e]"
@@ -9273,10 +9273,10 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
             </div>
           )}
 
-          {/* Players list with hover popup — на мобиле перенесён в drawer «Инфо» */}
-          <div className="hidden rounded-2xl border border-card-border bg-card p-3 lg:block">
+          {/* Players list with hover popup */}
+          <div className="rounded-2xl border border-card-border bg-card p-2 lg:p-3">
             <div className="mb-2 flex items-center justify-between">
-              <h2 className="font-display text-sm font-bold">Игроки</h2>
+              <h2 className="font-display text-xs font-bold lg:text-sm">Игроки</h2>
               <span className="font-mono text-[9px] text-muted-foreground">
                 {alive.length} / {players.length}
               </span>

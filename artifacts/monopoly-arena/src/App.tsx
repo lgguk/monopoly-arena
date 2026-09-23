@@ -7480,7 +7480,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
   return (
     <div
-      className="relative flex h-full overflow-hidden bg-[#1c1828]"
+      className="relative flex h-full w-full overflow-hidden bg-[#1c1828]"
       onClick={() => setPlayerHover(null)}
     >
       {/* Кнопка «Инфо» — только на мобиле и планшете */}
@@ -12513,7 +12513,7 @@ function GameShell({ children, name }: { children: ReactNode; name?: string }) {
         </div>
         <nav className="mt-4"></nav>
       </aside>
-      <main className="flex min-h-0 flex-1 overflow-hidden bg-[#1c1828]">
+      <main className="flex min-h-0 w-full flex-1 flex-col overflow-hidden bg-[#1c1828]">
         {children}
       </main>
     </div>

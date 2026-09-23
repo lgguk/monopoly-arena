@@ -7617,7 +7617,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         </div>
       </div>
       {/* Board + Right panel — shared centered container */}
-      <div className="flex flex-1 items-start justify-end gap-2 overflow-hidden bg-[#1c1828] p-2 lg:items-start lg:justify-center lg:gap-5 lg:py-1.5 lg:pr-2 lg:pl-[268px]">
+      <div className="flex flex-1 items-start justify-center gap-2 overflow-hidden bg-[#1c1828] p-2 lg:items-start lg:justify-center lg:gap-5 lg:py-1.5 lg:pr-2 lg:pl-[268px]">
                 <div className="arena-board-square relative aspect-square h-full max-h-full min-w-0 shrink shadow-[0_18px_60px_rgba(41,35,62,.35)]">
           <div
             className="grid h-full w-full gap-px bg-[#5e5a6e]"
@@ -9133,13 +9133,13 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
         {/* Right control panel */}
 <div className="flex h-full w-[140px] shrink-0 flex-col gap-1.5 overflow-y-auto p-1 lg:w-[255px] lg:gap-2 lg:p-1.5">
-          <div className="rounded-2xl border border-card-border bg-card p-3">
+          <div className="rounded-2xl border border-card-border bg-card p-2 lg:p-3">
             <div className="flex items-center justify-between">
               <div>
                 <div className="font-mono text-[8px] uppercase tracking-[.15em] text-primary">
                   ход сейчас
                 </div>
-                <h2 className="font-display text-lg font-bold leading-tight">
+                <h2 className="font-display text-base font-bold leading-tight lg:text-lg">
                   {player.name}
                 </h2>
               </div>
@@ -9150,27 +9150,27 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
               />
             </div>
             <div
-              className={`mt-2.5 flex items-center justify-between rounded-xl px-3 py-1.5 text-xs ${timeLeft <= 10 ? "bg-[#f6dfd7] text-primary" : "bg-muted"}`}
+              className={`mt-1.5 flex items-center justify-between rounded-lg px-2 py-1 text-[11px] lg:mt-2.5 lg:rounded-xl lg:px-3 lg:py-1.5 lg:text-xs ${timeLeft <= 10 ? "bg-[#f6dfd7] text-primary" : "bg-muted"}`}
             >
               <span className="flex items-center gap-1.5 font-bold">
                 <Timer size={12} /> Время хода
               </span>
               <span className="font-mono font-bold">{timeLeft} сек</span>
             </div>
-            <div className="mt-2 rounded-xl bg-muted px-3 py-2 text-[11px] leading-snug">
+            <div className="mt-1.5 rounded-lg bg-muted px-2 py-1.5 text-[10px] leading-snug lg:mt-2 lg:rounded-xl lg:px-3 lg:py-2 lg:text-[11px]">
               {message}
             </div>
-            <div className="mt-2 flex items-center justify-between">
+            <div className="mt-1.5 flex items-center justify-between lg:mt-2">
               <div>
                 <div className="text-[9px] text-muted-foreground">На руках</div>
-                <div className="font-mono text-sm font-bold">
+                <div className="font-mono text-[12px] font-bold lg:text-sm">
                   {player.money.toLocaleString("ru-RU")}{" "}
                   <span className="text-[9px] text-muted-foreground">К</span>
                 </div>
               </div>
-              <div className="max-w-[115px] text-right">
+              <div className="max-w-[90px] text-right lg:max-w-[115px]">
                 <div className="text-[9px] text-muted-foreground">Клетка</div>
-                <div className="truncate text-[11px] font-bold">
+                <div className="truncate text-[10px] font-bold lg:text-[11px]">
                   {currentCellName}
                 </div>
               </div>
@@ -9274,14 +9274,14 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           )}
 
           {/* Players list with hover popup */}
-          <div className="rounded-2xl border border-card-border bg-card p-2 lg:p-3">
-            <div className="mb-2 flex items-center justify-between">
+          <div className="rounded-2xl border border-card-border bg-card p-1.5 lg:p-3">
+            <div className="mb-1.5 flex items-center justify-between lg:mb-2">
               <h2 className="font-display text-xs font-bold lg:text-sm">Игроки</h2>
               <span className="font-mono text-[9px] text-muted-foreground">
                 {alive.length} / {players.length}
               </span>
             </div>
-            <div className="space-y-1">
+            <div className="space-y-0.5 lg:space-y-1">
               {players.map((p, i) => {
                 const isCurrentTurn =
                   p.id ===
@@ -9291,7 +9291,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 return (
                 <div
                   key={p.id}
-                  className={`relative flex items-center gap-2 overflow-hidden rounded-lg p-1.5 pr-3 cursor-pointer ${!isCurrentTurn ? "hover:bg-muted" : ""} ${p.bankrupt ? "opacity-40" : ""}`}
+                  className={`relative flex items-center gap-2 overflow-hidden rounded-lg p-1 pr-2.5 cursor-pointer lg:p-1.5 lg:pr-3 ${!isCurrentTurn ? "hover:bg-muted" : ""} ${p.bankrupt ? "opacity-40" : ""}`}
                   style={
                     isCurrentTurn
                       ? { backgroundColor: "#ffffff" }
@@ -9322,7 +9322,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   />
                   <Avatar initials={p.initials} color={p.color} size="sm" avatar={p.avatar} />
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-[11px] font-bold">
+                    <div className="truncate text-[13px] font-bold lg:text-[11px]">
   {p.name}
   {p.vipUntil && new Date(p.vipUntil) > new Date() && (
     <span className="ml-1 rounded bg-[#d3a247] px-1 py-0.5 text-[9px] font-bold text-white">VIP</span>
@@ -9330,7 +9330,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
   {p.bankrupt ? " · банкрот" : ""}
   {((p?.jailTurns ?? 0) > 0 ? " 🔒 " : "")}
 </div>
-                    <div className="text-[9px] text-muted-foreground">
+                    <div className="text-[10px] text-muted-foreground lg:text-[9px]">
                       {p.money.toLocaleString("ru-RU")} К ·{" "}
                       {boardCells[p.position]?.name ?? "?"}
                     </div>

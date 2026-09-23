@@ -1,21 +1,71 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
-    <title>Monopoly Arena</title>
-    <meta name="description" content="Monopoly Arena — built on Replit. Update this description to reflect the app." />
+
+    <!-- ===== Основные SEO-теги ===== -->
+    <title>Monopoly Arena — Монополия онлайн с друзьями</title>
+    <meta name="description" content="Играй в Монополию онлайн с реальными игроками: собирай монополии, торгуй скинами, общайся в чате, создавай лобби и побеждай. Бесплатно, без установки." />
+    <meta name="keywords" content="монополия онлайн, играть в монополию, monopoly online, настольные игры онлайн, monopoly arena, игра с друзьями, скины, обмен предметами" />
     <meta name="robots" content="index, follow" />
-    <meta property="og:title" content="Monopoly Arena" />
-    <meta property="og:description" content="Monopoly Arena — built on Replit. Update this description to reflect the app." />
+    <meta name="author" content="Monopoly Arena" />
+    <meta name="theme-color" content="#29233e" />
+
+    <!-- ===== Open Graph (Telegram, VK, Discord, WhatsApp) ===== -->
     <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Monopoly Arena" />
+    <meta property="og:title" content="Monopoly Arena — Монополия онлайн с друзьями" />
+    <meta property="og:description" content="Играй в Монополию онлайн с реальными игроками: собирай монополии, торгуй скинами, общайся в чате, создавай лобби и побеждай. Бесплатно, без установки." />
+    <meta property="og:url" content="https://monopoly-arena.ru/" />
+    <meta property="og:image" content="https://monopoly-arena.ru/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:locale" content="ru_RU" />
+
+    <!-- ===== Twitter Card ===== -->
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Monopoly Arena" />
-    <meta name="twitter:description" content="Monopoly Arena — built on Replit. Update this description to reflect the app." />
+    <meta name="twitter:title" content="Monopoly Arena — Монополия онлайн с друзьями" />
+    <meta name="twitter:description" content="Играй в Монополию онлайн с реальными игроками: собирай монополии, торгуй скинами, общайся в чате и побеждай." />
+    <meta name="twitter:image" content="https://monopoly-arena.ru/og-image.png" />
+
+    <!-- ===== Schema.org (структурированные данные для Google) ===== -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "VideoGame",
+      "name": "Monopoly Arena",
+      "description": "Онлайн-Монополия с реальными игроками: собирай монополии, торгуй скинами, общайся в чате, создавай лобби и побеждай.",
+      "url": "https://monopoly-arena.ru/",
+      "image": "https://monopoly-arena.ru/og-image.png",
+      "genre": ["Настольная игра", "Стратегия", "Мультиплеер"],
+      "gamePlatform": ["Web Browser", "PC", "Mobile"],
+      "playMode": ["MultiPlayer", "CoOp"],
+      "applicationCategory": "Game",
+      "operatingSystem": "Any",
+      "inLanguage": "ru",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "RUB",
+        "description": "Бесплатная игра с опциональными покупками"
+      }
+    }
+    </script>
+
+    <!-- ===== Иконки и шрифты ===== -->
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- На узких экранах чуть увеличиваем базовый размер шрифта —
+         все элементы на rem автоматически подрастут на ~6%. -->
+    <style>
+      @media (max-width: 640px) {
+        html { font-size: 17px; }
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>

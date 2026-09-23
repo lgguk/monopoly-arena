@@ -207,16 +207,30 @@ async function loadUserDataFromDb() {
       const udRes = await db.query('SELECT * FROM user_data WHERE user_id = $1', [uid]);
       const base = udRes.rows[0] || {};
 
-      // Инвентарь
+      // Инвентарь + дедупликация по item.id (защита от старых багов с race condition).
       const invRes = await db.query(
         'SELECT market_item_id, item_data, owned_at FROM inventory WHERE user_id = $1',
         [uid]
       );
-      const inventory = invRes.rows.map((r) => ({
-        ...r.item_data,
-        marketItemId: r.market_item_id || r.item_data?.marketItemId,
-        ownedAt: r.owned_at ? new Date(r.owned_at).toISOString() : undefined,
-      }));
+      const seenItemIds = new Set();
+      const inventory = [];
+      let dupsSkipped = 0;
+      for (const r of invRes.rows) {
+        const itemId = String(r.item_data?.id || '');
+        if (itemId && seenItemIds.has(itemId)) {
+          dupsSkipped++;
+          continue;
+        }
+        if (itemId) seenItemIds.add(itemId);
+        inventory.push({
+          ...r.item_data,
+          marketItemId: r.market_item_id || r.item_data?.marketItemId,
+          ownedAt: r.owned_at ? new Date(r.owned_at).toISOString() : undefined,
+        });
+      }
+      if (dupsSkipped > 0) {
+        console.log(`🧹 ${uid}: пропущено дублей в инвентаре: ${dupsSkipped} (будут удалены из БД при следующем сохранении)`);
+      }
 
       // Активные скины. Храним inventory_item_id (уникальный id предмета в инвентаре),
       // а не market_item_id. Так у двух одинаковых Intel будет только один активный.
@@ -306,6 +320,32 @@ async function loadUserDataFromDb() {
       };
     }
     console.log(`✅ Данные пользователей загружены из БД: ${Object.keys(userData).length}`);
+
+    // Миграция: пересчитываем stats.level по новой прогрессивной шкале.
+    // Раньше уровень считался как floor(xp/1000), теперь через getLevelFromXp.
+    let migratedLevels = 0;
+    for (const uid of Object.keys(userData)) {
+      const s = userData[uid]?.stats;
+      if (!s) continue;
+      const correct = getLevelFromXp(s.xp || 0);
+      if (s.level !== correct) {
+        s.level = correct;
+        migratedLevels++;
+      }
+    }
+    if (migratedLevels > 0) {
+      console.log(`📈 Пересчитано уровней: ${migratedLevels}`);
+    }
+
+    // Чистим дубли в inventory и пересохраняем всех игроков.
+    // saveUserData делает DELETE + INSERT — дубликаты исчезнут из БД.
+    let resaved = 0;
+    for (const uid of Object.keys(userData)) {
+      if (!userData[uid]) continue;
+      await saveUserData(uid);
+      resaved++;
+    }
+    console.log(`💾 Пересохранено игроков после миграции: ${resaved}`);
   } catch (err) {
     console.error('❌ Ошибка загрузки userData из БД, fallback на JSON:', err.message);
     try {
@@ -323,15 +363,16 @@ async function saveUsers() {
   try {
     for (const u of users) {
       await db.query(
-        `INSERT INTO users (id, login, password, name, initials, color, guest, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        `INSERT INTO users (id, login, password, name, initials, color, guest, created_at, avatar)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (id) DO UPDATE SET
            login = EXCLUDED.login,
            password = EXCLUDED.password,
            name = EXCLUDED.name,
            initials = EXCLUDED.initials,
            color = EXCLUDED.color,
-           guest = EXCLUDED.guest`,
+           guest = EXCLUDED.guest,
+           avatar = EXCLUDED.avatar`,
         [
           u.id,
           u.login || null,
@@ -341,6 +382,7 @@ async function saveUsers() {
           u.color || null,
           !!u.guest,
           u.createdAt || Date.now(),
+          u.avatar || null,
         ]
       );
     }
@@ -349,14 +391,41 @@ async function saveUsers() {
   }
 }
 
+// Очередь сериализации saveUserData. Для каждого uid держим промис,
+// чтобы два параллельных вызова не наложились DELETE/INSERT друг на друга
+// (иначе в inventory получались дубликаты).
+const saveQueues = new Map(); // uid -> Promise
+
+function enqueueSave(uid, fn) {
+  const prev = saveQueues.get(uid) || Promise.resolve();
+  const next = prev.then(fn, fn); // продолжаем даже если предыдущий упал
+  saveQueues.set(uid, next);
+  // Чистим очередь, когда работа завершена и это последний таск
+  next.finally(() => {
+    if (saveQueues.get(uid) === next) saveQueues.delete(uid);
+  });
+  return next;
+}
+
 // Сохраняем user_data + все связанные сущности в БД.
 // Если userId не задан — сохраняем всех. Если задан — только одного
 // (быстрее и безопаснее, когда меняем данные одного игрока).
+// Возвращает промис, который резолвится, когда все записи реально завершены.
 async function saveUserData(userId = null) {
   const ids = userId ? [userId] : Object.keys(userData);
+  const tasks = [];
   for (const uid of ids) {
+    // Сериализуем сохранение для каждого uid через очередь.
+    tasks.push(enqueueSave(uid, () => saveUserDataOne(uid)));
+  }
+  return Promise.all(tasks);
+}
+
+// Внутренняя функция — сохраняет одного игрока. Вызывается только через очередь.
+async function saveUserDataOne(uid) {
+  {
     const d = userData[uid];
-    if (!d) continue;
+    if (!d) return;
     try {
       // ===== user_data (плоские поля) =====
       await db.query(
@@ -541,13 +610,29 @@ function unlockItemsFromTrade(userId, itemIds) {
 }
 
 // ============ ФИНАЛИЗАЦИЯ ПАРТИИ ============
+// Coins за партию — намеренно низкие, основной доход с квестов (~500/нед).
+// XP — прогресс уровня, не валюта. VIP: +50% XP, +20% Coins (см. finalizeGame).
 const PLACE_REWARDS = [
-  { coins: 300, xp: 450 },
-  { coins: 200, xp: 300 },
-  { coins: 120, xp: 180 },
-  { coins: 100, xp: 150 },
-  { coins: 80,  xp: 120 },
+  { coins: 15, xp: 150 },
+  { coins: 12, xp: 120 },
+  { coins: 10, xp: 90 },
+  { coins: 10, xp: 50 },
+  { coins: 10, xp: 50 },
 ];
+
+// Прогрессивная шкала уровней: порог перехода на уровень L = 1000 + 200·(L−1).
+// Пороги: L1=1000, L2=2200, L3=3600, L4=5200, L5=7000 …
+function getLevelFromXp(xp) {
+  let level = 0;
+  let remaining = Number(xp) || 0;
+  while (level < 200) {
+    const cost = 1000 + 200 * level;
+    if (remaining < cost) break;
+    remaining -= cost;
+    level++;
+  }
+  return level;
+}
 
 // Начисляет награды по итогам партии. Вызывается один раз на комнату.
 // Правила мест:
@@ -597,10 +682,10 @@ async function finalizeGame(roomId) {
 
     const reward = PLACE_REWARDS[Math.min(place - 1, PLACE_REWARDS.length - 1)] || { coins: 0, xp: 0 };
 
-    // VIP × 2 к XP
+    // VIP × 2 к XP и +20% к Coins
     const isVip = p.vipUntil ? new Date(p.vipUntil) > new Date() : false;
-    const xp = isVip ? reward.xp * 2 : reward.xp;
-    const coins = reward.coins;
+    const xp = isVip ? Math.round(reward.xp * 1.5) : reward.xp;
+    const coins = isVip ? Math.round(reward.coins * 1.2) : reward.coins;
 
     // Дроп предмета (25%)
     let dropName = null;
@@ -650,7 +735,7 @@ async function finalizeGame(roomId) {
         d.stats.games = (d.stats.games || 0) + 1;
         if (place === 1) d.stats.wins = (d.stats.wins || 0) + 1;
         d.stats.xp = (d.stats.xp || 0) + xp;
-        d.stats.level = Math.floor(d.stats.xp / 1000);
+        d.stats.level = getLevelFromXp(d.stats.xp);
       }
       // Квесты: сыграл партию — всем, кто не leftAlive (place > 0).
       // Победил — только place === 1.
@@ -773,7 +858,14 @@ const disconnectTimers = new Map();
 const DISCONNECT_GRACE_MS = 2 * 60 * 1000; // 2 минуты
 // Когда начался текущий ход в каждой комнате: roomId -> timestamp
 const roomTurnStart = {};
-const TURN_DURATION_SEC = 45; // длительность хода в секундах
+const TURN_DURATION_CLASSIC = 45;
+const TURN_DURATION_FAST = 30;
+function getTurnDuration(mode) {
+  return (mode === "Быстрая" || mode === "Дуэль") ? TURN_DURATION_FAST : TURN_DURATION_CLASSIC;
+}
+function isFastMode(mode) {
+  return mode === "Быстрая" || mode === "Дуэль";
+}
 
 // Уникальный токен, генерируется при каждом запуске сервера.
 // Клиенты используют его, чтобы понять, что сервер перезапустился.
@@ -984,10 +1076,10 @@ io.on('connection', (socket) => {
     userData[userId].stats.xp += xp;
   }
   
-  // Пересчитываем уровень на основе XP (level = floor(xp / 1000))
-  userData[userId].stats.level = Math.floor(userData[userId].stats.xp / 1000);
+  // Пересчитываем уровень по прогрессивной шкале
+  userData[userId].stats.level = getLevelFromXp(userData[userId].stats.xp);
   
-  saveUserData();
+  saveUserData(userId);
   socket.emit('user-data-updated', userData[userId]);
 });
 
@@ -1046,7 +1138,8 @@ const user = {
     initials: name.split(/\s+/).slice(0, 2).map(p => p[0]).join('').toUpperCase(),
     color: PLAYER_COLORS[Math.floor(Math.random() * PLAYER_COLORS.length)],
     guest: !!guest,
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    avatar: null,
 };
 
  users.push(user);
@@ -1056,8 +1149,8 @@ const user = {
   }
 
   // Инициализируем данные игрока по умолчанию
-  userData[user.id] = { inventory: [], coins: 2400, stats: { games: 0, wins: 0, xp: 0, level: 1 }, friends: [], activeSkins: {}, vipUntil: null };
-  saveUserData();
+  userData[user.id] = { inventory: [], coins: 2400, stats: { games: 0, wins: 0, xp: 0, level: 0 }, friends: [], activeSkins: {}, vipUntil: null };
+  saveUserData(user.id);
   onlineUsers.set(user.id, socket.id);
   notifyFriendsStatus(user.id, true);
   ensureQuestsFresh(user.id); // создаём квесты на сегодня
@@ -1078,8 +1171,8 @@ socket.on('login', async (data, callback) => {
     return;
   }
   if (!userData[user.id]) {
-    userData[user.id] = { inventory: [], coins: 2400, stats: { games: 0, wins: 0, xp: 0, level: 1 }, friends: [], activeSkins: {}, vipUntil: null };
-    saveUserData();
+    userData[user.id] = { inventory: [], coins: 2400, stats: { games: 0, wins: 0, xp: 0, level: 0 }, friends: [], activeSkins: {}, vipUntil: null };
+    saveUserData(user.id);
   }
   onlineUsers.set(user.id, socket.id);
   notifyFriendsStatus(user.id, true);
@@ -2004,7 +2097,7 @@ socket.on('remove-market-listing', async (data, callback) => {
   if (userData[userId]) {
     if (!userData[userId].inventory) userData[userId].inventory = [];
     userData[userId].inventory.push(listing.item);
-    saveUserData();
+    saveUserData(userId);
     const tSocket = onlineUsers.get(userId);
     if (tSocket) {
       io.to(tSocket).emit('user-inventory-updated', userData[userId].inventory);
@@ -2090,7 +2183,8 @@ socket.on('buy-market-listing', async (data, callback) => {
   }
 
   // Сохраняем изменения
-  saveUserData();
+  saveUserData(buyerId);
+  saveUserData(sellerId);
 
   // Удаляем объявление
   marketListings = marketListings.filter(l => l.id !== data.listingId);
@@ -2198,15 +2292,26 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
   });
 
   socket.on('create-room', (roomData) => {
+  const VALID_MODES = ["Классический", "Быстрая", "Дуэль"];
+  const requestedMode = roomData.mode || "Классический";
+  const mode = VALID_MODES.includes(requestedMode) ? requestedMode : "Классический";
+  // Дуэль всегда 1×1, остальные — 2..5 игроков (значение приходит с клиента).
+  const maxPlayers =
+    mode === "Дуэль"
+      ? 2
+      : Math.min(5, Math.max(2, Number(roomData.maxPlayers) || 4));
   const newRoom = {
     ...roomData,
+    mode,
+    maxPlayers,
     id: Math.random().toString(36).slice(2, 7).toUpperCase(),
     players: 1,
     hostId: socket.id,
     playerNames: [roomData.host || "Гость"],
     playerSockets: { [socket.id]: roomData.host || "Гость" },
     createdAt: Date.now(),
-    started: false
+    started: false,
+    turnDurationSec: getTurnDuration(mode),
   };
     rooms.push(newRoom);
     socket.emit('room-created', newRoom);
@@ -2239,7 +2344,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
   });
 
   // --- НОВЫЕ ОБРАБОТЧИКИ ДЛЯ ИГРОВОГО СТОЛА ---
-    socket.on('enter-game-room', ({ roomId, playerData }) => {
+        socket.on('enter-game-room', ({ roomId, playerData }) => {
     socket.join(roomId);
     if (!gameRooms[roomId]) {
       gameRooms[roomId] = [];
@@ -2247,6 +2352,26 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       gameRooms[roomId].eliminationOrder = [];
       gameRooms[roomId].finalized = false;
     }
+
+    // Определяем режим комнаты (сохраняем при первом заходе)
+    if (!gameRooms[roomId].mode) {
+      const lobby = rooms.find(r => r.id === roomId);
+      gameRooms[roomId].mode = lobby?.mode || "Классический";
+    }
+    const roomMode = gameRooms[roomId].mode;
+    const fast = isFastMode(roomMode);
+
+    // Отдаём клиенту настройки режима
+    // Быстрая и Дуэль: аренда ×1.5, 1 попытка в тюрьме, бонусы Старта выше.
+    socket.emit('room-settings', {
+      mode: roomMode,
+      turnDurationSec: getTurnDuration(roomMode),
+      fastMode: fast,
+      rentMultiplier: fast ? 1.5 : 1.0,
+      jailAttempts: fast ? 1 : 3,
+      passStartBonus: fast ? 3000 : 2000,
+      landStartBonus: fast ? 4500 : 3000,
+    });
 
     // Сначала ищем игрока по УНИКАЛЬНОМУ id (не по socketId!) — это нужно для переподключения
     const existing = gameRooms[roomId].find(p => p.id === playerData.id);
@@ -2258,6 +2383,8 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       playerData.activeSkins = playerData.activeSkins || {};
       playerData.isVip = playerData.isVip || false;
       playerData.disconnected = false;
+      // Стартовый капитал по режиму: быстрые = 10 000, классика = из adminSettings
+      playerData.money = fast ? 10000 : (adminSettings.startCapital || 15000);
       gameRooms[roomId].push({ ...playerData, socketId: socket.id });
     } else {
       // Переподключение — обновляем socketId и снимаем флаг
@@ -2280,8 +2407,9 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
 
     // Отдаём переподключившемуся игроку актуальный остаток таймера хода
     if (roomTurnStart[roomId]) {
+      const duration = getTurnDuration(roomMode);
       const elapsed = Math.floor((Date.now() - roomTurnStart[roomId]) / 1000);
-      const remaining = Math.max(0, TURN_DURATION_SEC - elapsed);
+      const remaining = Math.max(0, duration - elapsed);
       socket.emit('sync-timer-broadcast', remaining);
       console.log(`⏱ ${playerData.name} получил остаток таймера: ${remaining}s`);
     }
@@ -2413,7 +2541,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     const friendIds = userData[userId].friends || [];
     const friends = friendIds.map(fid => {
       const user = users.find(u => u.id === fid);
-      return user ? { id: user.id, name: user.name, online: onlineUsers.has(fid) } : null;
+      return user ? { id: user.id, name: user.name, online: onlineUsers.has(fid), avatar: user.avatar || null } : null;
     }).filter(Boolean);
     callback?.({ success: true, friends });
   });
@@ -2423,7 +2551,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     const results = users
       .filter(u => !u.guest && (u.name.toLowerCase().includes(q) || u.id.toLowerCase().includes(q)))
       .slice(0, 10)
-      .map(u => ({ id: u.id, name: u.name, online: onlineUsers.has(u.id) }));
+      .map(u => ({ id: u.id, name: u.name, online: onlineUsers.has(u.id), avatar: u.avatar || null }));
     callback?.({ success: true, results });
   });
 
@@ -2446,11 +2574,12 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       userData[userId].friendRequests = userData[userId].friendRequests.filter(r => r.fromId !== friendId);
       userData[userId].friends = [...(userData[userId].friends || []), friendId];
       userData[friendId].friends = [...(userData[friendId].friends || []), userId];
-      saveUserData();
+      saveUserData(userId);
+      saveUserData(friendId);
       const initiator = users.find(u => u.id === userId);
       if (!userData[friendId].notifications) userData[friendId].notifications = [];
       userData[friendId].notifications.push({ text: `${initiator?.name || 'Игрок'} принял ваш запрос в друзья`, timestamp: Date.now(), read: false });
-      saveUserData();
+      saveUserData(friendId);
       const tSocket = onlineUsers.get(friendId);
       if (tSocket) io.to(tSocket).emit('new-notification', userData[friendId].notifications);
       // Обе стороны получают обновление
@@ -2464,11 +2593,11 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
 
     const initiator = users.find(u => u.id === userId);
     userData[friendId].friendRequests.push({ fromId: userId, fromName: initiator?.name || 'Игрок', timestamp: Date.now() });
-    saveUserData();
+    saveUserData(friendId);
 
     if (!userData[friendId].notifications) userData[friendId].notifications = [];
     userData[friendId].notifications.push({ text: `${initiator?.name || 'Игрок'} отправил вам запрос в друзья`, timestamp: Date.now(), read: false });
-    saveUserData();
+    saveUserData(friendId);
     const tSocket = onlineUsers.get(friendId);
     if (tSocket) {
       io.to(tSocket).emit('new-notification', userData[friendId].notifications);
@@ -2484,7 +2613,10 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
   socket.on('get-friend-requests', (userId, callback) => {
     if (!userId || !userData[userId]) return callback?.({ success: false, error: 'User not found' });
     // Входящие — те, что лежат у меня в friendRequests
-    const requests = (userData[userId].friendRequests || []).map(r => ({ ...r, fromOnline: onlineUsers.has(r.fromId) }));
+    const requests = (userData[userId].friendRequests || []).map(r => {
+      const fromUser = users.find(u => u.id === r.fromId);
+      return { ...r, fromOnline: onlineUsers.has(r.fromId), fromAvatar: fromUser?.avatar || null };
+    });
 
     // Исходящие — я лежу в friendRequests у других. Проходим по всем users.
     const outgoing = [];
@@ -2497,6 +2629,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
           toId: other.id,
           toName: other.name,
           timestamp: mine.timestamp || Date.now(),
+          toAvatar: other.avatar || null,
         });
       }
     }
@@ -2515,12 +2648,13 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     if (!userData[fromId].friends) userData[fromId].friends = [];
     if (!userData[userId].friends.includes(fromId)) userData[userId].friends.push(fromId);
     if (!userData[fromId].friends.includes(userId)) userData[fromId].friends.push(userId);
-    saveUserData();
+    saveUserData(userId);
+    saveUserData(fromId);
 
     const accepter = users.find(u => u.id === userId);
     if (!userData[fromId].notifications) userData[fromId].notifications = [];
     userData[fromId].notifications.push({ text: `${accepter?.name || 'Игрок'} принял ваш запрос в друзья`, timestamp: Date.now(), read: false });
-    saveUserData();
+    saveUserData(fromId);
     const tSocket = onlineUsers.get(fromId);
     const sSocket = onlineUsers.get(userId);
     if (tSocket) {
@@ -2540,7 +2674,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     if (!userId || !fromId || !userData[userId]) return callback?.({ success: false, error: 'Invalid request' });
     if (!userData[userId].friendRequests) userData[userId].friendRequests = [];
     userData[userId].friendRequests = userData[userId].friendRequests.filter(r => r.fromId !== fromId);
-    saveUserData();
+    saveUserData(userId);
     const tSocket = onlineUsers.get(fromId);
     const sSocket = onlineUsers.get(userId);
     if (tSocket) io.to(tSocket).emit('friend-requests-updated');
@@ -2556,7 +2690,8 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     if (userData[friendId]) {
       userData[friendId].friends = (userData[friendId].friends || []).filter(fid => fid !== userId);
     }
-    saveUserData();
+    saveUserData(userId);
+    saveUserData(friendId);
 
     const initiator = users.find(u => u.id === userId);
     if (userData[friendId]) {
@@ -2580,7 +2715,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     if (!userId || !userData[userId]) return;
     if (!userData[userId].notifications) return;
     userData[userId].notifications = userData[userId].notifications.map(n => ({ ...n, read: true }));
-    saveUserData();
+    saveUserData(userId);
     const tSocket = onlineUsers.get(userId);
     if (tSocket) io.to(tSocket).emit('new-notification', userData[userId].notifications);
   });
@@ -2588,7 +2723,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
   socket.on('clear-notifications', (userId) => {
     if (!userId || !userData[userId]) return;
     userData[userId].notifications = [];
-    saveUserData();
+    saveUserData(userId);
     const tSocket = onlineUsers.get(userId);
     if (tSocket) io.to(tSocket).emit('new-notification', []);
   });
@@ -2669,10 +2804,35 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     markQuestProgress(userId, ev);
   });
 
+      // Сохранение аватарки. Клиент сжимает картинку до 256×256 и присылает base64 PNG.
+      // Ограничиваем размер строки — защита от гигантских данных.
+      socket.on('update-avatar', ({ userId, avatar }, callback) => {
+        if (!userId || !userData[userId]) return callback?.({ success: false, error: 'Игрок не найден' });
+        const user = users.find(u => u.id === userId);
+        if (!user) return callback?.({ success: false, error: 'Пользователь не найден' });
+        if (avatar && typeof avatar === 'string' && avatar.length > 300000) {
+          return callback?.({ success: false, error: 'Файл слишком большой' });
+        }
+        user.avatar = avatar || null;
+        saveUsers();
+        // Уведомляем друзей, чтобы обновили список с новой аватаркой
+        const friends = userData[userId].friends || [];
+        friends.forEach(fid => {
+          const sId = onlineUsers.get(fid);
+          if (sId) io.to(sId).emit('friends-updated');
+        });
+        // Обновляем самого игрока в текущей сессии
+        const sId = onlineUsers.get(userId);
+        if (sId) {
+          io.to(sId).emit('user-data-updated', userData[userId]);
+        }
+        callback?.({ success: true });
+      });
+
       socket.on('update-active-skins', ({ userId, activeSkins }) => {
     if (!userId || !userData[userId]) return;
     userData[userId].activeSkins = activeSkins;
-    saveUserData();
+    saveUserData(userId);
     // Обновляем игрока во всех игровых комнатах, где он сейчас играет
     for (const roomId in gameRooms) {
       const player = gameRooms[roomId].find(p => p.id === userId);
@@ -2802,6 +2962,7 @@ const PORT = process.env.PORT || 8080;
         color: r.color,
         guest: r.guest,
         createdAt: Number(r.created_at),
+        avatar: r.avatar || null,
       }));
       console.log(`✅ Пользователи загружены из БД: ${users.length}`);
 

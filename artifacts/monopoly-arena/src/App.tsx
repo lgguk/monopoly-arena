@@ -61,6 +61,7 @@ import {
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { io } from 'socket.io-client';
+import { Landing } from "./Landing";
 
 const socket = io('https://api.monopoly-arena.ru', {
   transports: ['websocket', 'polling']
@@ -113,6 +114,7 @@ type Player = {
   activeSkins?: Record<number, string>;
   isVip?: boolean;
   vipUntil?: string;
+  avatar?: string | null;
 };
 type ChatMessage = {
   from: string;
@@ -178,6 +180,7 @@ type AuthUser = {
   color: string;
   guest?: boolean;
   vipUntil?: string; // дата окончания VIP (ISO)
+  avatar?: string | null; // base64 PNG, загруженный игроком
 };
 type AdminSettings = {
   startCapital: number;
@@ -255,7 +258,7 @@ type CaseDesign = {
   imageHeight?: number;
   shopScale?: number;
 };
-type LobbyMode = "Классический" | "2×2";
+type LobbyMode = "Классический" | "Быстрая" | "Дуэль";
 type LobbyRoom = {
   id: string;
   name: string;
@@ -332,14 +335,16 @@ type AuctionState = {
 
 const RENT_MULTIPLIERS = [1, 6, 12, 17, 27, 42];
 
-// Награды по местам (1-е место максимальное, далее по убыванию)
+// Награды по местам (1-е место максимальное, далее по убыванию).
+// Coins низкие — основной доход игрока идёт с квестов (~500/нед).
+// XP — прогресс уровня, не валюта. VIP: ×2 XP, +20% Coins.
 const REWARDS_BY_PLACE: Record<number, { coins: number; xp: number }> = {
-  1: { coins: 300, xp: 450 },
-  2: { coins: 200, xp: 300 },
-  3: { coins: 120, xp: 180 },
-  4: { coins: 100, xp: 150 },
-  5: { coins: 80, xp: 120 },
-  6: { coins: 60, xp: 100 },
+  1: { coins: 15, xp: 150 },
+  2: { coins: 12, xp: 120 },
+  3: { coins: 10, xp: 90 },
+  4: { coins: 10, xp: 50 },
+  5: { coins: 10, xp: 50 },
+  6: { coins: 10, xp: 50 },
 };
 const IMPROVE_LABELS = [
   "",
@@ -351,7 +356,40 @@ const IMPROVE_LABELS = [
 ];
 
 const roundTo10 = (val: number) => Math.round(val / 10) * 10;
-const getLevelFromXP = (xp: number) => Math.floor(xp / 1000);
+// Прогрессивная шкала: порог перехода на уровень L = 1000 + 200·(L−1).
+// L1=1000, L2=2200, L3=3600, L4=5200 …
+const getLevelFromXP = (xp: number): number => {
+  let level = 0;
+  let remaining = Number(xp) || 0;
+  while (level < 200) {
+    const cost = 1000 + 200 * level;
+    if (remaining < cost) break;
+    remaining -= cost;
+    level++;
+  }
+  return level;
+};
+
+// Отдаёт { level, totalXp, nextThreshold } — для прогресс-бара в Профиле.
+// totalXp — общий накопленный XP игрока.
+// nextThreshold — суммарный XP, который нужен, чтобы получить следующий уровень.
+const getLevelInfo = (xp: number) => {
+  const totalXp = Number(xp) || 0;
+  let level = 0;
+  let remaining = totalXp;
+  while (level < 200) {
+    const cost = 1000 + 200 * level;
+    if (remaining < cost) break;
+    remaining -= cost;
+    level++;
+  }
+  // Суммарный порог до следующего уровня = сумма всех переходов 0..level
+  let nextThreshold = 0;
+  for (let i = 0; i <= level; i++) {
+    nextThreshold += 1000 + 200 * i;
+  }
+  return { level, totalXp, nextThreshold };
+};
 // Глобальная переменная для актуальных дизайнов карточек (обновляется в компонентах)
 let globalCardDesigns: CardDesign[] = [];
 
@@ -816,6 +854,38 @@ const seedListings: Listing[] = [
   },
 ];
 
+// Сжимает картинку-файл до квадрата 256×256, обрезая по центру.
+// Возвращает base64 PNG. Используется для аватарок.
+async function compressAvatar(file: File): Promise<string> {
+  const MAX_INPUT = 5 * 1024 * 1024; // 5 МБ вход
+  if (file.size > MAX_INPUT) throw new Error("Файл больше 5 МБ");
+
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Не удалось прочитать файл"));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Не картинка"));
+      img.onload = () => {
+        const TARGET = 256;
+        const size = Math.min(img.width, img.height);
+        const sx = (img.width - size) / 2;
+        const sy = (img.height - size) / 2;
+        const canvas = document.createElement("canvas");
+        canvas.width = TARGET;
+        canvas.height = TARGET;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return reject(new Error("Canvas недоступен"));
+        ctx.drawImage(img, sx, sy, size, size, 0, 0, TARGET, TARGET);
+        // PNG с прозрачностью, качество 0.85
+        resolve(canvas.toDataURL("image/png"));
+      };
+      img.src = reader.result as string;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 function useLocalStorage<T>(key: string, initial: T) {
   const [value, setValue] = useState<T>(() => {
     try {
@@ -929,22 +999,35 @@ function Avatar({
   initials,
   color,
   size = "md",
+  avatar,
 }: {
   initials: string;
   color: string;
   size?: "sm" | "md" | "lg";
+  avatar?: string | null;
 }) {
   const sizes = {
     sm: "h-8 w-8 text-[10px]",
     md: "h-10 w-10 text-xs",
     lg: "h-16 w-16 text-lg",
   };
+  const px = { sm: 32, md: 40, lg: 64 }[size];
   return (
     <div
-      className={`${sizes[size]} flex shrink-0 items-center justify-center rounded-full font-bold text-white shadow-sm`}
-      style={{ backgroundColor: color }}
+      className={`${sizes[size]} flex shrink-0 items-center justify-center overflow-hidden rounded-full font-bold text-white shadow-sm`}
+      style={{ backgroundColor: avatar ? "transparent" : color }}
     >
-      {initials}
+      {avatar ? (
+        <img
+          src={avatar}
+          alt={initials}
+          width={px}
+          height={px}
+          className="h-full w-full object-cover"
+        />
+      ) : (
+        initials
+      )}
     </div>
   );
 }
@@ -1059,8 +1142,8 @@ function Dashboard({
 }) {
     const [rooms, setRooms] = useState<LobbyRoom[]>([]);
   const [chat, setChat] = useState<GlobalChatMessage[]>([]);
-    const [friends, setFriends] = useState<{ id: string; name: string; online: boolean }[]>([]);
-  const [friendSearchResults, setFriendSearchResults] = useState<{ id: string; name: string; online: boolean }[]>([]);
+    const [friends, setFriends] = useState<{ id: string; name: string; online: boolean; avatar?: string | null }[]>([]);
+  const [friendSearchResults, setFriendSearchResults] = useState<{ id: string; name: string; online: boolean; avatar?: string | null }[]>([]);
   const [isSpinning, setIsSpinning] = useState(false);
   const [jailPaymentPending, setJailPaymentPending] = useState(false);
     type QuestItem = { id: string; title: string; reward: number; icon: string; done: boolean; claimed: boolean; progress: number; target: number };
@@ -1256,7 +1339,7 @@ function Dashboard({
     return () => window.clearTimeout(id);
   }, [lobbyDeletedNotice]);
   const roomModeLabel = (mode: LobbyMode) =>
-    mode === "Классический" ? "Классика" : mode;
+  mode === "Классический" ? "Классика" : mode;
   const roomFeatures = (room: LobbyRoom) =>
     [
       room.jackpot && "Джекпот",
@@ -1282,17 +1365,14 @@ function Dashboard({
       const createRoom = (event: FormEvent) => {
     event.preventDefault();
     const mode = createMode;
-        const maxPlayers =
-      mode === "2×2"
-        ? 4
-        : Math.min(5, Math.max(2, createPlayers));
+    const maxPlayers = mode === "Дуэль" ? 2 : Math.min(5, Math.max(2, createPlayers));
     const isVip = (() => {
   const vipUntil = localStorage.getItem("arena-vip-until");
   return vipUntil ? new Date(vipUntil) > new Date() : false;
 })();
 
 if (!isVip && (mode !== "Классический" || createPassword.trim() !== "")) {
-  setNotice("❌ Без VIP-статуса можно создавать только классические комнаты (2-5 игроков) без пароля.");
+  setNotice("❌ Без VIP-статуса доступны только классические комнаты (2–5 игроков) без пароля. Быстрая игра, Дуэль и пароли — для VIP.");
   return;
 }    
     const roomData = {
@@ -1567,7 +1647,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
               {(friendQuery.trim()
                 ? friendSearchResults.filter(r => !friends.some(fr => fr.id === r.id))
                 : friends
-              ).slice(0, 10).map((f: { id: string; name: string; online: boolean }) => {
+              ).slice(0, 10).map((f: { id: string; name: string; online: boolean; avatar?: string | null }) => {
                 const initials = f.name
                   .split(/\s+/)
                   .slice(0, 2)
@@ -1584,7 +1664,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
                     className="flex items-center gap-2 rounded-lg p-2 hover:bg-muted"
                   >
                     <div className="relative shrink-0">
-                      <Avatar initials={initials} color={color} size="sm" />
+                      <Avatar initials={initials} color={color} size="sm" avatar={f.avatar} />
                       <span
                         className={`absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-card ${f.online ? "bg-accent" : "bg-muted-foreground/40"}`}
                       />
@@ -1696,7 +1776,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
         }
       }}
       placeholder="Напиши что-нибудь..."
-       className="min-w-0 flex-1 rounded-xl border border-input bg-[#f1eadc] px-3 py-2 text-sm outline-none resize-none overflow-hidden focus:ring-2 focus:ring-primary/30 min-h-[44px] max-h-[120px]"
+       className="min-w-0 flex-1 rounded-xl border border-input bg-[#f1eadc] px-3 py-2 text-base outline-none resize-none overflow-hidden placeholder:text-base focus:ring-2 focus:ring-primary/30 min-h-[44px] max-h-[120px]"
     />
     <button
       type="submit"
@@ -1728,7 +1808,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
             </div>
           </div>
           <div className="mb-4 flex flex-col gap-2 sm:flex-row">
-            <div className="relative min-w-0 flex-1">
+            <div className="relative min-w-0 sm:flex-1">
               <Search
                 size={15}
                 className="absolute left-3 top-3 text-muted-foreground"
@@ -1740,36 +1820,40 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
                 className="w-full rounded-xl border border-input bg-card py-2.5 pl-9 pr-3 text-sm outline-none focus:ring-2 focus:ring-primary/30"
               />
             </div>
-                             <div className="relative shrink-0">
-                            <select
-                value={roomMode}
-                onChange={(ev) =>
-                  setRoomMode(ev.target.value as "Все" | LobbyMode)
-                }
-                className="w-fit appearance-none rounded-xl border border-input bg-card py-2.5 pl-3 pr-8 text-sm outline-none"
+            <div className="flex gap-2">
+              <div className="relative min-w-0 flex-1">
+                <select
+                  value={roomMode}
+                  onChange={(ev) =>
+                    setRoomMode(ev.target.value as "Все" | LobbyMode)
+                  }
+                  className="h-11 w-full appearance-none rounded-xl border border-input bg-card pl-3 pr-8 text-lg font-medium outline-none sm:text-sm"
+                >
+                  <option>Все</option>
+                  <option>Классический</option>
+                  <option>Быстрая</option>
+                  <option>Дуэль</option>
+                </select>
+                <ChevronDown
+                  size={14}
+                  className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"
+                  style={{ marginTop: 0 }}
+                />
+              </div>
+              <button
+                onClick={refreshRooms}
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-input bg-card hover:bg-muted"
+                title="Обновить список комнат"
               >
-                <option>Все</option>
-                <option>Классический</option>
-                <option>2×2</option>
-              </select>
-              <ChevronDown
-                size={14}
-                className="pointer-events-none absolute right-[11px] top-1/2 -translate-y-1/2 text-muted-foreground"
-              />
+                <RefreshCw size={15} />
+              </button>
+              <button
+                onClick={onRequestCreate}
+                className="flex h-11 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-primary px-3 text-xs font-bold text-primary-foreground"
+              >
+                <Plus size={15} /> Создать
+              </button>
             </div>
-            <button
-              onClick={refreshRooms}
-              className="flex items-center justify-center rounded-xl border border-input bg-card px-3 py-2.5 text-sm hover:bg-muted"
-              title="Обновить список комнат"
-            >
-              <RefreshCw size={15} />
-            </button>
-            <button
-              onClick={onRequestCreate}
-              className="flex items-center justify-center gap-1.5 rounded-xl bg-primary px-4 py-2.5 text-xs font-bold text-primary-foreground"
-            >
-              <Plus size={15} /> Создать
-            </button>
           </div>
           {notice && (
             <div className="mb-4 flex items-center gap-2 rounded-xl border border-accent/25 bg-[#dceae3] px-4 py-3 text-xs font-medium text-accent">
@@ -1977,35 +2061,43 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
                 value={createMode}
                 onChange={(event) => {
                   const val = event.target.value as LobbyMode;
-                  if (val === "2×2" && !isVipActive()) {
-                    setNotice("❌ Режим 2×2 доступен только с VIP-статусом.");
+                  if (val !== "Классический" && !isVipActive()) {
+                    setNotice("❌ Быстрая игра и Дуэль доступны только с VIP-статусом.");
                     setTimeout(() => setNotice(""), 10000);
                     return;
                   }
                   setCreateMode(val);
+                  if (val === "Дуэль") setCreatePlayers(2);
                 }}
                 className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
               >
                 <option>Классический</option>
                 <option disabled={!isVipActive()}>
-                  {isVipActive() ? "2×2" : "2×2 (только VIP)"}
+                  {isVipActive() ? "Быстрая" : "Быстрая (только VIP)"}
+                </option>
+                <option disabled={!isVipActive()}>
+                  {isVipActive() ? "Дуэль" : "Дуэль (только VIP)"}
                 </option>
               </select>
               <label className="text-xs font-bold">
                 Количество игроков
                 <select
-                  value={createPlayers}
+                  value={createMode === "Дуэль" ? 2 : createPlayers}
                   onChange={(event) =>
                     setCreatePlayers(Number(event.target.value))
                   }
-                  disabled={createMode !== "Классический"}
+                  disabled={createMode === "Дуэль"}
                   className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal disabled:opacity-50"
                 >
-                  {[2, 3, 4, 5].map((count) => (
-                    <option key={count} value={count}>
-                      {count} игрока
-                    </option>
-                  ))}
+                  {createMode === "Дуэль" ? (
+                    <option value={2}>2 игрока (1×1)</option>
+                  ) : (
+                    [2, 3, 4, 5].map((count) => (
+                      <option key={count} value={count}>
+                        {count} игрока
+                      </option>
+                    ))
+                  )}
                 </select>
               </label>
             </div>
@@ -2100,7 +2192,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
               </button>
             </div>
             <div className="mt-5 space-y-2">
-               {(["Все", "Классический", "2×2"] as const).map((mode) => (
+               {(["Все", "Классический", "Быстрая", "Дуэль"] as const).map((mode) => (
                 <label
                   key={mode}
                   className={`flex cursor-pointer items-center gap-3 rounded-xl border p-3 text-sm font-bold ${findMode === mode ? "border-primary bg-[#f6dfd7]" : "border-input"}`}
@@ -2536,12 +2628,12 @@ function Friends({
   onPendingChatConsumed?: () => void;
 }) {
   const isGuest = player?.guest;
-   const [friends, setFriends] = useState<{ id: string; name: string; online: boolean }[]>([]);
-  const [friendRequests, setFriendRequests] = useState<{ fromId: string; fromName: string; timestamp: number; fromOnline: boolean }[]>([]);
-  const [outgoingRequests, setOutgoingRequests] = useState<{ toId: string; toName: string; timestamp: number }[]>([]);
+   const [friends, setFriends] = useState<{ id: string; name: string; online: boolean; avatar?: string | null }[]>([]);
+  const [friendRequests, setFriendRequests] = useState<{ fromId: string; fromName: string; timestamp: number; fromOnline: boolean; fromAvatar?: string | null }[]>([]);
+  const [outgoingRequests, setOutgoingRequests] = useState<{ toId: string; toName: string; timestamp: number; toAvatar?: string | null }[]>([]);
   const [activeSubTab, setActiveSubTab] = useState<"friends" | "requests">("friends");
   const [search, setSearch] = useState("");
-  const [searchResults, setSearchResults] = useState<{ id: string; name: string; online: boolean }[]>([]);
+  const [searchResults, setSearchResults] = useState<{ id: string; name: string; online: boolean; avatar?: string | null }[]>([]);
   const [notice, setNotice] = useState("");
   const [chatFriend, setChatFriend] = useState<{ id: string; name: string; online: boolean } | null>(null);
   const userId = player?.id;
@@ -2680,7 +2772,7 @@ function Friends({
                   <div className="text-xs font-bold text-muted-foreground uppercase tracking-wide">Результаты поиска</div>
                   {searchResults.filter(r => !friends.some(f => f.id === r.id)).map(r => (
                     <div key={r.id} className="flex items-center gap-3 rounded-xl p-2.5 transition hover:bg-muted">
-                      <Avatar initials={r.name[0]} color="#32786d" size="sm" />
+                      <Avatar initials={r.name[0]} color="#32786d" size="sm" avatar={r.avatar} />
                       <div className="min-w-0 flex-1">
                         <div className="truncate text-sm font-bold">{r.name}</div>
                         <div className="truncate text-[11px] text-muted-foreground">{r.id} · {r.online ? 'В сети' : 'Не в сети'}</div>
@@ -2722,7 +2814,7 @@ function Friends({
                   return (
                     <div key={friend.id} className="flex items-center gap-3 rounded-xl p-2.5 transition hover:bg-muted">
                       <div className="relative">
-                        <Avatar initials={initials} color={color} size="sm" />
+                        <Avatar initials={initials} color={color} size="sm" avatar={friend.avatar} />
                         {friend.online && <span className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-card bg-accent" />}
                       </div>
                                             <div className="min-w-0 flex-1">
@@ -2768,7 +2860,7 @@ function Friends({
                   return (
                     <div key={req.fromId} className="flex items-center gap-3 rounded-xl p-2.5 transition hover:bg-muted">
                       <div className="relative">
-                        <Avatar initials={initials} color={color} size="sm" />
+                        <Avatar initials={initials} color={color} size="sm" avatar={req.fromAvatar} />
                         {req.fromOnline && <span className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-card bg-accent" />}
                       </div>
                       <div className="min-w-0 flex-1">
@@ -2808,7 +2900,7 @@ function Friends({
                     )}
                     {outgoingRequests.map((req) => (
                       <div key={req.toId} className="flex items-center gap-3 rounded-xl p-2.5 transition hover:bg-muted">
-                        <Avatar initials={req.toName[0] || "?"} color="#e96852" size="sm" />
+                        <Avatar initials={req.toName[0] || "?"} color="#e96852" size="sm" avatar={req.toAvatar} />
                         <div className="min-w-0 flex-1">
                           <b className="truncate text-sm">{req.toName}</b>
                           <div className="truncate text-[11px] text-muted-foreground">
@@ -3165,12 +3257,12 @@ const buyVip = (vip: MarketItem) => {
           })}
       </div>
 
-           {/* VIP-статус */}
+                      {/* VIP-статус */}
       {vipItems.length > 0 && (
         <div className="mt-10">
           <h3 className="mb-4 font-display text-xl font-bold">VIP-статус</h3>
           <p className="mb-4 text-xs text-muted-foreground">
-            VIP даёт: x2 опыт за игры, создание лобби во всех режимах и с доп. функциями (включая Дуэль, 2х2, Быстрая игра, с паролем и др.), иконку VIP возле ника.
+            Наведи курсор на карточку, чтобы увидеть все бонусы статуса.
           </p>
                     <div className="grid gap-5" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(185px, 1fr))" }}>
             {vipItems.map((vip) => (
@@ -3179,9 +3271,13 @@ const buyVip = (vip: MarketItem) => {
                 return (
               <div
                 key={vip.id}
-                className="lift overflow-hidden rounded-2xl border border-card-border bg-card flex flex-col"
+                className="group relative"
                 style={{ width: `${sz.cardWidth}px` }}
               >
+                <div
+                  className="lift overflow-hidden rounded-2xl border border-card-border bg-card flex flex-col h-full"
+                  style={{ width: `${sz.cardWidth}px` }}
+                >
                 <div
                   className="relative flex items-center justify-center overflow-hidden"
                   style={{
@@ -3202,9 +3298,12 @@ const buyVip = (vip: MarketItem) => {
                 </div>
                 <div className="p-4 flex flex-col gap-3 flex-1">
                   <div>
-                    <h4 className="font-display text-lg font-bold">{vip.name}</h4>
+                    <h4 className="font-display text-lg font-bold">
+                      {vip.name}
+                      <span className="ml-1 text-[11px] font-normal text-muted-foreground align-middle">ⓘ</span>
+                    </h4>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {vip.description || `Продлевает VIP на ${vip.vipDuration || 7} дней`}
+                      {vip.description || `Продлевает VIP на ${vip.vipDuration || 7} дней. Наведи на карточку, чтобы увидеть все бонусы.`}
                     </p>
                   </div>
                   <div className="mt-auto flex items-center justify-between pt-2 border-t border-border">
@@ -3246,6 +3345,18 @@ const buyVip = (vip: MarketItem) => {
                       Купить
                     </button>
                   </div>
+                </div>
+                </div>
+                {/* Popup с бонусами — вылетает справа от карточки при наведении на любое место */}
+                <div className="pointer-events-none absolute left-full top-0 z-50 ml-2 hidden w-64 rounded-xl border border-card-border bg-card p-3 text-[11px] leading-4 text-foreground shadow-2xl group-hover:block">
+                  <div className="mb-1.5 font-bold text-primary">VIP-статус даёт:</div>
+                  <ul className="space-y-0.5 text-muted-foreground">
+                    <li>• +50% опыта за каждую партию</li>
+                    <li>• +20% Coins за каждую партию</li>
+                    <li>• Создание лобби во всех режимах (Классика, Быстрая, Дуэль)</li>
+                    <li>• Пароль на комнату</li>
+                    <li>• Иконка VIP рядом с ником</li>
+                  </ul>
                 </div>
               </div>
               );
@@ -4957,6 +5068,49 @@ function Market() {
 function Profile({ onInventory, onOpenWallet, player }: { onInventory: () => void; onOpenWallet?: () => void; player?: AuthUser | null }) {
   const [name, setName] = useState(player?.name || "Гость");
   const [saved, setSaved] = useState(false);
+  const [avatar, setAvatar] = useState<string | null>(player?.avatar || null);
+  const [avatarError, setAvatarError] = useState("");
+  const [avatarUploading, setAvatarUploading] = useState(false);
+  const avatarInputRef = useRef<HTMLInputElement>(null);
+
+  // Синхронизация avatar из player, если он поменялся извне
+  useEffect(() => {
+    setAvatar(player?.avatar || null);
+  }, [player?.avatar]);
+
+  const handleAvatarFile = async (file: File) => {
+    setAvatarError("");
+    setAvatarUploading(true);
+    try {
+      const base64 = await compressAvatar(file);
+      if (!player?.id) throw new Error("Нет ID игрока");
+      socket.emit(
+        "update-avatar",
+        { userId: player.id, avatar: base64 },
+        (res: any) => {
+          setAvatarUploading(false);
+          if (res?.success) {
+            setAvatar(base64);
+            // Обновляем сессию в localStorage — чтобы шапка тоже подхватила
+            try {
+              const raw = localStorage.getItem("arena-session-user");
+              if (raw && raw !== "null") {
+                const u = JSON.parse(raw);
+                u.avatar = base64;
+                localStorage.setItem("arena-session-user", JSON.stringify(u));
+                window.dispatchEvent(new Event("arena-user-updated"));
+              }
+            } catch {}
+          } else {
+            setAvatarError(res?.error || "Не удалось сохранить");
+          }
+        }
+      );
+    } catch (e: any) {
+      setAvatarUploading(false);
+      setAvatarError(e?.message || "Ошибка загрузки");
+    }
+  };
   const userData = useMemo(() => {
     if (player?.id) {
       const saved = localStorage.getItem("arena-user-data-" + player.id);
@@ -4979,13 +5133,40 @@ function Profile({ onInventory, onOpenWallet, player }: { onInventory: () => voi
       <div className="grid gap-6 xl:grid-cols-[.8fr_1.2fr]">
         <div className="rounded-2xl bg-[#29233e] p-6 text-[#f7f0e3]">
           <div className="flex items-center gap-4">
-            <Avatar initials={player?.initials || "Г"} color={player?.color || "#32786d"} size="lg" />
+            <div className="relative">
+              <Avatar
+                initials={player?.initials || "Г"}
+                color={player?.color || "#32786d"}
+                size="lg"
+                avatar={avatar}
+              />
+              <button
+                type="button"
+                onClick={() => avatarInputRef.current?.click()}
+                disabled={avatarUploading}
+                className="absolute -bottom-1 -right-1 flex h-7 w-7 items-center justify-center rounded-full bg-[#e96852] text-white shadow-md hover:brightness-95 disabled:opacity-50"
+                title="Загрузить аватарку"
+              >
+                {avatarUploading ? "…" : <Upload size={12} />}
+              </button>
+              <input
+                ref={avatarInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) handleAvatarFile(f);
+                  e.target.value = "";
+                }}
+              />
+            </div>
             <div>
               <div className="font-mono text-[10px] uppercase tracking-[.2em] text-[#e7ba68]">{player?.id || "MA-XXXX"}
               </div>
               <h2 className="mt-1 font-display text-2xl font-bold">{name}</h2>
               <div className="mt-1 text-xs text-[#bbb4c5]">
-                Уровень {userData?.stats?.level ?? 0}
+                Уровень {getLevelInfo(userData?.stats?.xp ?? 0).level}
               </div>
             </div>
           </div>
@@ -5003,17 +5184,21 @@ function Profile({ onInventory, onOpenWallet, player }: { onInventory: () => voi
               <div className="text-[10px] text-[#aaa2b4]">на арене</div>
             </div>
           </div>
+          {avatarError && (
+            <div className="mt-3 rounded-lg bg-[#e96852]/20 px-3 py-2 text-[11px] font-medium text-[#ff8a75]">
+              {avatarError}
+            </div>
+          )}
                     <div className="mt-6">
             {(() => {
               const xp = userData?.stats?.xp ?? 0;
-              const xpInLevel = xp % 1000;
-              const percent = Math.min(100, Math.max(0, xpInLevel / 10));
-              const nextLevelXp = Math.floor(xp / 1000) * 1000 + 1000;
+              const { level, totalXp, nextThreshold } = getLevelInfo(xp);
+              const percent = Math.min(100, Math.max(0, (totalXp / nextThreshold) * 100));
               return (
                 <>
                   <div className="mb-2 flex justify-between text-[11px]">
-                    <span>Прогресс уровня</span>
-                    <span className="font-mono text-[#e7ba68]">{xpInLevel} / 1000 XP</span>
+                    <span>Всего XP · до {level + 1} уровня</span>
+                    <span className="font-mono text-[#e7ba68]">{totalXp} / {nextThreshold} XP</span>
                   </div>
                   <div className="h-2 overflow-hidden rounded-full bg-white/10">
                     <div
@@ -5204,7 +5389,7 @@ const pendingJailMovementRef = useRef<{ d1: number; d2: number; capturedTurn: nu
   if (mortgages[cellIdx] !== undefined && mortgages[cellIdx] > globalTurnCounter) return 0;
   // Базовая рента = 10% от стоимости поля
   const basePrice = getCell(cellIdx).price ?? 0;
-  const rent = basePrice * 0.1 * RENT_MULTIPLIERS[Math.min(impr[cellIdx] ?? 0, 5)];
+  const rent = basePrice * 0.1 * RENT_MULTIPLIERS[Math.min(impr[cellIdx] ?? 0, 5)] * modeConfig.rentMultiplier;
   return Math.round(rent / 10) * 10;
 };
 
@@ -5258,10 +5443,11 @@ useEffect(() => { animPathRef.current = animPath; }, [animPath]);
         }
       } catch {}
 
-      let me: { name: string; initials: string; color: string } = {
+      let me: { name: string; initials: string; color: string; avatar?: string | null } = {
         name: "Игрок",
         initials: "ИГ",
         color: "#e96852",
+        avatar: null,
       };
       try {
         const stored = localStorage.getItem("arena-session-user");
@@ -5270,7 +5456,7 @@ useEffect(() => { animPathRef.current = animPath; }, [animPath]);
           if (u?.name) {
             const parts = u.name.trim().split(/\s+/);
             const initials = parts.slice(0, 2).map((p: string) => p[0]).join("").toUpperCase();
-            me = { name: u.name, initials: u.initials || initials, color: PLAYER_COLORS[0] };
+            me = { name: u.name, initials: u.initials || initials, color: PLAYER_COLORS[0], avatar: u.avatar || null };
           }
         } else {
           const nickname = localStorage.getItem("arena-nickname");
@@ -5321,6 +5507,7 @@ useEffect(() => { animPathRef.current = animPath; }, [animPath]);
       position: 0,
       vipUntil: localStorage.getItem("arena-vip-until") || undefined,
       activeSkins: JSON.parse(localStorage.getItem("arena-active-skins") || "{}").activeSkins || {},
+      avatar: currentUser?.avatar || null,
     };
 
     if (initialRoomId) {
@@ -5385,6 +5572,24 @@ resolveGameDesigns(cleanPlayers);
     // Обработчик получения нового таймера
     socket.on('sync-timer-broadcast', (newTime) => {
       setTimeLeft(newTime);
+    });
+
+    // Настройки режима с сервера. Приходят сразу после enter-game-room.
+    socket.on('room-settings', (data: any) => {
+      if (!data) return;
+      setModeConfig({
+        mode: data.mode || "Классический",
+        turnDurationSec: Number(data.turnDurationSec) || 45,
+        fastMode: !!data.fastMode,
+        rentMultiplier: Number(data.rentMultiplier) || 1.0,
+        jailAttempts: Number(data.jailAttempts) || 3,
+        passStartBonus: Number(data.passStartBonus) || 2000,
+        landStartBonus: Number(data.landStartBonus) || 3000,
+      });
+      // Стартовый таймер сразу под режим
+      if (typeof data.turnDurationSec === "number") {
+        setTimeLeft(data.turnDurationSec);
+      }
     });
 
     // Финальный экран с наградами приходит ТОЛЬКО с сервера.
@@ -5552,7 +5757,8 @@ resolveGameDesigns(cleanPlayers);
       socket.off('game-log-add-broadcast', handleGameLogBroadcast);
       socket.off('player-left'); // <--- ДОБАВИТЬ
       socket.off('game-ended');  // <--- ДОБАВИТЬ
-      socket.off('sync-timer-broadcast'); // <--- ДОБАВИТЬ ЭТУ СТРОКУ
+      socket.off('sync-timer-broadcast');
+      socket.off('room-settings');
       socket.off('trade-proposed-broadcast');
       socket.off('trade-resolved-broadcast');
     };
@@ -5620,10 +5826,49 @@ resolveGameDesigns(cleanPlayers);
 
   const [timeLeft, setTimeLeft] = useState(45);
 
+  // На мобиле играть можно только в ландшафтной ориентации —
+  // в портрете стол не помещается. Показываем заглушку с просьбой повернуть.
+  const [isPortraitMobile, setIsPortraitMobile] = useState(false);
+  useEffect(() => {
+    const check = () => {
+      const isPortrait = window.matchMedia("(orientation: portrait)").matches;
+      const isSmall = window.innerWidth < 1024;
+      setIsPortraitMobile(isPortrait && isSmall);
+    };
+    check();
+    window.addEventListener("resize", check);
+    window.addEventListener("orientationchange", check);
+    return () => {
+      window.removeEventListener("resize", check);
+      window.removeEventListener("orientationchange", check);
+    };
+  }, []);
+
+  // Настройки режима приходят с сервера (см. событие 'room-settings').
+  // Классический: аренда ×1, 3 попытки в тюрьме, +2000 за проход Старта, +3000 за клетку Старт.
+  // Быстрая/Дуэль: аренда ×1.5, 1 попытка, +3000 за проход Старта, +4500 за клетку.
+  const [modeConfig, setModeConfig] = useState<{
+    mode: string;
+    turnDurationSec: number;
+    fastMode: boolean;
+    rentMultiplier: number;
+    jailAttempts: number;
+    passStartBonus: number;
+    landStartBonus: number;
+  }>({
+    mode: "Классический",
+    turnDurationSec: 45,
+    fastMode: false,
+    rentMultiplier: 1.0,
+    jailAttempts: 3,
+    passStartBonus: 2000,
+    landStartBonus: 3000,
+  });
+
   // При открытии окна действия (покупка/аренда/налог/шанс) даём игроку свежие 45 секунд
   useEffect(() => {
     if (pendingAction) {
-      setTimeLeft(45);
+      setTimeLeft(modeConfig.turnDurationSec);
       timeoutHandled.current = false;
     }
   }, [pendingAction]);
@@ -6001,7 +6246,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     // Если это дубль (1-й или 2-й), мы не переключаем ход, а даём бросать снова тому же игроку
     if (!forceNext && isDoubleRoll && doubleCount < 3) {
       setRolled(false);
-      setTimeLeft(45);
+      setTimeLeft(modeConfig.turnDurationSec);
       setImprovedGroupsThisTurn([]);
       timeoutHandled.current = false;
       setMessage(`${playersRef.current[fromIdx].name}, дубль! Бросай кубики снова.`);
@@ -6011,11 +6256,11 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     setTurn(next);
     // ДОБАВЛЯЕМ ОТПРАВКУ НОВОГО ТАЙМЕРА ВСЕМ
     if (initialRoomId) {
-      socket.emit('sync-timer', { roomId: initialRoomId, timeLeft: 45 });
+      socket.emit('sync-timer', { roomId: initialRoomId, timeLeft: modeConfig.turnDurationSec });
     }
     
     setRolled(false);
-    setTimeLeft(45);
+    setTimeLeft(modeConfig.turnDurationSec);
     setImprovedGroupsThisTurn([]);
     setDoubleCount(0);
     setIsDoubleRoll(false);
@@ -6221,21 +6466,21 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     if (passedStart) {
       setPlayers((ps) =>
         ps.map((p, i) =>
-          i === capturedTurn ? { ...p, money: p.money + 2000 } : p,
+          i === capturedTurn ? { ...p, money: p.money + modeConfig.passStartBonus } : p,
         ),
       );
-      addLog(`🏁 ${cur.name} прошёл Старт: +2 000 К`);
+      addLog(`🏁 ${cur.name} прошёл Старт: +${modeConfig.passStartBonus.toLocaleString("ru-RU")} К`);
     }
     const cell = getCell(newPos);
     switch (cell.type) {
       case "start":
-        addLog(`🏁 ${cur.name} попал на Старт! +3 000 К`);
+        addLog(`🏁 ${cur.name} попал на Старт! +${modeConfig.landStartBonus.toLocaleString("ru-RU")} К`);
         setPlayers((ps) =>
           ps.map((p, i) =>
-            i === capturedTurn ? { ...p, money: p.money + 3000 } : p,
+            i === capturedTurn ? { ...p, money: p.money + modeConfig.landStartBonus } : p,
           ),
         );
-        addLog(`🏁 ${cur.name} получил 3 000 К за Старт!`);
+        addLog(`🏁 ${cur.name} получил ${modeConfig.landStartBonus.toLocaleString("ru-RU")} К за Старт!`);
         advanceTurn(capturedTurn);
         break;
       case "property": {
@@ -6379,28 +6624,28 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           setPlayers((ps) =>
             ps.map((p, i) =>
               i === capturedTurn
-                ? { ...p, position: 10, jailTurns: 3, jailAttempts: 0 }
+                ? { ...p, position: 10, jailTurns: modeConfig.jailAttempts, jailAttempts: 0 }
                 : p,
             ),
           );
           setDiagonalAnim(null);
-          addLog(`🔒 ${cur.name} отправлен в тюрьму (до 3 попыток дубля)`);
+          addLog(`🔒 ${cur.name} отправлен в тюрьму (до ${modeConfig.jailAttempts} попыт${modeConfig.jailAttempts === 1 ? "ки" : "ок"} дубля)`);
           advanceTurn(capturedTurn, true);
         }, 1200);
         break;
       case "jail":
         // 1.7.1: landing on Jail cell = same as gotojail
         addLog(
-          `🔒 ${cur.name} попал на «Тюрьма» — задержан! До 3 попыток дубля или выкуп 500 К.`,
+          `🔒 ${cur.name} попал на «Тюрьма» — задержан! До ${modeConfig.jailAttempts} попыт${modeConfig.jailAttempts === 1 ? "ки" : "ок"} дубля или выкуп 500 К.`,
         );
         setPlayers((ps) =>
           ps.map((p, i) =>
             i === capturedTurn
-              ? { ...p, position: 10, jailTurns: 3, jailAttempts: 0 }
+              ? { ...p, position: 10, jailTurns: modeConfig.jailAttempts, jailAttempts: 0 }
               : p,
           ),
         );
-        addLog(`🔒 ${cur.name} отправлен в тюрьму (до 3 попыток дубля)`);
+        addLog(`🔒 ${cur.name} отправлен в тюрьму (до ${modeConfig.jailAttempts} попыт${modeConfig.jailAttempts === 1 ? "ки" : "ок"} дубля)`);
         advanceTurn(capturedTurn, true);
         break;
       case "jackpot": {
@@ -6524,11 +6769,11 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         setPlayers((ps) =>
           ps.map((p, i) =>
             i === turn
-              ? { ...p, position: 10, jailTurns: 3, jailAttempts: 0 }
+              ? { ...p, position: 10, jailTurns: modeConfig.jailAttempts, jailAttempts: 0 }
               : p,
           ),
         );
-        addLog(`🔒 ${player.name} отправлен в тюрьму (до 3 попыток дубля)`);
+        addLog(`🔒 ${player.name} отправлен в тюрьму (до ${modeConfig.jailAttempts} попыт${modeConfig.jailAttempts === 1 ? "ки" : "ок"} дубля)`);
         advanceTurn();
         break;
       case "jackpot": {
@@ -7019,7 +7264,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         afterAnimRef.current = () => processLanding(np, 10, capturedTurn);
         setAnimStep(0);
         setAnimPath(path);
-                  } else if (attempts >= 3) {
+                  } else if (attempts >= modeConfig.jailAttempts) {
         // 3-я попытка: дубль не выпал. Игрок обязан выкупиться, продать/заложить имущество или сдаться.
         setJailPaymentPending(true);
         // ВАЖНО: Сохраняем выпавшие кубики, чтобы после оплаты выкупа передвинуть игрока!
@@ -7037,10 +7282,10 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         );
         
         addLog(
-          `❗ ${player.name} — 3-я попытка, дубль не выпал. Обязан выкупиться или продать/заложить имущество.`,
+          `❗ ${player.name} — попытки исчерпаны, дубль не выпал. Обязан выкупиться или продать/заложить имущество.`,
         );
-        setMessage("3-я попытка не удалась. Оплатите 500 К или продайте/заложите имущество.");
-        setTimeLeft(45);
+        setMessage("Попытки исчерпаны. Оплатите 500 К или продайте/заложите имущество.");
+        setTimeLeft(modeConfig.turnDurationSec);
       } else {
         // No double — stay in jail
         setPlayers((ps) =>
@@ -7048,7 +7293,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
             i === capturedTurn
               ? {
                   ...p,
-                  jailTurns: Math.max(0, (p?.jailTurns ?? 3) - 1),
+                  jailTurns: Math.max(0, (p?.jailTurns ?? modeConfig.jailAttempts) - 1),
                   jailAttempts: attempts,
                 }
               : p,
@@ -7108,7 +7353,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     } else {
       // Если просто выкупился до броска
       setRolled(false);
-      setTimeLeft(45);
+      setTimeLeft(modeConfig.turnDurationSec);
       setMessage("Выкупился! Теперь бросай кубики.");
     }
   };
@@ -7191,6 +7436,22 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         timeLeft: timeLeft // <--- ДОБАВЛЕНО
     });
     }, [turn, owners, improvements, jackpot, mortgages, gameOver, reward, auction, rolled, isDoubleRoll]);
+
+  // Заглушка для мобильных в портретной ориентации — играем только в ландшафте.
+  if (isPortraitMobile) {
+    return (
+      <div className="flex h-screen w-screen flex-col items-center justify-center gap-4 bg-[#1c1828] px-6 text-center text-white">
+        <div className="text-6xl">📱↻</div>
+        <h2 className="font-display text-xl font-bold">
+          Поверни телефон
+        </h2>
+        <p className="max-w-xs text-sm text-[#a39cb1]">
+          Игровой стол рассчитан на ландшафтный режим.
+          Поверни устройство горизонтально, чтобы продолжить партию.
+        </p>
+      </div>
+    );
+  }
 
   // 🌟 ИДЕАЛЬНАЯ ЗАЩИТА ОТ ОШИБКИ #310: Если в комнате меньше 2 игроков, BoardGame показывает лобби и не рендерит тяжелый стол с хуками!
   if (initialRoomId && (!players || players.length < 2)) {
@@ -8887,7 +9148,8 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
               {players.map((p, i) => (
                 <div
                   key={p.id}
-                  className={`relative flex items-center gap-2 rounded-lg p-1.5 cursor-pointer ${i === turn ? "bg-[#f6dfd7]" : "hover:bg-muted"} ${p.bankrupt ? "opacity-40" : ""}`}
+                  className={`relative flex items-center gap-2 rounded-lg p-1.5 pl-2 cursor-pointer ${i === turn ? "bg-[#f6dfd7]" : "hover:bg-muted"} ${p.bankrupt ? "opacity-40" : ""}`}
+                  style={{ borderLeft: `3px solid ${p.color}` }}
                   onClick={(e) => {
   e.stopPropagation();
   if (!p.bankrupt) {
@@ -8900,7 +9162,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     }
                   }}
                 >
-                  <Avatar initials={p.initials} color={p.color} size="sm" />
+                  <Avatar initials={p.initials} color={p.color} size="sm" avatar={p.avatar} />
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[11px] font-bold">
   {p.name}
@@ -9008,7 +9270,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
             >
               <div className="px-3 py-2 border-b border-border">
                 <div className="flex items-center gap-2">
-                  <Avatar initials={tp.initials} color={tp.color} size="sm" />
+                  <Avatar initials={tp.initials} color={tp.color} size="sm" avatar={tp.avatar} />
                   <div>
                     <div className="text-[11px] font-bold truncate">
                       {tp.name}
@@ -11631,6 +11893,34 @@ function AppShell({
   onOpenWallet?: () => void;
 }) {
   const [mobileNav, setMobileNav] = useState(false);
+
+  // Аватарка игрока — читаем из localStorage, обновляем при событии из Профиля.
+  const [userAvatar, setUserAvatar] = useState<string | null>(() => {
+    try {
+      const raw = localStorage.getItem("arena-session-user");
+      if (!raw || raw === "null") return null;
+      const u = JSON.parse(raw);
+      return u?.avatar || null;
+    } catch { return null; }
+  });
+  useEffect(() => {
+    const refresh = () => {
+      try {
+        const raw = localStorage.getItem("arena-session-user");
+        if (!raw || raw === "null") { setUserAvatar(null); return; }
+        const u = JSON.parse(raw);
+        setUserAvatar(u?.avatar || null);
+      } catch { setUserAvatar(null); }
+    };
+    refresh();
+    window.addEventListener("arena-user-updated", refresh);
+    window.addEventListener("storage", refresh);
+    return () => {
+      window.removeEventListener("arena-user-updated", refresh);
+      window.removeEventListener("storage", refresh);
+    };
+  }, []);
+
 const [notifications, setNotifications] = useState<{ text: string; timestamp: number; read: boolean }[]>([]);
 const [showNotifications, setShowNotifications] = useState(false);
 const [profileMenuOpen, setProfileMenuOpen] = useState(false);
@@ -11797,6 +12087,7 @@ useEffect(() => {
                   initials={isAdmin ? "АД" : initials}
                   color={isAdmin ? "#e96852" : "#32786d"}
                   size="sm"
+                  avatar={isAdmin ? null : userAvatar}
                 />
               ) : (
                 <div className="flex h-7 w-7 items-center justify-center rounded-full bg-white/10 text-white/70">
@@ -11892,8 +12183,8 @@ useEffect(() => {
           </div>
           <div className="flex items-center gap-2 ml-[20px] mr-[20px]">
             {name && !isAdmin && (
-              <div className="hidden items-center gap-1.5 rounded-xl bg-[#f3e7c8] px-3 py-1.5 text-xs font-bold text-[#7e5f1d] sm:flex">
-                <Coins size={14} />
+              <div className="flex items-center gap-1 rounded-xl bg-[#f3e7c8] px-2 py-1.5 text-[11px] font-bold text-[#7e5f1d] sm:gap-1.5 sm:px-3 sm:text-xs">
+                <Coins size={14} className="shrink-0" />
                 <span className="font-mono">{walletCoins.toLocaleString("ru-RU")}</span>
                 {(() => {
                   if (!walletVipUntil) return null;
@@ -11902,8 +12193,8 @@ useEffect(() => {
                   const daysLeft = Math.ceil((end.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
                   return (
                     <>
-                      <span className="mx-1 text-[#7e5f1d]/40">·</span>
-                      <Crown size={14} />
+                      <span className="mx-0.5 text-[#7e5f1d]/40">·</span>
+                      <Crown size={14} className="shrink-0" />
                       <span className="font-mono">{daysLeft}д</span>
                     </>
                   );
@@ -11937,7 +12228,7 @@ useEffect(() => {
         )}
     </button>
       {showNotifications && (
-        <div className="absolute right-0 top-10 z-50 w-72 rounded-xl border border-card-border bg-card p-3 shadow-2xl">
+        <div className="fixed left-3 right-3 top-14 z-50 rounded-xl border border-card-border bg-card p-3 shadow-2xl sm:absolute sm:left-auto sm:right-0 sm:top-10 sm:w-72">
             <div className="mb-2 flex items-center justify-between">
                 <div className="font-bold text-sm">Уведомления</div>
                 {notifications.length > 0 && (
@@ -11984,8 +12275,9 @@ useEffect(() => {
                         initials={isAdmin ? "АД" : initials}
                         color={isAdmin ? "#e96852" : "#32786d"}
                         size="sm"
+                        avatar={isAdmin ? null : userAvatar}
                       />
-                      <span className="hidden text-xs font-bold sm:block">
+                      <span className="max-w-[110px] truncate text-xs font-bold sm:max-w-none">
                         {name}
                         {isVipActive() && (
                           <span className="ml-1 rounded bg-[#d3a247] px-1 py-0.5 text-[9px] font-bold text-white">
@@ -11993,7 +12285,7 @@ useEffect(() => {
                           </span>
                         )}
                       </span>
-                      <ChevronDown size={12} className="hidden text-muted-foreground sm:block" />
+                      <ChevronDown size={12} className="hidden shrink-0 text-muted-foreground sm:block" />
                     </button>
                     {profileMenuOpen && (
                       <>
@@ -12103,6 +12395,21 @@ const [currentRoomId, setCurrentRoomId] = useState<string | null>(null);
   );
   const [createOpen, setCreateOpen] = useState(false);
   const [findOpen, setFindOpen] = useState(false);
+
+  // Если с лендинга прилетел сигнал «открой окно авторизации» —
+  // открываем AuthModal один раз и убираем флаг.
+  useEffect(() => {
+    try {
+      if (localStorage.getItem("arena-open-auth") === "1") {
+        localStorage.removeItem("arena-open-auth");
+        // Открываем модалку только если игрок ещё не авторизован.
+        if (!player && !adminAuthed) {
+          setAuthOpen(true);
+        }
+      }
+    } catch {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [pendingChatFriend, setPendingChatFriend] = useState<{ id: string; name: string; online: boolean } | null>(null);
   const [activeGame, setActiveGame] = useState<{ roomId: string; roomName: string; disconnected: boolean } | null>(null);
   const [incomingTradesCount, setIncomingTradesCount] = useState(0);
@@ -12268,7 +12575,7 @@ if (data.activeSkins && typeof data.activeSkins === "object") {
         const defaultData = {
           inventory: [],
           coins: 2400,
-          stats: { games: 0, wins: 0, xp: 0, level: 1 },
+          stats: { games: 0, wins: 0, xp: 0, level: 0 },
           friends: []
         };
         // ВАЖНО: здесь используем user.id, а не result.user.id
@@ -12571,6 +12878,33 @@ function AccessGate({ children }: { children: ReactNode }) {
 }
 
 function App() {
+  // Флаг «уже входил в приложение». Если нет — показываем лендинг,
+  // если да — сразу игру (без повторного просмотра лендинга).
+  // Google/Яндекс заходят без флага → видят лендинг → индексируют.
+  const [entered, setEntered] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("arena-entered") === "1";
+    } catch {
+      return false;
+    }
+  });
+
+  const handleEnter = () => {
+    try {
+      localStorage.setItem("arena-entered", "1");
+    } catch {}
+    setEntered(true);
+  };
+
+  // То же самое, но с сигналом для Home «открой окно авторизации».
+  // Home смонтируется в новом рендере и сразу прочитает флаг.
+  const handleEnterWithAuth = () => {
+    try {
+      localStorage.setItem("arena-open-auth", "1");
+    } catch {}
+    handleEnter();
+  };
+
   // При каждом (пере)подключении сокета сообщаем серверу,
   // что мы всё ещё онлайн, чтобы он поставил нас в onlineUsers
   // и уведомил друзей. Нужно после рестарта сервера или долгого отсутствия.
@@ -12648,9 +12982,13 @@ function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <AccessGate>
-          <Home />
-        </AccessGate>
+        {entered ? (
+          <AccessGate>
+            <Home />
+          </AccessGate>
+        ) : (
+          <Landing onEnter={handleEnter} onLogin={handleEnterWithAuth} />
+        )}
         <Toaster />
       </TooltipProvider>
     </QueryClientProvider>

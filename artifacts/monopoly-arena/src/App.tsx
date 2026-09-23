@@ -2022,10 +2022,10 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
       </div>
 
       {createOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#29233e]/60 p-4 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 p-4 backdrop-blur-sm">
           <form
             onSubmit={createRoom}
-            className="max-h-[calc(100dvh-2rem)] w-full max-w-lg overflow-auto rounded-2xl border border-card-border bg-card p-6 shadow-2xl"
+            className="my-4 w-full max-w-lg rounded-2xl border border-card-border bg-card p-6 shadow-2xl"
           >
             <div className="flex items-start justify-between">
               <div>
@@ -2166,10 +2166,10 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
         </div>
       )}
       {findOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#29233e]/60 p-4 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 p-4 backdrop-blur-sm">
           <form
             onSubmit={findGame}
-            className="w-full max-w-md rounded-2xl border border-card-border bg-card p-6 shadow-2xl"
+            className="my-4 w-full max-w-md rounded-2xl border border-card-border bg-card p-6 shadow-2xl"
           >
             <div className="flex items-start justify-between">
               <div>
@@ -2242,13 +2242,13 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
         </div>
       )}
       {joinTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#29233e]/60 p-4 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 p-4 backdrop-blur-sm">
           <form
             onSubmit={(event) => {
               event.preventDefault();
               joinRoom(joinTarget, joinPassword);
             }}
-            className="w-full max-w-sm rounded-2xl border border-card-border bg-card p-6 shadow-2xl"
+            className="my-4 w-full max-w-sm rounded-2xl border border-card-border bg-card p-6 shadow-2xl"
           >
             <div className="flex items-start justify-between">
               <div>
@@ -2294,8 +2294,8 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
         </div>
       )}
             {deleteTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#29233e]/60 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-sm rounded-2xl border border-card-border bg-card p-6 shadow-2xl">
+        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 p-4 backdrop-blur-sm">
+          <div className="my-4 w-full max-w-sm rounded-2xl border border-card-border bg-card p-6 shadow-2xl">
             <div className="flex items-start justify-between">
               <div>
                 <div className="font-mono text-[10px] uppercase tracking-[.2em] text-primary">

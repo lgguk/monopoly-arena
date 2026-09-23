@@ -65,6 +65,18 @@
       @media (max-width: 640px) {
         html { font-size: 17px; }
       }
+
+      /* Игровая доска на мобиле и планшете (ландшафт):
+         размер = минимум из (высота экрана − отступы) и (ширина экрана − правая панель 140px − отступы).
+         Так доска всегда квадрат, влезает целиком и не уезжает за правый край. */
+      @media (max-width: 1023px) and (orientation: landscape) {
+        .arena-board-square {
+          width: min(calc(100dvh - 16px), calc(100vw - 160px)) !important;
+          height: auto !important;
+          max-height: none !important;
+          max-width: calc(100vw - 160px) !important;
+        }
+      }
     </style>
   </head>
   <body>

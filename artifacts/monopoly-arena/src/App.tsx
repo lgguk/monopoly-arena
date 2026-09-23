@@ -7618,7 +7618,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       </div>
       {/* Board + Right panel — shared centered container */}
       <div className="flex flex-1 items-start gap-3 overflow-hidden bg-[#1c1828] p-2 lg:items-start lg:justify-center lg:gap-5 lg:py-1.5 lg:pr-2 lg:pl-[268px]">
-                <div className="relative aspect-square h-full max-h-full min-w-0 shrink shadow-[0_18px_60px_rgba(41,35,62,.35)]">
+                <div className="arena-board-square relative aspect-square h-full max-h-full min-w-0 shrink shadow-[0_18px_60px_rgba(41,35,62,.35)]">
           <div
             className="grid h-full w-full gap-px bg-[#5e5a6e]"
             style={{
@@ -12513,7 +12513,7 @@ function GameShell({ children, name }: { children: ReactNode; name?: string }) {
         </div>
         <nav className="mt-4"></nav>
       </aside>
-      <main className="flex min-h-0 flex-1 overflow-hidden bg-foreground">
+      <main className="flex min-h-0 flex-1 overflow-hidden bg-[#1c1828]">
         {children}
       </main>
     </div>

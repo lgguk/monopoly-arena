@@ -5826,6 +5826,9 @@ resolveGameDesigns(cleanPlayers);
 
   const [timeLeft, setTimeLeft] = useState(45);
 
+  // Drawer с инфо о партии — на мобиле и планшете выезжает поверх доски.
+  const [infoPanelOpen, setInfoPanelOpen] = useState(false);
+
   // На мобиле играть можно только в ландшафтной ориентации —
   // в портрете стол не помещается. Показываем заглушку с просьбой повернуть.
   const [isPortraitMobile, setIsPortraitMobile] = useState(false);
@@ -7480,6 +7483,61 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       className="relative flex h-full overflow-hidden bg-[#1c1828]"
       onClick={() => setPlayerHover(null)}
     >
+      {/* Кнопка «Инфо» — только на мобиле и планшете */}
+      <button
+        onClick={(e) => { e.stopPropagation(); setInfoPanelOpen(v => !v); }}
+        className="fixed left-2 top-2 z-30 flex h-10 items-center gap-1.5 rounded-xl bg-[#29233e] px-3 text-xs font-bold text-[#f7f0e3] shadow-lg lg:hidden"
+        aria-label="Информация о партии"
+      >
+        <PanelLeft size={14} />
+        Инфо
+      </button>
+
+      {/* Затемнение + выезжающая панель с инфо */}
+      {infoPanelOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-black/40 lg:hidden"
+          onClick={() => setInfoPanelOpen(false)}
+        />
+      )}
+      <div
+        className={`fixed left-0 top-0 z-50 h-full w-[220px] transform bg-[#29233e] px-4 py-4 text-[#f7f0e3] shadow-2xl transition-transform duration-200 lg:hidden ${infoPanelOpen ? "translate-x-0" : "-translate-x-full"}`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-4 flex items-center justify-between">
+          <div className="font-bold tracking-wide text-base leading-tight">
+            Monopoly <span className="text-[#e7ba68]">Arena</span>
+          </div>
+          <button
+            onClick={() => setInfoPanelOpen(false)}
+            className="rounded-lg p-1 text-[#aaa2b4] hover:bg-white/10 hover:text-white"
+            aria-label="Закрыть"
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="mb-3 font-mono text-[10px] uppercase leading-relaxed tracking-[.10em] text-primary">
+          <div>живая партия</div>
+          <div>стол #{initialRoomId?.replace('#', '')}</div>
+        </div>
+
+        <h2 className="mb-4 font-display text-lg font-bold leading-tight text-[#f7f0e3]">
+          Пятничный клуб
+        </h2>
+
+        <div className="space-y-2">
+          <div className="rounded-lg bg-[#f3e7c8] px-3 py-2 text-center">
+            <div className="font-mono text-[10px] text-[#7a5c1e]">ДЖЕКПОТ</div>
+            <div className="text-lg">🎰</div>
+          </div>
+          <div className="rounded-lg bg-[#f3e7c8] px-3 py-2 text-center">
+            <div className="font-mono text-[10px] text-[#7a5c1e]">ТЕЛЕПОРТ</div>
+            <div className="text-lg">🌀</div>
+          </div>
+        </div>
+      </div>
+
       {!socketConnected && (
         <div className="absolute inset-0 z-[999] flex items-center justify-center bg-black/70 backdrop-blur-sm">
           <div className="rounded-2xl bg-card p-6 text-center shadow-2xl">
@@ -7491,10 +7549,10 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           </div>
         </div>
       )}
-            {/* Room info strip — absolute left */}
-      <div className="absolute left-0 top-0 z-10 flex h-full w-[108px] px-3 py-3 bg-foreground text-border border-t-[#29233e] border-r-
+            {/* Room info strip — absolute left. На мобиле скрыт, там кнопка «Инфо» */}
+      <div className="hidden absolute left-0 top-0 z-10 h-full w-[108px] px-3 py-3 bg-foreground text-border border-t-[#29233e] border-r-
       [#29233e] border-b-[#29233e] border-l-[#29233e] pl-[135px] pr-[135px] justify-center items-center flex-col text-center gap-[14px] 
-      rounded-tl-[4px] rounded-tr-[4px] rounded-br-[4px] rounded-bl-[4px]">
+      rounded-tl-[4px] rounded-tr-[4px] rounded-br-[4px] rounded-bl-[4px] lg:flex">
         <div className="font-mono text-[10px] uppercase leading-relaxed tracking-[.10em] text-primary text-left border-t-[0px] border-r-[0px] 
         border-b-[0px] border-l-[0px] pt-[0px] pb-[0px] mt-[0px] mb-[0px]">
           <span className="block whitespace-nowrap">живая партия</span>
@@ -7517,7 +7575,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         </div>
       </div>
       {/* Board + Right panel — shared centered container */}
-      <div className="flex flex-1 items-start justify-center gap-5 overflow-hidden py-1.5 pr-2 pl-[268px] border-t-[#5e5a6e] border-r-[#5e5a6e] border-b-[#5e5a6e] border-l-[#5e5a6e] bg-foreground">
+      <div className="flex flex-1 items-start justify-center gap-5 overflow-hidden py-1.5 pr-2 pl-2 lg:pl-[268px] border-t-[#5e5a6e] border-r-[#5e5a6e] border-b-[#5e5a6e] border-l-[#5e5a6e] bg-foreground">
                 <div className="relative aspect-square h-full max-h-full shrink-0 shadow-[0_18px_60px_rgba(41,35,62,.35)]">
           <div
             className="grid h-full w-full gap-px bg-[#5e5a6e]"
@@ -12400,8 +12458,9 @@ function GameShell({ children, name }: { children: ReactNode; name?: string }) {
     : "Г";
   return (
     <div className="arena-shell arena-noise flex h-[100dvh] overflow-hidden text-foreground">
-      {/* Изменено: w-[130px] заменено на w-[143px] (+10%) */}
-      <aside className="flex w-[143px] shrink-0 flex-col bg-[#29233e] p-4 text-[#f7f0e3]">
+      {/* Сайдбар — только на десктопе. На мобиле и планшете скрывается,
+          чтобы освободить максимум места под игровой стол. */}
+      <aside className="hidden w-[143px] shrink-0 flex-col bg-[#29233e] p-4 text-[#f7f0e3] lg:flex">
         <div className="flex flex-col">
           <span className="font-bold tracking-wide text-[20px] leading-tight">
             Monopoly

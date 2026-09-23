@@ -7947,14 +7947,19 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     key={p.id}
                     className="flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-sm"
                      style={{
-                      backgroundColor: p.color,
-                      fontSize: "14px",
                       position: "relative",
                       zIndex: p.id === movingPlayerId ? 2 : 1,
-                      boxShadow: "0 0 0 2px #ffffff, 0 1px 4px rgba(0,0,0,0.35)",
+                      background: "linear-gradient(135deg, #f0d181 0%, #d4a647 50%, #8a6d1f 100%)",
+                      padding: 2,
+                      boxShadow: "0 1px 4px rgba(0,0,0,0.35)",
                     }}
                   >
-        {p.initials[0]}
+        <div
+          className="flex h-full w-full items-center justify-center rounded-full"
+          style={{ backgroundColor: p.color }}
+        >
+          <Crown size={12} style={{ color: "#faf0c8" }} />
+        </div>
       </div>
     ))}
   </div>
@@ -8812,14 +8817,19 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 }}
               >
                 <div
-                  className="flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-sm"
+                  className="flex w-[23px] h-[23px] items-center justify-center rounded-full"
                   style={{
-                    backgroundColor: movingPlayer.color,
-                    fontSize: "14px",
-                    boxShadow: "0 0 0 2px #ffffff, 0 1px 4px rgba(0,0,0,0.35)",
+                    background: "linear-gradient(135deg, #f0d181 0%, #d4a647 50%, #8a6d1f 100%)",
+                    padding: 2,
+                    boxShadow: "0 1px 4px rgba(0,0,0,0.35)",
                   }}
                 >
-                  {movingPlayer.initials[0]}
+                  <div
+                    className="flex h-full w-full items-center justify-center rounded-full"
+                    style={{ backgroundColor: movingPlayer.color }}
+                  >
+                    <Crown size={12} style={{ color: "#faf0c8" }} />
+                  </div>
                 </div>
               </div>
             );
@@ -8847,14 +8857,19 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 }}
               >
                 <div
-                  className="flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-sm"
+                  className="flex w-[23px] h-[23px] items-center justify-center rounded-full"
                   style={{
-                    backgroundColor: dp.color,
-                    fontSize: "14px",
-                    boxShadow: "0 0 0 2px #ffffff, 0 1px 4px rgba(0,0,0,0.35)",
+                    background: "linear-gradient(135deg, #f0d181 0%, #d4a647 50%, #8a6d1f 100%)",
+                    padding: 2,
+                    boxShadow: "0 1px 4px rgba(0,0,0,0.35)",
                   }}
                 >
-                  {dp.initials[0]}
+                  <div
+                    className="flex h-full w-full items-center justify-center rounded-full"
+                    style={{ backgroundColor: dp.color }}
+                  >
+                    <Crown size={12} style={{ color: "#faf0c8" }} />
+                  </div>
                 </div>
               </div>
             );
@@ -8970,13 +8985,14 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
                 {/* Фишка игрока (движется вместе с шлейфом) */}
                 <div
-                  className="absolute z-[110] flex w-[23px] h-[23px] items-center justify-center rounded-full font-bold text-white shadow-[0_0_25px_#ff8c00]"
+                  className="absolute z-[110] flex w-[23px] h-[23px] items-center justify-center rounded-full"
                   style={{
                     left: `${from.x}%`,
                     top: `${from.y}%`,
                     transform: "translate(-50%, -50%)",
-                    backgroundColor: dp.color,
-                    fontSize: "14px",
+                    background: "linear-gradient(135deg, #f0d181 0%, #d4a647 50%, #8a6d1f 100%)",
+                    padding: 2,
+                    boxShadow: "0 0 25px #ff8c00",
                     transition: "left 1.5s cubic-bezier(0.4, 0, 0.2, 1), top 1.5s cubic-bezier(0.4, 0, 0.2, 1)",
                   }}
                   ref={(el) => {
@@ -8987,7 +9003,12 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     });
                   }}
                 >
-                  {dp.initials[0]}
+                  <div
+                    className="flex h-full w-full items-center justify-center rounded-full"
+                    style={{ backgroundColor: dp.color }}
+                  >
+                    <Crown size={12} style={{ color: "#faf0c8" }} />
+                  </div>
                 </div>
               </div>
             );
@@ -9145,10 +9166,24 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
               </span>
             </div>
             <div className="space-y-1">
-              {players.map((p, i) => (
+              {players.map((p, i) => {
+                const isCurrentTurn =
+                  p.id ===
+                    (auction
+                      ? auction.participants[auction.currentIdx]
+                      : players[turn]?.id) && !p.bankrupt;
+                return (
                 <div
                   key={p.id}
-                  className={`relative flex items-center gap-2 overflow-hidden rounded-lg p-1.5 pr-3 cursor-pointer ${i === turn ? "bg-[#f6dfd7]" : "hover:bg-muted"} ${p.bankrupt ? "opacity-40" : ""}`}
+                  className={`relative flex items-center gap-2 overflow-hidden rounded-lg p-1.5 pr-3 cursor-pointer ${!isCurrentTurn ? "hover:bg-muted" : ""} ${p.bankrupt ? "opacity-40" : ""}`}
+                  style={
+                    isCurrentTurn
+                      ? {
+                          backgroundColor: "#ffffff",
+                          boxShadow: `0 0 0 2px ${p.color}, 0 0 14px ${p.color}80`,
+                        }
+                      : undefined
+                  }
                   onClick={(e) => {
   e.stopPropagation();
   if (!p.bankrupt) {
@@ -9181,18 +9216,9 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                       {boardCells[p.position]?.name ?? "?"}
                     </div>
                   </div>
-                  {(() => {
-                    const isCurrentTurn =
-                      p.id ===
-                      (auction
-                        ? auction.participants[auction.currentIdx]
-                        : players[turn]?.id);
-                    return isCurrentTurn && !p.bankrupt ? (
-                      <span className="h-2 w-2 shrink-0 rounded-full bg-primary" />
-                    ) : null;
-                  })()}
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
 

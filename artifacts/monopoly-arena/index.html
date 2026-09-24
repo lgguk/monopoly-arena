@@ -70,6 +70,15 @@
          размер = минимум из (высота экрана − отступы) и (ширина экрана − правая панель 140px − отступы).
          Так доска всегда квадрат, влезает целиком и не уезжает за правый край. */
       @media (max-width: 1023px) and (orientation: landscape) {
+        /* Фишки игроков — уменьшены, чтобы 5 штук влезали на клетку. */
+        .arena-chip {
+          width: 16px !important;
+          height: 16px !important;
+        }
+        .arena-chip svg {
+          width: 9px !important;
+          height: 9px !important;
+        }
         .arena-board-square {
           width: min(calc(100dvh - 16px), calc(100vw - 160px)) !important;
           height: auto !important;

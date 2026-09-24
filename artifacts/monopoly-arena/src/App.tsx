@@ -1003,15 +1003,16 @@ function Avatar({
 }: {
   initials: string;
   color: string;
-  size?: "sm" | "md" | "lg";
+  size?: "xs" | "sm" | "md" | "lg";
   avatar?: string | null;
 }) {
   const sizes = {
+    xs: "h-6 w-6 text-[11px]",
     sm: "h-8 w-8 text-[14px]",
     md: "h-10 w-10 text-base",
     lg: "h-16 w-16 text-2xl",
   };
-  const px = { sm: 32, md: 40, lg: 64 }[size];
+  const px = { xs: 24, sm: 32, md: 40, lg: 64 }[size];
   return (
     <div
       className={`${sizes[size]} flex shrink-0 items-center justify-center overflow-hidden rounded-full font-bold text-white shadow-sm`}
@@ -8045,7 +8046,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     {playersHere.map((p) => (
                         <div
                     key={p.id}
-                    className="flex w-[23px] h-[23px] items-center justify-center rounded-full"
+                    className="arena-chip flex w-[23px] h-[23px] items-center justify-center rounded-full"
                     style={{
                       position: "relative",
                       zIndex: p.id === movingPlayerId ? 2 : 1,
@@ -8816,7 +8817,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   </div>
                 </div>
               )}
-              <div className="min-h-0 flex-1 relative p-1.5 pt-1 text-[12px]">
+              <div className="min-h-0 flex-1 relative p-1.5 pt-1 text-[14px]">
                 {/* Сами логи чата (объединенный и отсортированный поток) */}
                 <div
                   ref={logContainerRef}
@@ -8883,13 +8884,13 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
                   placeholder="Сообщение…"
-                  className="min-w-0 flex-1 rounded bg-white/10 px-2.5 py-1.5 text-[12px] text-white placeholder:text-white/35 outline-none"
+                  className="min-w-0 flex-1 rounded bg-white/10 px-2 py-1 text-[12px] text-white placeholder:text-white/35 outline-none"
                 />
                 <button
                   type="submit"
-                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-[#e96852] text-white"
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-[#e96852] text-white"
                 >
-                  <Send size={14} />
+                  <Send size={12} />
                 </button>
               </form>
             </div>
@@ -8921,7 +8922,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 }}
               >
                 <div
-                  className="flex w-[23px] h-[23px] items-center justify-center rounded-full"
+                  className="arena-chip flex w-[23px] h-[23px] items-center justify-center rounded-full"
                   style={{
                     background: "linear-gradient(135deg, #fbe6a0 0%, #e8c463 20%, #d4a647 50%, #b08a2d 80%, #8a6d1f 100%)",
                     padding: 2,
@@ -8965,7 +8966,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 }}
               >
                 <div
-                  className="flex w-[23px] h-[23px] items-center justify-center rounded-full"
+                  className="arena-chip flex w-[23px] h-[23px] items-center justify-center rounded-full"
                   style={{
                     background: "linear-gradient(135deg, #fbe6a0 0%, #e8c463 20%, #d4a647 50%, #b08a2d 80%, #8a6d1f 100%)",
                     padding: 2,
@@ -9097,7 +9098,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
                 {/* Фишка игрока (движется вместе с шлейфом) */}
                 <div
-                  className="absolute z-[110] flex w-[23px] h-[23px] items-center justify-center rounded-full"
+                  className="arena-chip absolute z-[110] flex w-[23px] h-[23px] items-center justify-center rounded-full"
                   style={{
                     left: `${from.x}%`,
                     top: `${from.y}%`,
@@ -9146,7 +9147,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
               <Avatar
                 initials={player.initials}
                 color={player.color}
-                size="sm"
+                size="xs"
               />
             </div>
             <div
@@ -9157,20 +9158,20 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
               </span>
               <span className="font-mono font-bold">{timeLeft} сек</span>
             </div>
-            <div className="mt-1.5 rounded-lg bg-muted px-2 py-1.5 text-[10px] leading-snug lg:mt-2 lg:rounded-xl lg:px-3 lg:py-2 lg:text-[11px]">
+            <div className="mt-1.5 rounded-lg bg-muted px-2 py-1.5 text-[12px] leading-snug lg:mt-2 lg:rounded-xl lg:px-3 lg:py-2 lg:text-[11px]">
               {message}
             </div>
             <div className="mt-1.5 flex items-center justify-between lg:mt-2">
               <div>
-                <div className="text-[9px] text-muted-foreground">На руках</div>
-                <div className="font-mono text-[12px] font-bold lg:text-sm">
+                <div className="text-[11px] text-muted-foreground">На руках</div>
+                <div className="font-mono text-[14px] font-bold lg:text-sm">
                   {player.money.toLocaleString("ru-RU")}{" "}
-                  <span className="text-[9px] text-muted-foreground">К</span>
+                  <span className="text-[11px] text-muted-foreground">К</span>
                 </div>
               </div>
               <div className="max-w-[90px] text-right lg:max-w-[115px]">
-                <div className="text-[9px] text-muted-foreground">Клетка</div>
-                <div className="truncate text-[10px] font-bold lg:text-[11px]">
+                <div className="text-[11px] text-muted-foreground">Клетка</div>
+                <div className="truncate text-[12px] font-bold lg:text-[11px]">
                   {currentCellName}
                 </div>
               </div>
@@ -9190,7 +9191,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     busy || 
                     (initialRoomId ? turn !== players.findIndex(p => p.name === (currentUser?.name || player?.name)) : false)
                   }
-                  className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl bg-primary py-2.5 text-xs font-bold text-primary-foreground disabled:opacity-45"
+                  className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary py-2 text-xs font-bold text-primary-foreground disabled:opacity-45 lg:mt-3 lg:rounded-xl lg:py-2.5"
                 >
                   <Dice5 size={13} />
                   {diceRolling ? "…бросок…" : "Бросить кубики"}
@@ -9227,7 +9228,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   busy || 
                   (initialRoomId ? turn !== players.findIndex(p => p.name === (currentUser?.name || player?.name)) : false)
                 }
-                className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-primary py-2.5 text-sm font-bold text-primary-foreground disabled:opacity-45"
+                className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg bg-primary py-2 text-sm font-bold text-primary-foreground disabled:opacity-45 lg:mt-3 lg:rounded-xl lg:py-2.5"
               >
                 <Dice5 size={15} />
                 {diceRolling
@@ -9257,7 +9258,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 handleVoluntaryLeave(myId);
                 onExit();
               }}
-              className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-xl border border-input py-2 text-xs font-bold text-muted-foreground hover:bg-muted"
+              className="mt-1.5 flex w-full items-center justify-center gap-1.5 rounded-lg border border-input py-1.5 text-xs font-bold text-muted-foreground hover:bg-muted lg:mt-2 lg:rounded-xl lg:py-2"
             >
               <LogOut size={12} /> Покинуть игру
             </button>
@@ -9275,9 +9276,9 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
           {/* Players list with hover popup */}
           <div className="rounded-2xl border border-card-border bg-card p-1.5 lg:p-3">
-            <div className="mb-1.5 flex items-center justify-between lg:mb-2">
-              <h2 className="font-display text-xs font-bold lg:text-sm">Игроки</h2>
-              <span className="font-mono text-[9px] text-muted-foreground">
+            <div className="mb-1.5 flex items-center justify-center gap-3 lg:mb-2 lg:justify-between">
+              <h2 className="font-display text-[14px] font-bold lg:text-sm">Игроки</h2>
+              <span className="font-mono text-[11px] text-muted-foreground lg:text-[9px]">
                 {alive.length} / {players.length}
               </span>
             </div>
@@ -9291,7 +9292,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 return (
                 <div
                   key={p.id}
-                  className={`relative flex items-center gap-2 overflow-hidden rounded-lg p-1 pr-2.5 cursor-pointer lg:p-1.5 lg:pr-3 ${!isCurrentTurn ? "hover:bg-muted" : ""} ${p.bankrupt ? "opacity-40" : ""}`}
+                  className={`relative flex items-center gap-1.5 overflow-hidden rounded-lg py-0.5 pl-1 pr-2 cursor-pointer lg:gap-2 lg:p-1.5 lg:pr-3 ${!isCurrentTurn ? "hover:bg-muted" : ""} ${p.bankrupt ? "opacity-40" : ""}`}
                   style={
                     isCurrentTurn
                       ? { backgroundColor: "#ffffff" }
@@ -9320,7 +9321,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     }}
                     aria-hidden="true"
                   />
-                  <Avatar initials={p.initials} color={p.color} size="sm" avatar={p.avatar} />
+                  <Avatar initials={p.initials} color={p.color} size="xs" avatar={p.avatar} />
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[13px] font-bold lg:text-[11px]">
   {p.name}

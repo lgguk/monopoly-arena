@@ -7481,7 +7481,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
   return (
     <div
-      className="relative flex h-full overflow-hidden bg-[#1c1828]"
+      className="relative flex h-full w-full overflow-hidden bg-[#1c1828] lg:w-auto"
       onClick={() => setPlayerHover(null)}
     >
       {/* Кнопка «Инфо» — только на мобиле и планшете */}

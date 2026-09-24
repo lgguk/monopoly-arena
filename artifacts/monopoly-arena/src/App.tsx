@@ -1007,7 +1007,7 @@ function Avatar({
   avatar?: string | null;
 }) {
   const sizes = {
-    xs: "h-6 w-6 text-[11px]",
+    xs: "h-6 w-6 text-[11px] lg:h-8 lg:w-8 lg:text-[14px]",
     sm: "h-8 w-8 text-[14px]",
     md: "h-10 w-10 text-base",
     lg: "h-16 w-16 text-2xl",
@@ -8817,7 +8817,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   </div>
                 </div>
               )}
-              <div className="min-h-0 flex-1 relative p-1.5 pt-1 text-[14px]">
+              <div className="min-h-0 flex-1 relative p-1.5 pt-1 text-[14px] lg:text-[12px]">
                 {/* Сами логи чата (объединенный и отсортированный поток) */}
                 <div
                   ref={logContainerRef}
@@ -8884,11 +8884,11 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
                   placeholder="Сообщение…"
-                  className="min-w-0 flex-1 rounded bg-white/10 px-2 py-1 text-[12px] text-white placeholder:text-white/35 outline-none"
+                  className="min-w-0 flex-1 rounded bg-white/10 px-2 py-1 text-[12px] text-white placeholder:text-white/35 outline-none lg:px-2.5 lg:py-1.5"
                 />
                 <button
                   type="submit"
-                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-[#e96852] text-white"
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-[#e96852] text-white lg:h-8 lg:w-8"
                 >
                   <Send size={12} />
                 </button>
@@ -12514,7 +12514,7 @@ function GameShell({ children, name }: { children: ReactNode; name?: string }) {
         </div>
         <nav className="mt-4"></nav>
       </aside>
-      <main className="flex min-h-0 w-full flex-1 flex-col overflow-hidden bg-[#1c1828]">
+      <main className="flex min-h-0 flex-1 overflow-hidden bg-foreground">
         {children}
       </main>
     </div>

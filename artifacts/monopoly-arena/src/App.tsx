@@ -5774,7 +5774,17 @@ resolveGameDesigns(cleanPlayers);
 
       // Обновляем всё, что пришло (даже если игроки пустые, но владельцы/ход изменились!)
       if (data.players && data.players.length > 0) {
-        setPlayers(data.players.filter((p: any) => p !== null && p !== undefined));
+        setPlayers((prevPlayers) => {
+          return data.players
+            .filter((p: any) => p !== null && p !== undefined)
+            .map((incoming: any) => {
+              const existing = prevPlayers.find((p) => p.id === incoming.id);
+              return {
+                ...incoming,
+                avatar: existing?.avatar ?? incoming.avatar ?? null,
+              };
+            });
+        });
       }
       setOwners(data.owners);
       setImprovements(data.improvements);
@@ -7492,11 +7502,24 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
   if (isRemoteUpdate.current) return;
   if (!playersRef.current || playersRef.current.length === 0) return; // <-- ДОБАВИЛИ ЭТУ СТРОЧКУ
     // ВАЖНО: Отправляем состояние всегда, когда оно меняется!
-    console.log("📤 Отправляем изменения стейта другу...");
-    socket.emit('sync-game-state', {
+    const syncPayload = {
         roomId: initialRoomId,
-        senderId: currentUser?.id || "you", // <--- Добавили отправителя
-        players: playersRef.current,
+        senderId: currentUser?.id || "you",
+        players: playersRef.current.map(p => ({
+            id: p.id,
+            name: p.name,
+            initials: p.initials,
+            color: p.color,
+            money: p.money,
+            position: p.position,
+            bankrupt: p.bankrupt,
+            leftAlive: p.leftAlive,
+            jailTurns: p.jailTurns,
+            jailAttempts: p.jailAttempts,
+            isVip: p.isVip,
+            vipUntil: p.vipUntil,
+            activeSkins: p.activeSkins,
+        })),
         owners: ownersRef.current,
         improvements: improvementsRef.current,
         turn: turnRef.current,
@@ -7505,13 +7528,20 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         mortgages: mortgagesRef.current,
         gameOver: gameOverRef.current,
         reward: rewardRef.current,
-        auction: auctionRef.current, // <--- ДОБАВЛЕНО
-        rolled: rolledRef.current, // <--- ДОБАВЛЕНО
+        auction: auctionRef.current,
+        rolled: rolledRef.current,
         isDoubleRoll: isDoubleRollRef.current,
-        pendingAction: pendingAction, // <--- ДОБАВЛЕНО
+        pendingAction: pendingAction,
         globalCustomSkins: globalCustomSkins,
-        timeLeft: timeLeft // <--- ДОБАВЛЕНО
-    });
+        timeLeft: timeLeft
+    };
+    const syncTotal = JSON.stringify(syncPayload).length;
+    if (syncTotal > 50000) {
+      const syncPlayers = JSON.stringify(playersRef.current).length;
+      const syncSkins = JSON.stringify(globalCustomSkins).length;
+      console.warn(`⚠️ sync: ${syncTotal}B | players: ${syncPlayers}B | skins: ${syncSkins}B — выше нормы`);
+    }
+    socket.emit('sync-game-state', syncPayload);
     }, [turn, owners, improvements, jackpot, mortgages, gameOver, reward, auction, rolled, isDoubleRoll]);
 
   // Заглушка для мобильных в портретной ориентации — играем только в ландшафте.

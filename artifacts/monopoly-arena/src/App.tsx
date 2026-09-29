@@ -5448,6 +5448,7 @@ const timeLeftRef = useRef(45);
   const gameOverRef = useRef(false);
   const isRemoteUpdate = useRef(false);
   const lastReceivedStateRef = useRef("");
+  const remoteAppliedAtRef = useRef(0);
   const movingPlayerIdRef = useRef<string | null>(null);
   const rolledRef = useRef(false); // <--- ДОБАВЛЕНО
   const isDoubleRollRef = useRef(false); // <--- ДОБАВЛЕНО
@@ -5598,6 +5599,7 @@ useEffect(() => { animPathRef.current = animPath; }, [animPath]);
     return;
   }
   setPlayers(cleanPlayers);
+    remoteAppliedAtRef.current = Date.now();
 
       const resolveGameDesigns = (serverPlayers: any[]) => {
     if (!serverPlayers || serverPlayers.length === 0) return;
@@ -5771,6 +5773,7 @@ resolveGameDesigns(cleanPlayers);
       const stateString = JSON.stringify(data);
       if (lastReceivedStateRef.current === stateString) return;
       lastReceivedStateRef.current = stateString;
+      remoteAppliedAtRef.current = Date.now();
 
       // Обновляем всё, что пришло (даже если игроки пустые, но владельцы/ход изменились!)
       if (data.players && data.players.length > 0) {
@@ -7497,10 +7500,24 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
   type GainA = { type: "chance"; amount: number; gain: boolean; desc: string };
 
 
-          useEffect(() => {
+            useEffect(() => {
     if (!initialRoomId) return;
   if (isRemoteUpdate.current) return;
-  if (!playersRef.current || playersRef.current.length === 0) return; // <-- ДОБАВИЛИ ЭТУ СТРОЧКУ
+  if (!playersRef.current || playersRef.current.length === 0) return;
+  // Suppression window: не отправляем снапшот, если только что применили чужой.
+  // Иначе получаем эхо-петлю A→B→A→B и откаты хода на 3+ игроках.
+  if (Date.now() - remoteAppliedAtRef.current < 250) return;
+  // Не отправляем пустой снапшот от только что вошедшего игрока —
+  // он ещё не получил актуальный стейт и своими пустыми owners/turn
+  // обнулит всё у остальных.
+  if (
+    Object.keys(ownersRef.current).length === 0 &&
+    turnRef.current === 0 &&
+    globalTurnCounterRef.current === 0
+  ) return;
+  // Suppression window: не отправляем снапшот, если только что применили чужой.
+  // Иначе получаем эхо-петлю: A→B→A→B и откаты хода на 3+ игроках.
+  if (Date.now() - remoteAppliedAtRef.current < 250) return;
     // ВАЖНО: Отправляем состояние всегда, когда оно меняется!
     const syncPayload = {
         roomId: initialRoomId,

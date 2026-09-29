@@ -5452,6 +5452,7 @@ const timeLeftRef = useRef(45);
   const movingPlayerIdRef = useRef<string | null>(null);
   const rolledRef = useRef(false); // <--- ДОБАВЛЕНО
   const isDoubleRollRef = useRef(false); // <--- ДОБАВЛЕНО
+  const doubleCountRef = useRef(0); // счётчик дублей подряд, синхронный (state асинхронен)
   const rewardRef = useRef<string | null>(null);
   const rewardGivenRef = useRef(false); // защита от повторного начисления
   const eliminationOrderRef = useRef<string[]>([]); // порядок выбывания по банкротству
@@ -5736,6 +5737,37 @@ resolveGameDesigns(cleanPlayers);
       const isDoubles = d1 === d2;
 
             doRollAnimation(d1, d2, () => {
+        // Третий дубль подряд — в тюрьму без движения.
+        const isThirdDouble = isDoubles && doubleCountRef.current >= 2;
+        if (isThirdDouble) {
+          doubleCountRef.current = 0;
+          setDoubleCount(0);
+          setIsDoubleRoll(false);
+          const cur = playersRef.current[activePlayerIdx];
+          if (cur) {
+            addLog(`🚔 ${cur.name} — третий дубль подряд, отправляется в тюрьму!`);
+            setPlayers((ps) =>
+              ps.map((p, i) =>
+                i === activePlayerIdx
+                  ? { ...p, position: 10, jailTurns: modeConfig.jailAttempts, jailAttempts: 0 }
+                  : p,
+              ),
+            );
+          }
+          window.setTimeout(() => advanceTurn(activePlayerIdx, true), 400);
+          return;
+        }
+
+        // Счётчик дублей обновляем СИНХРОННО через ref —
+        // advanceTurn ниже читает его, а не устаревший state.
+        if (isDoubles) {
+          doubleCountRef.current += 1;
+          setDoubleCount(doubleCountRef.current);
+        } else {
+          doubleCountRef.current = 0;
+          setDoubleCount(0);
+        }
+
                 const path: number[] = [oldPos];
         for (let i = 1; i <= steps; i++) path.push((oldPos + i) % 40);
         const finalPos = path[path.length - 1];
@@ -6334,7 +6366,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     }
 
     // Если это дубль (1-й или 2-й), мы не переключаем ход, а даём бросать снова тому же игроку
-    if (!forceNext && isDoubleRoll && doubleCount < 3) {
+    if (!forceNext && isDoubleRoll && doubleCountRef.current < 3) {
       setRolled(false);
       setTimeLeft(modeConfig.turnDurationSec);
       setImprovedGroupsThisTurn([]);
@@ -6353,6 +6385,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     setTimeLeft(modeConfig.turnDurationSec);
     setImprovedGroupsThisTurn([]);
     setDoubleCount(0);
+    doubleCountRef.current = 0;
     setIsDoubleRoll(false);
     timeoutHandled.current = false;
     setMessage(`${playersRef.current[next].name}, твой ход. Бросай кости.`);

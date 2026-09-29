@@ -1170,6 +1170,8 @@ function Dashboard({
   const [lobbyDeletedNotice, setLobbyDeletedNotice] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<LobbyRoom | null>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
+  const [friendsOpen, setFriendsOpen] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
   const [userScrolled, setUserScrolled] = useState(false);
   const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1628,10 +1630,24 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
             )}
           </div>
           <div className="rounded-2xl border border-card-border bg-card p-5">
-            <div className="flex items-center gap-2">
-              <Users size={16} className="text-primary" />
-              <h2 className="font-display text-xl font-bold">Друзья</h2>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Users size={16} className="text-primary" />
+                <h2 className="font-display text-xl font-bold">Друзья</h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setFriendsOpen(v => !v)}
+                className="rounded-lg p-1 text-muted-foreground hover:bg-muted lg:hidden"
+                aria-label={friendsOpen ? "Свернуть" : "Развернуть"}
+              >
+                <ChevronDown
+                  size={18}
+                  className={`transition-transform ${friendsOpen ? "rotate-180" : ""}`}
+                />
+              </button>
             </div>
+            <div className={`${friendsOpen ? "block" : "hidden"} lg:block`}>
             <div className="relative mt-4">
               <Search
                 size={14}
@@ -1718,6 +1734,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
                 </div>
               )}
             </div>
+            </div>
           </div>
           
           {/* === ПЕРЕНЕСЕННЫЙ ЧАТ === */}
@@ -1732,10 +1749,24 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
         Общий разговор для всех игроков на главной.
       </p>
     </div>
-    <span className="rounded-full bg-[#e96852] px-2.5 py-1 font-mono text-[10px] text-white">
-      {chat.length} сообщений
-    </span>
+    <div className="flex items-center gap-2">
+      <span className="rounded-full bg-[#e96852] px-2.5 py-1 font-mono text-[10px] text-white">
+        {chat.length} сообщений
+      </span>
+      <button
+        type="button"
+        onClick={() => setChatOpen(v => !v)}
+        className="rounded-lg p-1 text-muted-foreground hover:bg-muted lg:hidden"
+        aria-label={chatOpen ? "Свернуть" : "Развернуть"}
+      >
+        <ChevronDown
+          size={18}
+          className={`transition-transform ${chatOpen ? "rotate-180" : ""}`}
+        />
+      </button>
+    </div>
   </div>
+  <div className={`${chatOpen ? "block" : "hidden"} lg:block`}>
     <div className="flex flex-col min-h-[250px] max-h-[360px] gap-2 overflow-x-hidden overflow-y-auto rounded-xl bg-[#f1eadc] p-3 [&::-webkit-scrollbar]:hidden" style={{ scrollbarWidth: "none" }}>
     {chat.map((message, index) => (
       <div
@@ -1786,6 +1817,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
       <Send size={17} />
     </button>
   </form>
+  </div>
 </div>
           {/* === КОНЕЦ ПЕРЕНЕСЕННОГО ЧАТА === */}
         </div>
@@ -3091,7 +3123,7 @@ const buyVip = (vip: MarketItem) => {
           </button>
         </div>
       )}
-                  <div className="grid gap-5" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(185px, 1fr))" }}>
+              <div className="flex flex-wrap gap-5">
                 {section === "cases" &&
           cases.map((product) => {
             const caseItems = (product.items || [])
@@ -3130,12 +3162,53 @@ const buyVip = (vip: MarketItem) => {
                     <p className="mt-1 text-xs text-muted-foreground">{product.desc || "Случайный предмет"}</p>
                   </div>
                   {caseItems.length > 0 && (
-                    <div className="flex flex-wrap gap-1">
-                      {caseItems.map((it) => (
-                        <span key={it!.id} className="rounded-md bg-muted px-2 py-0.5 text-[10px] font-medium">
-                          {it!.name}
-                        </span>
-                      ))}
+                    <div className="flex flex-wrap items-center gap-1">
+                      {caseItems.slice(0, 5).map((it) => {
+                        const rarityBg =
+                          it!.category === "vip" ? "#d3a247" :
+                          it!.rarity === "rare" ? "#2563eb" :
+                          it!.rarity === "epic" ? "#9b5de5" :
+                          "#b0b0b0";
+                        return (
+                          <span
+                            key={it!.id}
+                            className="rounded-md px-2 py-0.5 text-[10px] font-bold text-white"
+                            style={{ backgroundColor: rarityBg }}
+                          >
+                            {it!.name}
+                          </span>
+                        );
+                      })}
+                      {caseItems.length > 5 && (
+                        <div className="group relative inline-flex">
+                          <span className="flex h-5 w-5 cursor-help items-center justify-center rounded-full bg-muted text-[10px] font-bold text-muted-foreground">
+                            i
+                          </span>
+                          <div className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-1 hidden w-max max-w-[220px] -translate-x-1/2 rounded-lg border border-card-border bg-card p-2 text-[10px] shadow-xl group-hover:block">
+                            <div className="mb-1 font-bold">
+                              Все предметы ({caseItems.length}):
+                            </div>
+                            <div className="flex flex-wrap gap-1">
+                              {caseItems.map((it) => {
+                                const rarityBg =
+                                  it!.category === "vip" ? "#d3a247" :
+                                  it!.rarity === "rare" ? "#2563eb" :
+                                  it!.rarity === "epic" ? "#9b5de5" :
+                                  "#b0b0b0";
+                                return (
+                                  <span
+                                    key={it!.id}
+                                    className="rounded px-1.5 py-0.5 text-[9px] font-bold text-white"
+                                    style={{ backgroundColor: rarityBg }}
+                                  >
+                                    {it!.name}
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                   <div className="mt-auto flex items-center justify-between pt-2 border-t border-border">
@@ -10771,9 +10844,13 @@ socket.emit('admin-update-card-designs', updatedDesigns);
                     <button
                       className="rounded bg-[#f6dfd7] px-1.5 py-0.5 text-[9px] font-bold text-primary"
                       onClick={() => {
-                        const updatedItems = marketItems.filter(prev => prev.id !== item.id);
-                        setMarketItems(updatedItems);
-                        socket.emit('save-custom-items', updatedItems);
+                        if (!confirm(`Удалить товар «${item.name}»?`)) return;
+                        socket.emit('delete-market-item', { itemId: item.id }, (res: any) => {
+                          if (!res?.success) {
+                            alert(res?.error || 'Не удалось удалить товар');
+                          }
+                          // Сервер сам пришлёт custom-items-updated
+                        });
                       }}
                     >
                       Удал.
@@ -13200,9 +13277,49 @@ function MarketItemModal({ onClose, onSave, initialItem }: { onClose: () => void
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => setImage(ev.target?.result as string);
-    reader.readAsDataURL(file);
+
+    const compressImage = (
+      file: File,
+      maxWidth: number,
+      maxHeight: number,
+    ): Promise<string> => {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const img = new Image();
+          img.onload = () => {
+            const canvas = document.createElement("canvas");
+            let width = img.width;
+            let height = img.height;
+            if (width > maxWidth) {
+              height = (height * maxWidth) / width;
+              width = maxWidth;
+            }
+            if (height > maxHeight) {
+              width = (width * maxHeight) / height;
+              height = maxHeight;
+            }
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext("2d");
+            ctx?.drawImage(img, 0, 0, width, height);
+            let dataUrl = canvas.toDataURL("image/png");
+            if (dataUrl.length > 150000) {
+              dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+            }
+            resolve(dataUrl);
+          };
+          img.onerror = reject;
+          img.src = ev.target?.result as string;
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    };
+
+    compressImage(file, 300, 300)
+      .then((compressed) => setImage(compressed))
+      .catch((err) => console.error("Ошибка сжатия картинки:", err));
   };
 
     const save = () => {

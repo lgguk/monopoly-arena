@@ -847,7 +847,10 @@ async function loadCardDesigns() {
 const app = express();
 app.use(cors({ origin: "*" }));
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+const io = new Server(server, {
+  cors: { origin: "*" },
+  maxHttpBufferSize: 25 * 1024 * 1024, // 25 МБ — с запасом на крупные сжатые картинки
+});
 
 // Хранилище лобби и игровых сессий
 let rooms = [];
@@ -1305,18 +1308,38 @@ socket.on('get-user-data', (userId, callback) => {
     if (!Array.isArray(newItems)) return;
     marketItems = newItems;
     try {
-      await db.query('DELETE FROM market_items');
+      // Только добавляем/обновляем. Удаление — отдельным событием.
       for (const it of marketItems) {
         await db.query(
-          'INSERT INTO market_items (id, data) VALUES ($1, $2)',
+          `INSERT INTO market_items (id, data) VALUES ($1, $2)
+           ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`,
           [it.id, JSON.stringify(it)]
         );
       }
+      // В памяти оставляем только то, что реально есть в БД
+      const dbIdsRes = await db.query('SELECT id FROM market_items');
+      const dbIds = new Set(dbIdsRes.rows.map(r => r.id));
+      marketItems = marketItems.filter(i => dbIds.has(i.id));
     } catch (err) {
       console.error('Ошибка сохранения товаров в БД:', err);
     }
     io.emit('custom-items-updated', marketItems);
     console.log(`🛍  Админ обновил товары (${marketItems.length})`);
+  });
+
+  // Отдельное событие для явного удаления товара
+  socket.on('delete-market-item', async ({ itemId }, callback) => {
+    if (!itemId) return callback?.({ success: false, error: 'Нет itemId' });
+    try {
+      await db.query('DELETE FROM market_items WHERE id = $1', [itemId]);
+      marketItems = marketItems.filter(i => i.id !== itemId);
+      io.emit('custom-items-updated', marketItems);
+      console.log(`🗑  Удалён товар ${itemId}`);
+      callback?.({ success: true });
+    } catch (err) {
+      console.error('Ошибка удаления товара:', err);
+      callback?.({ success: false, error: 'Ошибка сервера' });
+    }
   });
   
   // ---- ПОКУПКА КАРТОЧКИ ИЗ МАГАЗИНА ----

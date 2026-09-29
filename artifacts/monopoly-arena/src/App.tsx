@@ -5836,6 +5836,31 @@ resolveGameDesigns(cleanPlayers);
       else setAuction(null); 
     });
 
+    socket.on('vote-state', (data: any) => {
+      if (!data || !data.targetId) return;
+      const target = playersRef.current.find(p => p.id === data.targetId);
+      if (!target) return;
+      setVote({
+        target,
+        reason: data.reason || 'решение стола',
+        votes: data.votes || {},
+        endsAt: Number(data.endsAt) || (Date.now() + 30000),
+      });
+    });
+
+    socket.on('vote-resolved', (data: any) => {
+      setVote(null);
+      addLog(
+        `🗳 Голосование: ${data.yes}/${data.total} за исключение. ${data.targetName} ${data.kicked ? 'исключён' : 'оставлен'}.`,
+      );
+      if (data.kicked) {
+        const idx = playersRef.current.findIndex(p => p.id === data.targetId);
+        if (idx !== -1 && !playersRef.current[idx].bankrupt) {
+          bankruptPlayer(idx, 'решение стола');
+        }
+      }
+    });
+
     // ВСТАВИТЬ ЭТИ 4 БЛОКА СЮДА (после закрывающей скобки update-remote-state, но внутри useEffect):
     socket.on('player-left', (playerId) => {
       // Живой игрок вышел — награды не получает, помечаем leftAlive
@@ -5878,6 +5903,8 @@ resolveGameDesigns(cleanPlayers);
       socket.off('game-ended');  // <--- ДОБАВИТЬ
       socket.off('sync-timer-broadcast');
       socket.off('room-settings');
+      socket.off('vote-state');
+      socket.off('vote-resolved');
       socket.off('trade-proposed-broadcast');
       socket.off('trade-resolved-broadcast');
     };
@@ -6033,9 +6060,11 @@ resolveGameDesigns(cleanPlayers);
   }, [initialRoomId, currentUser?.id]);
   const [vote, setVote] = useState<{
     target: Player;
+    reason: string;
     votes: Record<string, "yes" | "no">;
-    left: number;
+    endsAt: number;
   } | null>(null);
+  const [, forceVoteTick] = useState(0);
   const [voteLog, setVoteLog] = useState<string[]>([]);
   const [gameOver, setGameOver] = useState(false);
   const [reward, setReward] = useState<string | null>(null);
@@ -6463,30 +6492,13 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     }
   };
 
-  const resolveVote = (votes: Record<string, "yes" | "no">, target: Player) => {
-    const yes = Object.values(votes).filter((v) => v === "yes").length;
-    const tot = Object.values(votes).length;
-    const stays = tot > 0 && yes / tot >= settings.voteYesPercent / 100;
-    const result = `🗳 Голосование: ${yes}/${tot} «Да». ${target.name} ${stays ? "остаётся" : "выбывает"}.`;
-    addLog(result);
-    setVote(null);
-
-    // Закрываем окна действий — игрок проигнорировал свой ход
-    if (pendingAction) setPendingAction(null);
-    if (auction) setAuction(null);
-
-    if (stays) advanceTurn(turn);
-    else bankruptPlayer(turn, "решение стола");
-  };
-
-  const castVote = (voter: string, value: "yes" | "no") => {
-    if (!vote || vote.votes[voter]) return;
-    const nv = { ...vote.votes, [voter]: value };
-    const others = players.filter(
-      (p) => p.id !== vote.target.id && !p.bankrupt,
-    );
-    if (Object.keys(nv).length >= others.length) resolveVote(nv, vote.target);
-    else setVote({ ...vote, votes: nv });
+    // Отправка голоса на сервер. Голосовать может каждый один раз.
+  const sendVote = (value: "yes" | "no") => {
+    if (!vote || !initialRoomId) return;
+    const myId = currentUser?.id || "you";
+    if (vote.votes[myId]) return;
+    if (vote.target.id === myId) return;
+    socket.emit('vote-cast', { roomId: initialRoomId, voterId: myId, value });
   };
 
   const handleTimeout = () => {
@@ -6505,8 +6517,13 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     }
 
     // Иначе — всегда голосование за исключение
-    voteHandled.current = false;
-    setVote({ target: player, votes: {}, left: settings.voteDuration });
+    if (!initialRoomId) return;
+    socket.emit('vote-start', {
+      roomId: initialRoomId,
+      targetId: player.id,
+      reason: 'истекло время ожидания хода',
+      duration: settings.voteDuration,
+    });
     setMessage(`Время вышло. Голосование за ${player.name}.`);
   };
 
@@ -6533,26 +6550,6 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     return () => window.clearInterval(id);
   });
 
-  useEffect(() => {
-    if (!vote) return;
-    const id = window.setInterval(
-      () =>
-        setVote((old) => {
-          if (!old) return null;
-          if (old.left <= 1) {
-            if (!voteHandled.current) {
-              voteHandled.current = true;
-              window.setTimeout(() => resolveVote(old.votes, old.target), 0);
-            }
-            return { ...old, left: 0 };
-          }
-          return { ...old, left: old.left - 1 };
-        }),
-      1000,
-    );
-    return () => window.clearInterval(id);
-  });
-
     useEffect(() => {
     if (!animPath || animStep >= animPath.length - 1) return;
     const totalSteps = animPath.length - 1;
@@ -6561,6 +6558,14 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     const t = window.setTimeout(() => setAnimStep((s) => s + 1), stepDuration);
     return () => window.clearTimeout(t);
   }, [animPath, animStep]);
+
+  // Тикер для модалки голосования: секунды обновляются каждую секунду,
+  // пока идёт голосование. Просто force-render, значение не используется.
+  useEffect(() => {
+    if (!vote) return;
+    const id = window.setInterval(() => forceVoteTick(t => t + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [vote]);
 
   useEffect(() => {
     if (!animPath || animStep < animPath.length - 1) return;
@@ -9612,11 +9617,12 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     label: "Выгнать",
                     action: () => {
                       setPlayerHover(null);
-                      voteHandled.current = false;
-                      setVote({
-                        target: tp,
-                        votes: {},
-                        left: settings.voteDuration,
+                      if (!initialRoomId) return;
+                      socket.emit('vote-start', {
+                        roomId: initialRoomId,
+                        targetId: tp.id,
+                        reason: 'инициатива игрока',
+                        duration: settings.voteDuration,
                       });
                     },
                   },
@@ -9836,60 +9842,83 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           );
         })()}
       {/* Vote modal */}
-      {vote && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#29233e]/60 p-5">
-          <div className="w-full max-w-lg rounded-2xl border border-card-border bg-card p-6 shadow-2xl">
-            <div className="flex items-start justify-between">
-              <div>
-                <div className="font-mono text-[10px] uppercase tracking-[.18em] text-primary">
-                  голосование · {vote.left} сек
-                </div>
-                <h2 className="mt-2 font-display text-2xl font-bold">
-                  Оставить {vote.target.name}?
-                </h2>
-              </div>
-              <div className="rounded-xl bg-[#f6dfd7] p-3 text-primary">
-                <Timer size={22} />
-              </div>
-            </div>
-            <div className="mt-5 space-y-2">
-              {players
-                .filter((p) => p.id !== vote.target.id && !p.bankrupt)
-                .map((p) => (
-                  <div
-                    key={p.id}
-                    className="flex items-center gap-3 rounded-xl bg-muted p-3"
-                  >
-                    <Avatar initials={p.initials} color={p.color} size="sm" />
-                    <div className="flex-1 text-sm font-bold">{p.name}</div>
-                    {vote.votes[p.id] ? (
-                      <span
-                        className={`text-xs font-bold ${vote.votes[p.id] === "yes" ? "text-accent" : "text-primary"}`}
-                      >
-                        {vote.votes[p.id] === "yes" ? "Да" : "Нет"}
-                      </span>
-                    ) : (
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => castVote(p.id, "yes")}
-                          className="rounded-lg bg-[#dceae3] px-3 py-1.5 text-xs font-bold text-accent"
-                        >
-                          Да
-                        </button>
-                        <button
-                          onClick={() => castVote(p.id, "no")}
-                          className="rounded-lg bg-[#f6dfd7] px-3 py-1.5 text-xs font-bold text-primary"
-                        >
-                          Нет
-                        </button>
-                      </div>
-                    )}
+      {vote && (() => {
+        const myId = currentUser?.id || "you";
+        const myVote = vote.votes[myId];
+        const secondsLeft = Math.max(0, Math.ceil((vote.endsAt - Date.now()) / 1000));
+        const voters = players.filter(p => !p.bankrupt && p.id !== vote.target.id);
+        const votedCount = Object.keys(vote.votes).length;
+        const targetIsMe = vote.target.id === myId;
+        return (
+          <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#29233e]/60 p-5">
+            <div className="w-full max-w-lg rounded-2xl border border-card-border bg-card p-6 shadow-2xl">
+              <div className="flex items-start justify-between">
+                <div>
+                  <div className="font-mono text-[10px] uppercase tracking-[.18em] text-primary">
+                    голосование · {secondsLeft} сек
                   </div>
-                ))}
+                  <h2 className="mt-2 font-display text-2xl font-bold">
+                    Исключить {vote.target.name}?
+                  </h2>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    Причина: {vote.reason}
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    Проголосовали: {votedCount} / {voters.length}
+                  </div>
+                </div>
+                <div className="rounded-xl bg-[#f6dfd7] p-3 text-primary">
+                  <Timer size={22} />
+                </div>
+              </div>
+
+              <div className="mt-5 space-y-2">
+                {voters.map((p) => {
+                  const v = vote.votes[p.id];
+                  const isMe = p.id === myId;
+                  return (
+                    <div key={p.id} className="flex items-center gap-3 rounded-xl bg-muted p-3">
+                      <Avatar initials={p.initials} color={p.color} size="sm" />
+                      <div className="flex-1 text-sm font-bold">
+                        {p.name}
+                        {isMe && <span className="ml-2 text-[10px] text-muted-foreground">(вы)</span>}
+                      </div>
+                      {v === "yes" && <span className="text-xs font-bold text-primary">Исключить</span>}
+                      {v === "no" && <span className="text-xs font-bold text-accent">Оставить</span>}
+                      {!v && <span className="text-[11px] italic text-muted-foreground">ещё голосует…</span>}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {targetIsMe ? (
+                <div className="mt-5 rounded-xl bg-[#f6dfd7] px-4 py-3 text-center text-xs font-bold text-primary">
+                  Голосование за вас. Ожидайте решения стола.
+                </div>
+              ) : myVote ? (
+                <div className="mt-5 rounded-xl bg-[#dceae3] px-4 py-3 text-center text-xs font-bold text-accent">
+                  Ваш голос: {myVote === "yes" ? "Исключить" : "Оставить"}
+                </div>
+              ) : (
+                <div className="mt-5 flex gap-2">
+                  <button
+                    onClick={() => sendVote("yes")}
+                    className="flex-1 rounded-xl bg-primary py-3 text-sm font-bold text-primary-foreground hover:brightness-95"
+                  >
+                    Исключить
+                  </button>
+                  <button
+                    onClick={() => sendVote("no")}
+                    className="flex-1 rounded-xl bg-[#dceae3] py-3 text-sm font-bold text-accent hover:brightness-95"
+                  >
+                    Оставить
+                  </button>
+                </div>
+              )}
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
       {/* Reward modal */}
       {reward && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#29233e]/60 p-5">

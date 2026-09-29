@@ -2271,6 +2271,90 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     io.to(data.roomId).emit('game-chat-message-broadcast', data);
   });
 
+    // ============ ГОЛОСОВАНИЕ ЗА ИСКЛЮЧЕНИЕ ============
+  // Клиент-инициатор шлёт vote-start. Сервер хранит голосование в room.vote,
+  // рассылает vote-state всем, принимает vote-cast от каждого один раз.
+  // По таймеру или когда проголосовали все — resolveVote, шлёт vote-resolved.
+  // Само банкротство применяют клиенты через bankruptPlayer (чтобы ход
+  // корректно перешёл к следующему). Сервер только сообщает результат.
+  function resolveVote(roomId) {
+    const room = gameRooms[roomId];
+    if (!room || !room.vote) return;
+    const vote = room.vote;
+    delete room.vote;
+    if (room.voteTimer) { clearTimeout(room.voteTimer); delete room.voteTimer; }
+
+    const yes = Object.values(vote.votes).filter(v => v === 'yes').length;
+    const total = Object.keys(vote.votes).length;
+    const threshold = adminSettings.voteYesPercent || 50;
+    const percent = total > 0 ? (yes / total) * 100 : 0;
+    // Решение об исключении — строго больше порога.
+    // При 50/50 (напр., 1 из 2 при 3 игроках) игрок остаётся.
+    const kicked = percent > threshold;
+
+    const target = room.find(p => p.id === vote.targetId);
+    const targetName = target?.name || '?';
+    console.log(`🗳 Голосование ${roomId}: ${yes}/${total} за кик ${targetName} → ${kicked ? 'ИСКЛЮЧЁН' : 'оставлен'}`);
+
+    io.to(roomId).emit('vote-resolved', {
+      targetId: vote.targetId,
+      targetName,
+      yes, total, kicked,
+    });
+  }
+
+  socket.on('vote-start', ({ roomId, targetId, reason, duration }) => {
+    if (!roomId || !gameRooms[roomId]) return;
+    const room = gameRooms[roomId];
+    if (room.vote) return; // уже идёт
+    const target = room.find(p => p.id === targetId);
+    if (!target || target.bankrupt) return;
+
+    const dur = Math.max(5, Math.min(120, Number(duration) || 30));
+    room.vote = {
+      targetId,
+      reason: reason || 'решение стола',
+      votes: {},
+      endsAt: Date.now() + dur * 1000,
+    };
+    io.to(roomId).emit('vote-state', {
+      targetId,
+      reason: room.vote.reason,
+      votes: {},
+      endsAt: room.vote.endsAt,
+    });
+
+    if (room.voteTimer) clearTimeout(room.voteTimer);
+    room.voteTimer = setTimeout(() => resolveVote(roomId), dur * 1000);
+    console.log(`🗳 Голосование ${roomId}: за кик ${target.name}, ${dur}с`);
+  });
+
+  socket.on('vote-cast', ({ roomId, voterId, value }) => {
+    if (!roomId || !gameRooms[roomId]) return;
+    const room = gameRooms[roomId];
+    if (!room.vote) return;
+    if (voterId === room.vote.targetId) return;
+    if (room.vote.votes[voterId]) return;
+    if (value !== 'yes' && value !== 'no') return;
+
+    const voter = room.find(p => p.id === voterId);
+    if (!voter || voter.bankrupt) return;
+
+    room.vote.votes[voterId] = value;
+    io.to(roomId).emit('vote-state', {
+      targetId: room.vote.targetId,
+      reason: room.vote.reason,
+      votes: room.vote.votes,
+      endsAt: room.vote.endsAt,
+    });
+
+    const aliveVoters = room.filter(p => !p.bankrupt && p.id !== room.vote.targetId);
+    if (Object.keys(room.vote.votes).length >= aliveVoters.length) {
+      if (room.voteTimer) clearTimeout(room.voteTimer);
+      resolveVote(roomId);
+    }
+  });
+
   socket.on('sync-game-state', (data) => {
     // Сохраняем актуальное состояние игроков на сервере —
     // это нужно, чтобы при переподключении игрок получил свежие позиции,

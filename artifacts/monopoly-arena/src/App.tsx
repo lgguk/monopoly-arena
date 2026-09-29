@@ -7054,6 +7054,15 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       const auctionDecline = () => {
     if (!auction) return;
     const bidderId = auction.participants[auction.currentIdx];
+
+    // Если это единственный участник и он же highBidder — отказ невозможен.
+    // Он обязан выкупить поле по своей последней ставке.
+    if (
+      auction.participants.length === 1 &&
+      auction.highBidder === bidderId
+    ) {
+      return;
+    }
     const bidder = players.find((p) => p.id === bidderId);
     addLog(`🔨 ${bidder?.name ?? "?"} отказался от участия в аукционе`);
 
@@ -8610,14 +8619,39 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                         if (isMyAuctionAction) {
                           const isLastParticipant =
                             auction.participants.length === 1;
+                          const isObligatedWinner =
+                            isLastParticipant &&
+                            auction.highBidder === currentBidderId;
                           const buyPrice = isLastParticipant
                             ? auction.price
                             : auction.price + 100;
+                          const canAfford =
+                            !currentBidder || currentBidder.money >= buyPrice;
+
+                          // Игрок уже делал ставку и остался один — обязан выкупить.
+                          // Отказаться нельзя: иначе это не аукцион.
+                          if (isObligatedWinner) {
+                            return (
+                              <div>
+                                <div className="text-[10px] text-white/60 mb-1.5 text-center">
+                                  Ваша ставка победила — вы обязаны выкупить поле.
+                                </div>
+                                <button
+                                  onClick={auctionRaise}
+                                  disabled={!canAfford}
+                                  className="w-full rounded-lg bg-[#32786d] py-1.5 text-[11px] font-bold text-white disabled:opacity-40 hover:bg-[#266059] transition-colors"
+                                >
+                                  Выкупить за {auction.price.toLocaleString("ru-RU")} К
+                                </button>
+                              </div>
+                            );
+                          }
+
                           return (
                             <div className="flex gap-1.5">
                               <button
                                 onClick={auctionRaise}
-                                disabled={currentBidder && currentBidder.money < buyPrice}
+                                disabled={!canAfford}
                                 className="flex-1 rounded-lg bg-[#32786d] py-1.5 text-[11px] font-bold text-white disabled:opacity-40 hover:bg-[#266059] transition-colors"
                               >
                                 {isLastParticipant

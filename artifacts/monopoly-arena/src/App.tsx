@@ -6967,35 +6967,44 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     addLog(`🔨 ${player.name} отказался от участия в аукционе`);
   };
 
-  const auctionRaise = () => {
+    const auctionRaise = () => {
     if (!auction) return;
     const bidderId = auction.participants[auction.currentIdx];
     const bidder = players.find((p) => p.id === bidderId);
-    const newPrice = auction.price + 100;
-    if (!bidder || bidder.money < newPrice) {
-      addLog("❌ Недостаточно средств для ставки.");
-      return;
-    }
+    if (!bidder) return;
 
-    // Если в аукционе остался только 1 участник, он сразу выигрывает по новой цене
+    // Последний оставшийся участник: выкупает по ТЕКУЩЕЙ цене
+    // (никто не перебивает, +100 не нужно). Либо отказывается.
     if (auction.participants.length === 1) {
+      if (bidder.money < auction.price) {
+        addLog(
+          `❌ У ${bidder.name} недостаточно средств (нужно ${auction.price.toLocaleString("ru-RU")} К).`,
+        );
+        return;
+      }
       const winner = bidder;
       setOwners((old) => ({ ...old, [auction.cellIndex]: bidderId }));
       setPlayers((ps) =>
         ps.map((p) =>
-          p.id === bidderId ? { ...p, money: p.money - newPrice } : p,
+          p.id === bidderId ? { ...p, money: p.money - auction.price } : p,
         ),
       );
       addLog(
-        `🏆 ${winner.name} выиграл аукцион! «${getCell(auction.cellIndex).name}»  за ${newPrice.toLocaleString("ru-RU")} К`,
+        `🏆 ${winner.name} выкупил «${getCell(auction.cellIndex).name}» за ${auction.price.toLocaleString("ru-RU")} К`,
       );
       setAuction(null);
       advanceTurn();
       return;
     }
 
+    // Обычная ставка: +100 к текущей, ход переходит к следующему.
+    const newPrice = auction.price + 100;
+    if (bidder.money < newPrice) {
+      addLog("❌ Недостаточно средств для ставки.");
+      return;
+    }
     const nextIdx = (auction.currentIdx + 1) % auction.participants.length;
-    addLog(`🔨 ${bidder.name} ста9 ит ${newPrice.toLocaleString("ru-RU")} К`);
+    addLog(`🔨 ${bidder.name} ставит ${newPrice.toLocaleString("ru-RU")} К`);
     setAuction({
       ...auction,
       price: newPrice,
@@ -7004,20 +7013,24 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     });
   };
 
-    const auctionDecline = () => {
+      const auctionDecline = () => {
     if (!auction) return;
     const bidderId = auction.participants[auction.currentIdx];
     const bidder = players.find((p) => p.id === bidderId);
     addLog(`🔨 ${bidder?.name ?? "?"} отказался от участия в аукционе`);
+
+    // Отказывается ли текущий лидер? Если да — его ставка аннулируется.
+    const wasHighBidder = auction.highBidder === bidderId;
 
     // Удаляем отказавшегося игрока
     const newParticipants = auction.participants.filter(
       (id) => id !== bidderId,
     );
 
-    // Если никого не осталось — аукцион завершён без победителя
+    // Никого не осталось — аукцион завершён.
     if (newParticipants.length === 0) {
-      if (auction.highBidder) {
+      // Победу отдаём последнему лидеру, ТОЛЬКО если он сам не отказался.
+      if (auction.highBidder && !wasHighBidder) {
         const winner = players.find((p) => p.id === auction.highBidder);
         if (winner && winner.money >= auction.price) {
           setOwners((old) => ({
@@ -7045,37 +7058,26 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       return;
     }
 
-    // Если остался 1 участник — он становится победителем по текущей цене
+    // Остался 1 участник — НЕ отдаём победу автоматом.
+    // Открываем окно: он либо выкупит по текущей цене, либо тоже откажется.
     if (newParticipants.length === 1) {
-      const winnerId = newParticipants[0];
-      const winner = players.find((p) => p.id === winnerId);
-      if (winner && winner.money >= auction.price) {
-        setOwners((old) => ({
-          ...old,
-          [auction.cellIndex]: winnerId,
-        }));
-        setPlayers((ps) =>
-          ps.map((p) =>
-            p.id === winnerId ? { ...p, money: p.money - auction.price } : p,
-          ),
-        );
-        addLog(
-          `🏆 ${winner.name} выиграл аукцион! «${getCell(auction.cellIndex).name}» за ${auction.price.toLocaleString("ru-RU")} К`,
-        );
-      } else {
-        addLog(`🔨 Аукцион завершён без победителя (недостаточно средств у ${winner?.name}).`);
-      }
-      setAuction(null);
-      advanceTurn();
+      setAuction({
+        ...auction,
+        participants: newParticipants,
+        currentIdx: 0,
+        // Если отказался лидер — highBidder больше неактуален.
+        highBidder: wasHighBidder ? null : auction.highBidder,
+      });
       return;
     }
 
-    // Если осталось больше 1 участника, продолжаем
+    // Больше 1 участника — продолжаем.
     const nextIdx = auction.currentIdx % newParticipants.length;
     setAuction({
       ...auction,
       participants: newParticipants,
       currentIdx: nextIdx,
+      highBidder: wasHighBidder ? null : auction.highBidder,
     });
   };
 
@@ -8568,14 +8570,21 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                         const isMyAuctionAction = currentBidderId === (currentUser?.id || "you");
 
                         if (isMyAuctionAction) {
+                          const isLastParticipant =
+                            auction.participants.length === 1;
+                          const buyPrice = isLastParticipant
+                            ? auction.price
+                            : auction.price + 100;
                           return (
                             <div className="flex gap-1.5">
                               <button
                                 onClick={auctionRaise}
-                                disabled={currentBidder && currentBidder.money < auction.price + 100}
+                                disabled={currentBidder && currentBidder.money < buyPrice}
                                 className="flex-1 rounded-lg bg-[#32786d] py-1.5 text-[11px] font-bold text-white disabled:opacity-40 hover:bg-[#266059] transition-colors"
                               >
-                                Поставить {(auction.price + 100).toLocaleString("ru-RU")} К
+                                {isLastParticipant
+                                  ? `Выкупить за ${buyPrice.toLocaleString("ru-RU")} К`
+                                  : `Поставить ${buyPrice.toLocaleString("ru-RU")} К`}
                               </button>
                               <button
                                 onClick={auctionDecline}

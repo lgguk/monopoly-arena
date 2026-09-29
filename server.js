@@ -856,6 +856,9 @@ const io = new Server(server, {
 let rooms = [];
 // { roomId: [playerObj, playerObj, ...] }
 let gameRooms = {};
+// roomId -> { mode, maxPlayers } — сохраняется до создания gameRooms,
+// чтобы знать maxPlayers после удаления лобби из rooms.
+const roomMeta = {};
 // Таймеры отключения: ключ `${roomId}:${playerId}` → timeoutId
 const disconnectTimers = new Map();
 const DISCONNECT_GRACE_MS = 2 * 60 * 1000; // 2 минуты
@@ -2421,6 +2424,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     turnDurationSec: getTurnDuration(mode),
   };
     rooms.push(newRoom);
+    roomMeta[newRoom.id] = { mode, maxPlayers };
     socket.emit('room-created', newRoom);
     socket.join(newRoom.id);
     io.emit('update-rooms', rooms);
@@ -2464,10 +2468,12 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       gameRooms[roomId].finalized = false;
     }
 
-    // Определяем режим комнаты (сохраняем при первом заходе)
+    // Определяем режим и maxPlayers комнаты (сохраняем при первом заходе).
+    // Лобби к этому моменту уже удалено из rooms — берём из roomMeta.
     if (!gameRooms[roomId].mode) {
-      const lobby = rooms.find(r => r.id === roomId);
-      gameRooms[roomId].mode = lobby?.mode || "Классический";
+      const meta = roomMeta[roomId];
+      gameRooms[roomId].mode = meta?.mode || "Классический";
+      gameRooms[roomId].maxPlayers = meta?.maxPlayers || 2;
     }
     const roomMode = gameRooms[roomId].mode;
     const fast = isFastMode(roomMode);
@@ -2497,6 +2503,22 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       // Стартовый капитал по режиму: быстрые = 10 000, классика = из adminSettings
       playerData.money = fast ? 10000 : (adminSettings.startCapital || 15000);
       gameRooms[roomId].push({ ...playerData, socketId: socket.id });
+
+      // Когда все игроки зашли — шафлим порядок, чтобы первый ход был
+      // у случайного игрока, а не у того, чей сокет дошёл первым.
+      if (
+        !gameRooms[roomId].shuffled &&
+        gameRooms[roomId].length === gameRooms[roomId].maxPlayers
+      ) {
+        const arr = gameRooms[roomId];
+        for (let i = arr.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [arr[i], arr[j]] = [arr[j], arr[i]];
+        }
+        gameRooms[roomId].shuffled = true;
+        const order = arr.map(p => p.name).join(' → ');
+        console.log(`🎲 Комната ${roomId}: порядок хода — ${order}`);
+      }
     } else {
       // Переподключение — обновляем socketId и снимаем флаг
       existing.socketId = socket.id;
@@ -2567,6 +2589,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     if (gameRooms[roomId]) {
       delete gameRooms[roomId];
       delete roomTurnStart[roomId];
+      delete roomMeta[roomId];
     }
     console.log(`Лобби ${roomId} удалено хостом`);
   });
@@ -2648,6 +2671,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       setTimeout(() => {
         delete gameRooms[roomId];
         delete roomTurnStart[roomId];
+        delete roomMeta[roomId];
         console.log(`🗑 Комната ${roomId} удалена после завершения игры`);
       }, 8000);
     }
@@ -3020,6 +3044,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
           delete roomTurnStart[roomId];
           setTimeout(() => {
             delete gameRooms[roomId];
+            delete roomMeta[roomId];
             console.log(`🗑 Комната ${roomId} удалена после авто-банкрота`);
           }, 8000);
         }

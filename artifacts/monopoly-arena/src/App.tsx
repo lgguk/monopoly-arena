@@ -992,6 +992,42 @@ async function compressImageFile(
   });
 }
 
+
+// Сжатие base64-картинки (не файла). Используется для миграции
+// уже загруженных в БД картинок. Логика та же, что в compressImageFile:
+// PNG, если есть прозрачность; JPEG fallback, если непрозрачная и
+// превышает maxBytes.
+async function compressBase64Url(
+  base64: string,
+  maxWidth: number,
+  maxHeight: number,
+  maxBytes = 150000,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onerror = () => reject(new Error("Не картинка"));
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      let width = img.width;
+      let height = img.height;
+      if (width > maxWidth) { height = (height * maxWidth) / width; width = maxWidth; }
+      if (height > maxHeight) { width = (width * maxHeight) / height; height = maxHeight; }
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return reject(new Error("Canvas недоступен"));
+      ctx.drawImage(img, 0, 0, width, height);
+      const hasAlpha = canvasHasTransparency(ctx, width, height);
+      let dataUrl = canvas.toDataURL("image/png");
+      if (!hasAlpha && dataUrl.length > maxBytes) {
+        dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+      }
+      resolve(dataUrl);
+    };
+    img.src = base64;
+  });
+}
+
 // Сжимает картинку-файл до квадрата 256×256, обрезая по центру.
 // Возвращает base64 PNG. Используется для аватарок.
 async function compressAvatar(file: File): Promise<string> {
@@ -10791,6 +10827,79 @@ const [customPrice, setCustomPrice] = useState("");
                       {compressProgress}
                     </div>
                   )}
+                  <button
+                    onClick={async () => {
+                      if (isCompressing) return;
+                      setIsCompressing(true);
+                      setCompressProgress("⏳ Миграция картинок...");
+                      try {
+                        let compressedItems = 0;
+                        let compressedCases = 0;
+
+                        // Товары / карточки для рынка
+                        const newItems = await Promise.all(
+                          marketItems.map(async (item) => {
+                            if (!item.imageDataUrl || item.imageDataUrl.length < 50000) return item;
+                            try {
+                              const maxDim = item.category === "dice" ? 128 : 300;
+                              const compressed = await compressBase64Url(
+                                item.imageDataUrl, maxDim, maxDim, 100000,
+                              );
+                              compressedItems++;
+                              return { ...item, imageDataUrl: compressed };
+                            } catch (err) {
+                              console.error("Ошибка сжатия товара", item.id, err);
+                              return item;
+                            }
+                          })
+                        );
+                        if (compressedItems > 0) {
+                          setMarketItems(newItems);
+                          socket.emit('save-custom-items', newItems);
+                        }
+
+                        // Кейсы
+                        const newCases = await Promise.all(
+                          cases.map(async (c) => {
+                            if (!c.imageDataUrl || c.imageDataUrl.length < 50000) return c;
+                            try {
+                              const compressed = await compressBase64Url(
+                                c.imageDataUrl, 400, 400, 120000,
+                              );
+                              compressedCases++;
+                              return { ...c, imageDataUrl: compressed };
+                            } catch (err) {
+                              console.error("Ошибка сжатия кейса", c.id, err);
+                              return c;
+                            }
+                          })
+                        );
+                        if (compressedCases > 0) {
+                          setCases(newCases);
+                          socket.emit('admin-save-cases', newCases);
+                        }
+
+                        setCompressProgress(
+                          `✅ Готово! Сжато товаров: ${compressedItems}, кейсов: ${compressedCases}.`,
+                        );
+                        setTimeout(() => setCompressProgress(null), 5000);
+                      } catch (err) {
+                        setCompressProgress(`❌ Ошибка: ${err}`);
+                      } finally {
+                        setIsCompressing(false);
+                      }
+                    }}
+                    disabled={isCompressing}
+                    className={`flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-bold transition-colors ${
+                      isCompressing
+                        ? "bg-muted text-muted-foreground cursor-not-allowed"
+                        : "bg-[#32786d] text-white hover:bg-[#266059]"
+                    }`}
+                  >
+                    {isCompressing
+                      ? "⏳ Сжимаем..."
+                      : "🗜 Пережать картинки товаров и кейсов"}
+                  </button>
                   <button
                     onClick={async () => {
                       if (isCompressing) return;

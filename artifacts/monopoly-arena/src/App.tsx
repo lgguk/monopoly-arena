@@ -530,7 +530,76 @@ const boardCells: BoardCell[] = [
   { name: "Johnson & Johnson", type: "property", price: 3400, rent: 340 }, // 38
   { name: "Moderna", type: "property", price: 3500, rent: 350 }, // 39
 ];
+// Unicode-символы ⚀..⚅ — маркеры в тексте лога. На некоторых системах
+// они рендерятся квадратиками, поэтому визуально их подменяет CSS-кубик.
+const DICE_FACE = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"];
+const DICE_FACE_INDEX: Record<string, number> = {
+  "⚀": 1, "⚁": 2, "⚂": 3, "⚃": 4, "⚄": 5, "⚅": 6,
+};
+const diceFace = (v: number) => DICE_FACE[v] || "";
 
+// Кубик с точками. Дизайн 1-в-1 с ThreeDDice (используется в анимации
+// броска): белый фон, тонкая серая граница, чёрные точки, мягкая тень.
+// Позиционирование точек абсолютное в процентах — симметрия сохраняется
+// на любом размере (16.67% / 50% / 83.33% для 3 позиций по каждой оси).
+function DiceFace({ value, size = 20 }: { value: number; size?: number }) {
+  const patterns: Record<number, [number, number][]> = {
+    1: [[1, 1]],
+    2: [[0, 0], [2, 2]],
+    3: [[0, 0], [1, 1], [2, 2]],
+    4: [[0, 0], [0, 2], [2, 0], [2, 2]],
+    5: [[0, 0], [0, 2], [1, 1], [2, 0], [2, 2]],
+    6: [[0, 0], [0, 1], [0, 2], [2, 0], [2, 1], [2, 2]],
+  };
+  const dots = patterns[value] || [];
+
+  const pad = Math.max(2, size * 0.14);
+  const dotSize = Math.max(2.5, size * 0.17);
+  const radius = Math.max(2, size * 0.14);
+  const inner = size - pad * 2;
+
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: size,
+        height: size,
+        background: "#ffffff",
+        borderRadius: radius,
+        border: "1px solid #d1d5db",
+        boxShadow:
+          "inset 0 1px 1px rgba(255,255,255,1), 0 1px 2px rgba(0,0,0,0.25)",
+        verticalAlign: "middle",
+        margin: "0 2px",
+        flexShrink: 0,
+      }}
+    >
+      <span style={{ position: "relative", width: inner, height: inner }}>
+        {dots.map(([r, c], idx) => {
+          const left = ((c + 0.5) / 3) * 100;
+          const top = ((r + 0.5) / 3) * 100;
+          return (
+            <span
+              key={idx}
+              style={{
+                position: "absolute",
+                left: `${left}%`,
+                top: `${top}%`,
+                width: dotSize,
+                height: dotSize,
+                transform: "translate(-50%, -50%)",
+                borderRadius: "50%",
+                background: "#000000",
+              }}
+            />
+          );
+        })}
+      </span>
+    </span>
+  );
+}
 // Logos & icons for board cells
 const CELL_LOGOS: Record<number, string> = {
   1: "🍎",
@@ -5780,7 +5849,7 @@ resolveGameDesigns(cleanPlayers);
 
         if (isMyTurn) {
           // ЛОГ ДОБАВЛЯЕТСЯ ТОЛЬКО ТЕМ, КТО БРОСАЕТ
-          addLog(`🎲 ${playersRef.current[activePlayerIdx]?.name} выбросил ${d1} и ${d2} = ${steps}`);
+          addLog(`🎲 ${playersRef.current[activePlayerIdx]?.name} выбросил ${diceFace(d1)} ${diceFace(d2)}`);
           
           afterAnimRef.current = () => {
             setPlayers((prevPlayers) =>
@@ -8515,9 +8584,9 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                     <button
                                       key={n}
                                       onClick={toggle}
-                                      className={`flex h-8 w-8 items-center justify-center rounded-lg text-sm font-bold transition-all ${sel ? "bg-[#e7ba68] text-[#29233e] scale-110" : canAdd ? "bg-white/15 text-white hover:bg-white/25" : "bg-white/5 text-white/30 cursor-not-allowed"}`}
+                                      className={`flex h-10 w-10 items-center justify-center rounded-lg transition-all ${sel ? "bg-[#e7ba68] scale-110" : canAdd ? "bg-white/15 hover:bg-white/25" : "bg-white/5 opacity-30 cursor-not-allowed"}`}
                                     >
-                                      {n}
+                                      <DiceFace value={n} size={28} />
                                     </button>
                                   );
                                 })}
@@ -9044,16 +9113,24 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                           </div>
                         );
                       } else {
-                        // Это лог игры
+                        // Лог игры. Разбиваем строку по символам кубиков —
+                        // их рендерим крупнее и без курсива, чтобы точки были видны.
+                        const DICE_RE = /([⚀⚁⚂⚃⚄⚅])/;
+                        const parts = item.text.split(DICE_RE);
+                        const isSpecial = item.type === "special";
                         return (
-                          <div key={`l-${i}`} className={`leading-tight break-words ${item.type === "special" ? "text-orange-400" : "italic text-white/65"}`}
-                            style={
-                              item.type === "special"
-                                ? { color: "#f97316" }
-                                : {}
-                            }
+                          <div
+                            key={`l-${i}`}
+                            className={`leading-tight break-words ${isSpecial ? "text-orange-400" : "italic text-white/65"}`}
+                            style={isSpecial ? { color: "#f97316" } : {}}
                           >
-                            {item.text}
+                            {parts.map((part, idx) => {
+                              const val = DICE_FACE_INDEX[part];
+                              if (val) {
+                                return <DiceFace key={idx} value={val} size={18} />;
+                              }
+                              return <span key={idx}>{part}</span>;
+                            })}
                           </div>
                         );
                       }

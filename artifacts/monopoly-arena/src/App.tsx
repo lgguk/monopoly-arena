@@ -923,6 +923,75 @@ const seedListings: Listing[] = [
   },
 ];
 
+// Универсальная функция сжатия картинки-файла до заданных размеров.
+// Сначала PNG (сохраняет прозрачность). Если base64 больше maxBytes —
+// переключается на JPEG 0.85. Для иконок/логотипов прозрачность обычно
+// не критична, поэтому JPEG допустим. Используется во всех загрузках,
+// кроме аватарки (там своя логика с кропом по центру).
+// Проверка: есть ли в canvas прозрачные пиксели.
+// Если есть — JPEG использовать нельзя, он зальёт их чёрным.
+function canvasHasTransparency(ctx: CanvasRenderingContext2D, w: number, h: number): boolean {
+  try {
+    const data = ctx.getImageData(0, 0, w, h).data;
+    for (let i = 3; i < data.length; i += 4) {
+      if (data[i] < 255) return true;
+    }
+    return false;
+  } catch {
+    // Если canvas tainted (cross-origin) — считаем, что прозрачность может быть.
+    return true;
+  }
+}
+
+// Универсальная функция сжатия картинки-файла.
+// Стратегия:
+//  - если картинка содержит прозрачные пиксели — ТОЛЬКО PNG
+//    (JPEG зальёт прозрачные места чёрным/белым, сломав скины на доске);
+//  - если картинка полностью непрозрачная — PNG, а при превышении
+//    maxBytes переключаемся на JPEG 0.85 (для фотографий это даёт
+//    кратное уменьшение без потери качества).
+async function compressImageFile(
+  file: File,
+  maxWidth: number,
+  maxHeight: number,
+  maxBytes = 150000,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Не удалось прочитать файл"));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Не картинка"));
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        let width = img.width;
+        let height = img.height;
+        if (width > maxWidth) {
+          height = (height * maxWidth) / width;
+          width = maxWidth;
+        }
+        if (height > maxHeight) {
+          width = (width * maxHeight) / height;
+          height = maxHeight;
+        }
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return reject(new Error("Canvas недоступен"));
+        ctx.drawImage(img, 0, 0, width, height);
+        const hasAlpha = canvasHasTransparency(ctx, width, height);
+        let dataUrl = canvas.toDataURL("image/png");
+        if (!hasAlpha && dataUrl.length > maxBytes) {
+          dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+        }
+        resolve(dataUrl);
+      };
+      img.src = reader.result as string;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 // Сжимает картинку-файл до квадрата 256×256, обрезая по центру.
 // Возвращает base64 PNG. Используется для аватарок.
 async function compressAvatar(file: File): Promise<string> {
@@ -10447,53 +10516,9 @@ const [customPrice, setCustomPrice] = useState("");
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !editDraft) return;
-
-    // Функция сжатия картинки через Canvas (исправлено на PNG)
-    const compressImage = (
-      file: File,
-      maxWidth: number,
-      maxHeight: number,
-    ): Promise<string> => {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const img = new Image();
-          img.onload = () => {
-            const canvas = document.createElement("canvas");
-            let width = img.width;
-            let height = img.height;
-
-            // Расчет пропорций
-            if (width > maxWidth) {
-              height = (height * maxWidth) / width;
-              width = maxWidth;
-            }
-            if (height > maxHeight) {
-              width = (width * maxHeight) / height;
-              height = maxHeight;
-            }
-
-            canvas.width = width;
-            canvas.height = height;
-            const ctx = canvas.getContext("2d");
-            // Рисуем картинку с прозрачностью
-            ctx?.drawImage(img, 0, 0, width, height);
-
-            // ВАЖНО: Используем PNG, чтобы сохранить прозрачный фон
-            resolve(canvas.toDataURL("image/png"));
-          };
-          img.onerror = reject;
-          img.src = e.target?.result as string;
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      });
-    };
-
-    // Применяем сжатие с сохранением прозрачности
-    compressImage(file, 200, 200)
-      .then((compressedBase64) => {
-        setEditDraft((d) => (d ? { ...d, imageDataUrl: compressedBase64 } : d));
+    compressImageFile(file, 200, 200, 80000)
+      .then((compressed) => {
+        setEditDraft((d) => (d ? { ...d, imageDataUrl: compressed } : d));
       })
       .catch((err) => {
         console.error("Ошибка сжатия картинки", err);
@@ -10781,7 +10806,8 @@ if (!designs || designs.length === 0) {
 }
                         let compressedCount = 0;
 
-                        // Функция сжатия Base64 картинки (PNG с прозрачностью)
+                        // Сжатие base64-картинки. PNG пока не превышает 80 KB,
+                        // иначе JPEG 0.85 — так все крупные картинки ужмутся.
                         const compressBase64Image = (
                           base64: string,
                           maxWidth: number,
@@ -10805,7 +10831,12 @@ if (!designs || designs.length === 0) {
                               canvas.height = height;
                               const ctx = canvas.getContext("2d");
                               ctx?.drawImage(img, 0, 0, width, height);
-                              resolve(canvas.toDataURL("image/png"));
+                              const hasAlpha = canvasHasTransparency(ctx!, width, height);
+                              let dataUrl = canvas.toDataURL("image/png");
+                              if (!hasAlpha && dataUrl.length > 80000) {
+                                dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+                              }
+                              resolve(dataUrl);
                             };
                             img.onerror = reject;
                             img.src = base64;
@@ -11005,19 +11036,18 @@ socket.emit('admin-update-card-designs', updatedDesigns);
                   </label>
                   <label className="text-xs font-bold">
                     Изображение (необязательно)
-                    <input
-                      type="file"
-                      accept="image/*"
-                      onChange={(e) => {
-                        const f = e.target.files?.[0];
-                        if (!f) return;
-                        const r = new FileReader();
-                        r.onload = (ev) =>
-                          setDiceImageDataUrl(ev.target?.result as string);
-                        r.readAsDataURL(f);
-                      }}
-                      className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
-                    />
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (!f) return;
+                      compressImageFile(f, 128, 128, 40000)
+                        .then((compressed) => setDiceImageDataUrl(compressed))
+                        .catch((err) => console.error("Ошибка сжатия кубика:", err));
+                    }}
+                    className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
+                  />
                   </label>
                   {diceImageDataUrl && (
                     <img
@@ -11297,13 +11327,9 @@ socket.emit('admin-update-card-designs', updatedDesigns);
         onChange={(e) => {
           const file = e.target.files?.[0];
           if (!file) return;
-          const reader = new FileReader();
-          reader.onload = (ev) => {
-            const imageDataUrl = ev.target?.result as string;
-            // Сжимаем как в других местах? Пока сохраняем как есть
-            setCaseImageDataUrl(imageDataUrl);
-          };
-          reader.readAsDataURL(file);
+          compressImageFile(file, 400, 400, 120000)
+            .then((compressed) => setCaseImageDataUrl(compressed))
+            .catch((err) => console.error("Ошибка сжатия картинки кейса:", err));
         }}
         className="hidden"
       />
@@ -13652,8 +13678,9 @@ function MarketItemModal({ onClose, onSave, initialItem }: { onClose: () => void
             canvas.height = height;
             const ctx = canvas.getContext("2d");
             ctx?.drawImage(img, 0, 0, width, height);
+            const hasAlpha = canvasHasTransparency(ctx!, width, height);
             let dataUrl = canvas.toDataURL("image/png");
-            if (dataUrl.length > 150000) {
+            if (!hasAlpha && dataUrl.length > 150000) {
               dataUrl = canvas.toDataURL("image/jpeg", 0.85);
             }
             resolve(dataUrl);

@@ -412,7 +412,13 @@ function enqueueSave(uid, fn) {
 // (быстрее и безопаснее, когда меняем данные одного игрока).
 // Возвращает промис, который резолвится, когда все записи реально завершены.
 async function saveUserData(userId = null) {
-  const ids = userId ? [userId] : Object.keys(userData);
+  // Для массового сохранения фильтруем «сирот»: если игрока нет в users
+  // (гость удалён при disconnect, а userData остался) — не пытаемся писать
+  // его в БД, иначе падает FK constraint user_data_user_id_fkey.
+  const validIdSet = userId ? null : new Set(users.map(u => u.id));
+  const ids = userId
+    ? [userId]
+    : Object.keys(userData).filter(uid => validIdSet.has(uid));
   const tasks = [];
   for (const uid of ids) {
     // Сериализуем сохранение для каждого uid через очередь.
@@ -2569,6 +2575,14 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
         gameRooms[roomId].shuffled = true;
         const order = arr.map(p => p.name).join(' → ');
         console.log(`🎲 Комната ${roomId}: порядок хода — ${order}`);
+
+        // Авто-старт таймера на первого игрока (у него turn=0).
+        // Без этого партия начнётся, но никто не запустит отсчёт:
+        // advanceTurn при старте не вызывается, pendingAction пусто,
+        // клиент ждёт timer-start от сервера.
+        const firstPlayer = arr[0];
+        startTurnTimer(roomId, getTurnDuration(roomMode), firstPlayer.id);
+        console.log(`⏱ Авто-старт таймера: ${firstPlayer.name}, ${getTurnDuration(roomMode)}с`);
       }
     } else {
       // Переподключение — обновляем socketId и снимаем флаг

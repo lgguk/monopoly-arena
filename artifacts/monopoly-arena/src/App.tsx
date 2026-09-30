@@ -5525,6 +5525,15 @@ const timeLeftRef = useRef(45);
   const rewardRef = useRef<string | null>(null);
   const rewardGivenRef = useRef(false); // защита от повторного начисления
   const eliminationOrderRef = useRef<string[]>([]); // порядок выбывания по банкротству
+  // Refs на функции, которые вызываются из socket.on. Без этого они
+  // замыкаются на state первого рендера (alive=[], players=[] и т.д.) —
+  // и вместо голосования при тайм-ауте клиент сразу банкротит (alive.length <= 1 на пустом массиве).
+  const handleTimeoutRef = useRef<(playerId?: string) => void>(() => {});
+  const bankruptPlayerRef = useRef<(index: number, reason: string) => void>(() => {});
+  const advanceTurnRef = useRef<(fromIdx?: number, forceNext?: boolean) => void>(() => {});
+  const finishGameRef = useRef<() => void>(() => {});
+  const handleVoluntaryLeaveRef = useRef<(playerId: string) => void>(() => {});
+  const addLogRef = useRef<(entry: string, type?: "default" | "special") => void>(() => {});
 const auctionRef = useRef<AuctionState | null>(null);
 const pendingJailMovementRef = useRef<{ d1: number; d2: number; capturedTurn: number } | null>(null);
   const [turn, setTurn] = useState(0);
@@ -5715,10 +5724,6 @@ resolveGameDesigns(cleanPlayers);
     socket.on('update-game-players', handlePlayersUpdate);
     socket.on('game-chat-message-broadcast', handleBroadcastMessage);
     socket.on('game-log-add-broadcast', handleGameLogBroadcast);
-    // Обработчик получения нового таймера
-    socket.on('sync-timer-broadcast', (newTime) => {
-      setTimeLeft(newTime);
-    });
 
     // Настройки режима с сервера. Приходят сразу после enter-game-room.
     socket.on('room-settings', (data: any) => {
@@ -5904,6 +5909,25 @@ resolveGameDesigns(cleanPlayers);
       if (data.auction) setAuction(data.auction);
       else setAuction(null); 
     });
+    socket.on('timer-start', (data: any) => {
+      if (!data || typeof data.endsAt !== 'number') return;
+      setTimerEndsAt(data.endsAt);
+      setTimerPaused(false);
+      const remaining = Math.max(0, Math.ceil((data.endsAt - Date.now()) / 1000));
+      setTimeLeft(remaining);
+      timeoutHandled.current = false;
+    });
+
+    socket.on('timer-pause', () => {
+      setTimerPaused(true);
+      setTimerEndsAt(0);
+    });
+
+    socket.on('timer-expired', (data: any) => {
+      if (!data || data.playerId !== (currentUser?.id || "you")) return;
+      setTimeLeft(0);
+      handleTimeoutRef.current(data.playerId);
+    });
 
     socket.on('vote-state', (data: any) => {
       if (!data || !data.targetId) return;
@@ -5919,27 +5943,29 @@ resolveGameDesigns(cleanPlayers);
 
     socket.on('vote-resolved', (data: any) => {
       setVote(null);
-      addLog(
+      addLogRef.current(
         `🗳 Голосование: ${data.yes}/${data.total} за исключение. ${data.targetName} ${data.kicked ? 'исключён' : 'оставлен'}.`,
       );
       if (data.kicked) {
         const idx = playersRef.current.findIndex(p => p.id === data.targetId);
         if (idx !== -1 && !playersRef.current[idx].bankrupt) {
-          bankruptPlayer(idx, 'решение стола');
+          bankruptPlayerRef.current(idx, 'решение стола');
         }
+      } else {
+        advanceTurnRef.current(turnRef.current, true);
       }
     });
 
     // ВСТАВИТЬ ЭТИ 4 БЛОКА СЮДА (после закрывающей скобки update-remote-state, но внутри useEffect):
     socket.on('player-left', (playerId) => {
       // Живой игрок вышел — награды не получает, помечаем leftAlive
-      handleVoluntaryLeave(playerId);
+      handleVoluntaryLeaveRef.current(playerId);
     });
 
     socket.on('game-ended', () => {
       if (rewardGivenRef.current) return; // уже наградили — не дублируем
       setGameOver(true);
-      window.setTimeout(finishGame, 200);
+      window.setTimeout(() => finishGameRef.current(), 200);
     });
 
     socket.on('trade-proposed-broadcast', (data) => {
@@ -5970,10 +5996,12 @@ resolveGameDesigns(cleanPlayers);
       socket.off('game-log-add-broadcast', handleGameLogBroadcast);
       socket.off('player-left'); // <--- ДОБАВИТЬ
       socket.off('game-ended');  // <--- ДОБАВИТЬ
-      socket.off('sync-timer-broadcast');
       socket.off('room-settings');
       socket.off('vote-state');
       socket.off('vote-resolved');
+      socket.off('timer-start');
+      socket.off('timer-pause');
+      socket.off('timer-expired');
       socket.off('trade-proposed-broadcast');
       socket.off('trade-resolved-broadcast');
     };
@@ -6040,6 +6068,8 @@ resolveGameDesigns(cleanPlayers);
   ]);
 
   const [timeLeft, setTimeLeft] = useState(45);
+  const [timerEndsAt, setTimerEndsAt] = useState<number>(0);
+  const [timerPaused, setTimerPaused] = useState(false);
 
   // Drawer с инфо о партии — на мобиле и планшете выезжает поверх доски.
   const [infoPanelOpen, setInfoPanelOpen] = useState(false);
@@ -6085,8 +6115,12 @@ resolveGameDesigns(cleanPlayers);
 
   // При открытии окна действия (покупка/аренда/налог/шанс) даём игроку свежие 45 секунд
   useEffect(() => {
-    if (pendingAction) {
-      setTimeLeft(modeConfig.turnDurationSec);
+    if (pendingAction && initialRoomId) {
+      socket.emit('timer-start', {
+        roomId: initialRoomId,
+        durationSec: modeConfig.turnDurationSec,
+        playerId: playersRef.current[turnRef.current]?.id,
+      });
       timeoutHandled.current = false;
     }
   }, [pendingAction]);
@@ -6466,26 +6500,34 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     // Если это дубль (1-й или 2-й), мы не переключаем ход, а даём бросать снова тому же игроку
     if (!forceNext && isDoubleRoll && doubleCountRef.current < 3) {
       setRolled(false);
-      setTimeLeft(modeConfig.turnDurationSec);
       setImprovedGroupsThisTurn([]);
       timeoutHandled.current = false;
+      if (initialRoomId) {
+        socket.emit('timer-start', {
+          roomId: initialRoomId,
+          durationSec: modeConfig.turnDurationSec,
+          playerId: playersRef.current[fromIdx]?.id,
+        });
+      }
       setMessage(`${playersRef.current[fromIdx].name}, дубль! Бросай кубики снова.`);
       return;
     }
     const next = nextAliveIndex(fromIdx);
     setTurn(next);
-    // ДОБАВЛЯЕМ ОТПРАВКУ НОВОГО ТАЙМЕРА ВСЕМ
-    if (initialRoomId) {
-      socket.emit('sync-timer', { roomId: initialRoomId, timeLeft: modeConfig.turnDurationSec });
-    }
     
     setRolled(false);
-    setTimeLeft(modeConfig.turnDurationSec);
     setImprovedGroupsThisTurn([]);
     setDoubleCount(0);
     doubleCountRef.current = 0;
     setIsDoubleRoll(false);
     timeoutHandled.current = false;
+    if (initialRoomId) {
+      socket.emit('timer-start', {
+        roomId: initialRoomId,
+        durationSec: modeConfig.turnDurationSec,
+        playerId: playersRef.current[next]?.id,
+      });
+    }
     setMessage(`${playersRef.current[next].name}, твой ход. Бросай кости.`);
   };
   
@@ -6570,7 +6612,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     socket.emit('vote-cast', { roomId: initialRoomId, voterId: myId, value });
   };
 
-  const handleTimeout = () => {
+  const handleTimeout = (expiredPlayerId?: string) => {
     if (timeoutHandled.current || auction || animPath || diceRolling) return;
     // Если ход уже сделан и окон не открыто — тайм-аут ни к чему
     if (rolled && !pendingAction) return;
@@ -6579,9 +6621,19 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     // Закрываем окно действия — игрок проигнорировал
     if (pendingAction) setPendingAction(null);
 
-    // Если за столом двое — голосовать не с кем, исключаем сразу
-    if (alive.length <= 2) {
-      bankruptPlayer(turn, "тайм-аут");
+    // Определяем игрока, которого наказываем. Приоритет — id из timer-expired,
+    // fallback — turn state. Это защищает от рассинхрона: у клиента turn
+    // мог не обновиться, а сервер знает точно, у кого истёк таймер.
+    const targetId = expiredPlayerId || playersRef.current[turnRef.current]?.id;
+    const targetIdx = playersRef.current.findIndex(p => p.id === targetId);
+    if (targetIdx === -1) return;
+    const target = playersRef.current[targetIdx];
+
+    // Голосовать не с кем только когда живой остался один.
+    // При 2 игроках — голосование всё равно запускается: один решает,
+    // оставить второго или исключить.
+    if (alive.length <= 1) {
+      bankruptPlayer(targetIdx, "тайм-аут");
       return;
     }
 
@@ -6589,35 +6641,32 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     if (!initialRoomId) return;
     socket.emit('vote-start', {
       roomId: initialRoomId,
-      targetId: player.id,
+      targetId,
       reason: 'истекло время ожидания хода',
       duration: settings.voteDuration,
     });
-    setMessage(`Время вышло. Голосование за ${player.name}.`);
+    setMessage(`Время вышло. Голосование за ${target?.name}.`);
   };
 
+  // Единый тикер: раз в секунду пересчитываем остаток от timerEndsAt.
+  // Это не «счётчик», а отображение серверного endsAt — поэтому
+  // в фоне Chrome может троттлить этот интервал, но при возврате
+  // во вкладку value сразу правильное (пересчёт от Date.now()).
   useEffect(() => {
-    if (
-      vote ||
-      gameOver ||
-      auction ||
-      animPath ||
-      diceRolling
-    )
-      return;
-    const id = window.setInterval(
-      () =>
-        setTimeLeft((old) => {
-          if (old <= 1) {
-            window.setTimeout(handleTimeout, 0);
-            return 0;
-          }
-          return old - 1;
-        }),
-      1000,
-    );
-    return () => window.clearInterval(id);
-  });
+    if (!timerEndsAt) return;
+    const recompute = () => {
+      const remaining = Math.max(0, Math.ceil((timerEndsAt - Date.now()) / 1000));
+      setTimeLeft(remaining);
+    };
+    recompute();
+    const id = window.setInterval(recompute, 1000);
+    const onVis = () => { if (!document.hidden) recompute(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [timerEndsAt]);
 
     useEffect(() => {
     if (!animPath || animStep >= animPath.length - 1) return;
@@ -7424,6 +7473,12 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
   // --- Roll mechanics ---
   const doRollAnimation = (d1: number, d2: number, onDone: () => void) => {
+    // Пока летят кубики и фишка идёт по клеткам — таймер у всех на паузе.
+    // Новый старт произойдёт: либо через useEffect(pendingAction),
+    // либо через advanceTurn в конце обработки.
+    if (initialRoomId) {
+      socket.emit('timer-pause', { roomId: initialRoomId });
+    }
     setTargetDice([d1, d2]);
     setDiceRolling(true); // Показываем оверлей
     setIsSpinning(true); // Запускаем вращение кубиков
@@ -7493,7 +7548,13 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           `❗ ${player.name} — попытки исчерпаны, дубль не выпал. Обязан выкупиться или продать/заложить имущество.`,
         );
         setMessage("Попытки исчерпаны. Оплатите 500 К или продайте/заложите имущество.");
-        setTimeLeft(modeConfig.turnDurationSec);
+        if (initialRoomId) {
+          socket.emit('timer-start', {
+            roomId: initialRoomId,
+            durationSec: modeConfig.turnDurationSec,
+            playerId: playerId,
+          });
+        }
       } else {
         // No double — stay in jail
         setPlayers((ps) =>
@@ -7561,7 +7622,13 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     } else {
       // Если просто выкупился до броска
       setRolled(false);
-      setTimeLeft(modeConfig.turnDurationSec);
+      if (initialRoomId) {
+        socket.emit('timer-start', {
+          roomId: initialRoomId,
+          durationSec: modeConfig.turnDurationSec,
+          playerId: playersRef.current[turnRef.current]?.id,
+        });
+      }
       setMessage("Выкупился! Теперь бросай кубики.");
     }
   };
@@ -7592,6 +7659,18 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       }
     }, 5000);
   };
+
+  // Актуализируем refs на функции каждый рендер. Так socket.on-обработчики,
+  // зарегистрированные один раз, всегда вызывают самую свежую версию функции
+  // с актуальным state (alive, players, turn и т.д.).
+  useEffect(() => {
+    handleTimeoutRef.current = handleTimeout;
+    bankruptPlayerRef.current = bankruptPlayer;
+    advanceTurnRef.current = advanceTurn;
+    finishGameRef.current = finishGame;
+    handleVoluntaryLeaveRef.current = handleVoluntaryLeave;
+    addLogRef.current = addLog;
+  });
 
   const cellGridPos = (index: number) => ({
     row:

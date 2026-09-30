@@ -2539,6 +2539,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     // Быстрая и Дуэль: аренда ×1.5, 1 попытка в тюрьме, бонусы Старта выше.
     socket.emit('room-settings', {
       mode: roomMode,
+      maxPlayers: gameRooms[roomId].maxPlayers || 2,
       turnDurationSec: getTurnDuration(roomMode),
       fastMode: fast,
       rentMultiplier: fast ? 1.5 : 1.0,

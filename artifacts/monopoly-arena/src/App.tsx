@@ -1256,6 +1256,14 @@ function Dashboard({
     // Обработчик запуска игры (теперь ВНУТРИ основного useEffect)
     socket.on('start-game', (roomData: LobbyRoom) => {
         console.log("Игра начинается для всех!", roomData);
+        // Сохраняем maxPlayers ДО того, как BoardGame смонтируется.
+        // Иначе заглушка «Ожидание игроков» покажет fallback 0/2,
+        // пока не придёт room-settings от сервера.
+        if (roomData?.maxPlayers) {
+          try {
+            localStorage.setItem("arena-lobby-maxPlayers", String(roomData.maxPlayers));
+          } catch {}
+        }
         onJoinGame(roomData.id);
     });
 
@@ -5730,6 +5738,7 @@ resolveGameDesigns(cleanPlayers);
       if (!data) return;
       setModeConfig({
         mode: data.mode || "Классический",
+        maxPlayers: Number(data.maxPlayers) || 2,
         turnDurationSec: Number(data.turnDurationSec) || 45,
         fastMode: !!data.fastMode,
         rentMultiplier: Number(data.rentMultiplier) || 1.0,
@@ -6097,20 +6106,32 @@ resolveGameDesigns(cleanPlayers);
   // Быстрая/Дуэль: аренда ×1.5, 1 попытка, +3000 за проход Старта, +4500 за клетку.
   const [modeConfig, setModeConfig] = useState<{
     mode: string;
+    maxPlayers: number;
     turnDurationSec: number;
     fastMode: boolean;
     rentMultiplier: number;
     jailAttempts: number;
     passStartBonus: number;
     landStartBonus: number;
-  }>({
-    mode: "Классический",
-    turnDurationSec: 45,
-    fastMode: false,
-    rentMultiplier: 1.0,
-    jailAttempts: 3,
-    passStartBonus: 2000,
-    landStartBonus: 3000,
+  }>(() => {
+    // Fallback из localStorage — если room-settings ещё не пришли.
+    // При создании лобби host сохраняет туда maxPlayers, при join
+    // может быть пусто — тогда 2.
+    let saved = 2;
+    try {
+      const v = parseInt(localStorage.getItem("arena-lobby-maxPlayers") || "2", 10);
+      if (v >= 2 && v <= 5) saved = v;
+    } catch {}
+    return {
+      mode: "Классический",
+      maxPlayers: saved,
+      turnDurationSec: 45,
+      fastMode: false,
+      rentMultiplier: 1.0,
+      jailAttempts: 3,
+      passStartBonus: 2000,
+      landStartBonus: 3000,
+    };
   });
 
   // При открытии окна действия (покупка/аренда/налог/шанс) даём игроку свежие 45 секунд
@@ -6599,7 +6620,27 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     const remainingAlive = allPlayers.filter((p, i) => i !== idx && !p.bankrupt);
     if (remainingAlive.length <= 1) {
       setGameOver(true);
-      window.setTimeout(finishGame, 300);
+      window.setTimeout(() => finishGameRef.current(), 300);
+      return;
+    }
+
+    // Игра продолжается. Нужно понять: вышел активный игрок или наблюдатель.
+    if (turnRef.current === idx) {
+      // Вышел тот, чей ход — передаём ход следующему, форсированно.
+      // advanceTurn сам запустит timer-start на нового игрока.
+      advanceTurnRef.current(idx, true);
+    } else if (initialRoomId) {
+      // Ход у другого — просто перезапускаем таймер на текущего активного,
+      // чтобы не висел старый отсчёт (он мог быть запущен для вышедшего).
+      const activeIdx = turnRef.current;
+      const activeId = playersRef.current[activeIdx]?.id;
+      if (activeId) {
+        socket.emit('timer-start', {
+          roomId: initialRoomId,
+          durationSec: modeConfig.turnDurationSec,
+          playerId: activeId,
+        });
+      }
     }
   };
 
@@ -7787,7 +7828,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       return (
         <div className="flex h-screen w-screen flex-col gap-3 items-center justify-center bg-[#1c1828] text-xl text-white font-sans">
           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-[#ff5a00]"></div>
-          <div>Ожидание подключения игроков ({players?.length || 0}/2)...</div>
+          <div>Ожидание подключения игроков ({players?.length || 0}/{modeConfig.maxPlayers})...</div>
           <div className="text-xs text-muted-foreground bg-white/5 px-3 py-1.5 rounded-lg font-mono">
             Код комнаты: #{initialRoomId?.replace('#', '')}
           </div>

@@ -873,6 +873,48 @@ function isFastMode(mode) {
   return mode === "Быстрая" || mode === "Дуэль";
 }
 
+// ============ ИГРОВОЙ ТАЙМЕР (серверный, единый источник истины) ============
+// roomId -> { timeoutId, endsAt, playerId }
+// Клиент шлёт timer-start, сервер рассылает всем абсолютное endsAt,
+// каждый клиент считает остаток = endsAt - Date.now(). Это исключает
+// рассинхрон между вкладками и троттлинг setInterval в фоне.
+const turnTimers = new Map();
+
+function clearTurnTimer(roomId) {
+  const t = turnTimers.get(roomId);
+  if (t && t.timeoutId) clearTimeout(t.timeoutId);
+  turnTimers.delete(roomId);
+}
+
+function startTurnTimer(roomId, durationSec, playerId) {
+  if (!roomId || !gameRooms[roomId]) return;
+  clearTurnTimer(roomId);
+  const dur = Math.max(1, Math.min(300, Number(durationSec) || TURN_DURATION_CLASSIC));
+  const endsAt = Date.now() + dur * 1000;
+  roomTurnStart[roomId] = Date.now();
+
+  const timeoutId = setTimeout(() => {
+    // Сервер сам фиксирует истечение и рассылает всем единое событие.
+    const t = turnTimers.get(roomId);
+    if (!t || t.endsAt !== endsAt) return; // таймер уже перезапущен
+    turnTimers.delete(roomId);
+    const room = gameRooms[roomId];
+    if (!room) return;
+    const p = room.find(x => x.id === playerId);
+    console.log(`⏰ Таймер ${roomId} истёк у ${p?.name || playerId}`);
+    io.to(roomId).emit('timer-expired', { roomId, playerId });
+  }, dur * 1000);
+
+  turnTimers.set(roomId, { timeoutId, endsAt, playerId });
+  io.to(roomId).emit('timer-start', { roomId, endsAt, durationSec: dur, playerId });
+}
+
+function pauseTurnTimer(roomId) {
+  if (!roomId || !gameRooms[roomId]) return;
+  clearTurnTimer(roomId);
+  io.to(roomId).emit('timer-pause', { roomId });
+}
+
 // Уникальный токен, генерируется при каждом запуске сервера.
 // Клиенты используют его, чтобы понять, что сервер перезапустился.
 const SERVER_START_TOKEN = Date.now().toString() + '-' + Math.random().toString(36).slice(2, 10);
@@ -2304,6 +2346,11 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       targetName,
       yes, total, kicked,
     });
+
+    // После голосования клиенты сами сделают advanceTurn и пришлют
+    // timer-start. Но на случай гонки — снимаем старый таймер,
+    // чтобы он не «выстрелил» в момент перехода хода.
+    clearTurnTimer(roomId);
   }
 
   socket.on('vote-start', ({ roomId, targetId, reason, duration }) => {
@@ -2326,6 +2373,10 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       votes: {},
       endsAt: room.vote.endsAt,
     });
+
+    // Ход перекрыт голосованием — игровой таймер снимаем.
+    // Новый запустится только после vote-resolved, когда ход перейдёт.
+    clearTurnTimer(roomId);
 
     if (room.voteTimer) clearTimeout(room.voteTimer);
     room.voteTimer = setTimeout(() => resolveVote(roomId), dur * 1000);
@@ -2538,12 +2589,17 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
 
     io.to(roomId).emit('update-game-players', gameRooms[roomId]);
 
-    // Отдаём переподключившемуся игроку актуальный остаток таймера хода
-    if (roomTurnStart[roomId]) {
-      const duration = getTurnDuration(roomMode);
-      const elapsed = Math.floor((Date.now() - roomTurnStart[roomId]) / 1000);
-      const remaining = Math.max(0, duration - elapsed);
-      socket.emit('sync-timer-broadcast', remaining);
+    // Отдаём переподключившемуся игроку актуальный остаток таймера.
+    // Берём из серверного хранилища — там точный endsAt, а не расчёт от старта.
+    const t = turnTimers.get(roomId);
+    if (t) {
+      const remaining = Math.max(0, Math.ceil((t.endsAt - Date.now()) / 1000));
+      socket.emit('timer-start', {
+        roomId,
+        endsAt: t.endsAt,
+        durationSec: remaining,
+        playerId: t.playerId,
+      });
       console.log(`⏱ ${playerData.name} получил остаток таймера: ${remaining}s`);
     }
   });
@@ -2590,6 +2646,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       delete gameRooms[roomId];
       delete roomTurnStart[roomId];
       delete roomMeta[roomId];
+      clearTurnTimer(roomId);
     }
     console.log(`Лобби ${roomId} удалено хостом`);
   });
@@ -2610,11 +2667,28 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     socket.on('trade-resolved', ({ roomId, initiatorId }) => {
     socket.to(roomId).emit('trade-resolved-broadcast', { initiatorId });
   });
-  // Событие синхронизации таймера (отправляется всем в комнате, кроме отправителя)
-  socket.on('sync-timer', (data) => {
-    // Запоминаем момент старта текущего хода — пригодится при реконнекте
-    roomTurnStart[data.roomId] = Date.now();
-    socket.to(data.roomId).emit('sync-timer-broadcast', data.timeLeft);
+  // Клиент просит запустить таймер на новое ожидаемое действие.
+  // Событие шлёт один клиент (тот, кто инициировал переход), сервер
+  // рассылает абсолютное endsAt ВСЕМ, включая инициатора — так рассинхрон
+  // в миллисекундах минимален.
+  socket.on('timer-start', ({ roomId, durationSec, playerId }) => {
+    if (!roomId || !gameRooms[roomId]) return;
+    startTurnTimer(roomId, durationSec, playerId);
+  });
+
+  // Клиент просит поставить таймер на паузу (анимация броска, движение фишки).
+  // Сервер отменяет setTimeout и рассылает timer-pause всем.
+  socket.on('timer-pause', ({ roomId }) => {
+    if (!roomId || !gameRooms[roomId]) return;
+    pauseTurnTimer(roomId);
+  });
+
+  // Переподключившийся клиент запрашивает актуальный остаток.
+  socket.on('get-current-timer', ({ roomId }, callback) => {
+    const t = turnTimers.get(roomId);
+    if (!t) return callback?.({ active: false });
+    const remaining = Math.max(0, Math.ceil((t.endsAt - Date.now()) / 1000));
+    callback?.({ active: true, endsAt: t.endsAt, remaining, playerId: t.playerId });
   });
 
   socket.on('leave-game', async (data) => {
@@ -2672,6 +2746,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
         delete gameRooms[roomId];
         delete roomTurnStart[roomId];
         delete roomMeta[roomId];
+        clearTurnTimer(roomId);
         console.log(`🗑 Комната ${roomId} удалена после завершения игры`);
       }, 8000);
     }
@@ -3045,6 +3120,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
           setTimeout(() => {
             delete gameRooms[roomId];
             delete roomMeta[roomId];
+            clearTurnTimer(roomId);
             console.log(`🗑 Комната ${roomId} удалена после авто-банкрота`);
           }, 8000);
         }

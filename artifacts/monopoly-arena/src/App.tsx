@@ -13207,6 +13207,41 @@ useEffect(() => {
         gameTriggerRef.current = null;
     }
 }, [currentRoomId]);
+  // Автосжатие старого аватара. Если в БД лежит большая base64-картинка
+  // (> 20 KB, что ≈ 15 KB бинарника) — один раз за сессию пережимаем
+  // до 256×256 и отправляем update-avatar. Защита от цикла — ref.
+  const avatarCompressedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!player?.id || !player.avatar) return;
+    if (player.avatar.length < 20000) return;
+    if (avatarCompressedRef.current === player.id) return;
+    avatarCompressedRef.current = player.id;
+
+    (async () => {
+      try {
+        const compressed = await compressBase64Url(player.avatar!, 256, 256, 60000);
+        if (compressed.length < player.avatar!.length - 1000) {
+          socket.emit('update-avatar', { userId: player.id, avatar: compressed }, (res: any) => {
+            if (res?.success) {
+              try {
+                const raw = localStorage.getItem("arena-session-user");
+                if (raw && raw !== "null") {
+                  const u = JSON.parse(raw);
+                  u.avatar = compressed;
+                  localStorage.setItem("arena-session-user", JSON.stringify(u));
+                  window.dispatchEvent(new Event("arena-user-updated"));
+                }
+              } catch {}
+              console.log(`♻️ Аватар ${player.id} сжат: ${player.avatar!.length} → ${compressed.length}`);
+            }
+          });
+        }
+      } catch (err) {
+        console.error("Ошибка автосжатия аватара:", err);
+      }
+    })();
+  }, [player?.id, player?.avatar]);
+
 
 // Счётчик минут онлайн: +1 каждые 60 секунд, пока игрок авторизован
 useEffect(() => {

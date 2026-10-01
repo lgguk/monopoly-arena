@@ -7257,6 +7257,14 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         : diceCount === 2
           ? settings.jackpotBet2
           : settings.jackpotBet3;
+
+    // Защита: даже если игрок как-то пробрался к вызову с недостатком
+    // денег — не списываем в минус, не платим приз. Откатываем.
+    if (player.money < entryFee) {
+      addLog(`❌ ${player.name} — недостаточно средств для ставки ${entryFee} К.`);
+      advanceTurn();
+      return;
+    }
     const prize =
       diceCount === 1
         ? settings.jackpotWin1
@@ -9047,16 +9055,22 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                         : settings.jackpotWin3;
                                   const chance =
                                     dc === 1 ? "1/6" : dc === 2 ? "2/6" : "3/6";
+                                  const canAfford = player.money >= fee;
                                   return (
                                     <button
                                       key={dc}
-                                      onClick={() =>
+                                      onClick={() => {
+                                        if (!canAfford) {
+                                          addLog(`❌ ${player.name} — недостаточно средств для ставки ${fee} К (есть ${player.money.toLocaleString("ru-RU")} К).`);
+                                          return;
+                                        }
                                         setPendingAction({
                                           ...a,
                                           diceCount: dc,
-                                        })
-                                      }
-                                      className="rounded-lg bg-white/15 px-1 py-2 text-center hover:bg-[#e7ba68]/30 transition-colors"
+                                        });
+                                      }}
+                                      disabled={!canAfford}
+                                      className={`rounded-lg px-1 py-2 text-center transition-colors ${canAfford ? "bg-white/15 hover:bg-[#e7ba68]/30" : "bg-white/5 opacity-40 cursor-not-allowed"}`}
                                     >
                                       <div className="text-[16px]">
                                         {"🎲".repeat(dc)}

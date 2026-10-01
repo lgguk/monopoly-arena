@@ -338,6 +338,40 @@ const RENT_MULTIPLIERS = [1, 6, 12, 17, 27, 42];
 // Таймер в аукционе — фиксированный 30 сек для всех режимов.
 // Аукцион проходит быстрее, чем обычный ход, даже в классике.
 const AUCTION_TIMER_SEC = 30;
+// Короткий «динь» при наступлении хода. Web Audio API — без файлов,
+// без интернета. Громкость 0.35 (35%), два тона (880 + 1320 Гц) с
+// быстрым затуханием. AudioContext создаётся один раз и переиспользуется.
+let audioCtxRef: AudioContext | null = null;
+function playTurnSound() {
+  try {
+    if (!audioCtxRef) {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!Ctx) return;
+      audioCtxRef = new Ctx();
+    }
+    const ctx = audioCtxRef;
+    if (ctx.state === "suspended") ctx.resume();
+    const now = ctx.currentTime;
+    const tones = [
+      { freq: 880, start: 0, dur: 0.12 },
+      { freq: 1320, start: 0.08, dur: 0.18 },
+    ];
+    tones.forEach(({ freq, start, dur }) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, now + start);
+      gain.gain.exponentialRampToValueAtTime(0.35, now + start + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now + start);
+      osc.stop(now + start + dur + 0.02);
+    });
+  } catch {}
+}
+
 
 // Суммарные активы игрока: деньги + стоимость всех его полей +
 // стоимость улучшений (по цене постройки). Используется в окне
@@ -5682,6 +5716,7 @@ const timeLeftRef = useRef(45);
   } | null>(null);
   const pendingJailMovementRef = useRef<{ d1: number; d2: number; capturedTurn: number } | null>(null);
   const [turn, setTurn] = useState(0);
+  const [turnFlash, setTurnFlash] = useState(false);
   const [mortgages, setMortgages] = useState<Record<number, number>>({});
   const [globalTurnCounter, setGlobalTurnCounter] = useState(0);
   const getRent = (cellIdx: number, impr: Record<number, number>) => {
@@ -6354,6 +6389,26 @@ resolveGameDesigns(cleanPlayers);
   const [gameOver, setGameOver] = useState(false);
   const [reward, setReward] = useState<string | null>(null);
   useEffect(() => { turnRef.current = turn; }, [turn]);
+
+  // Уведомление о наступлении хода: подсветка панели + звук.
+  // Не срабатывает на первый рендер (prevTurn === null).
+  const prevTurnForNotifRef = useRef<number | null>(null);
+  useEffect(() => {
+    const prev = prevTurnForNotifRef.current;
+    prevTurnForNotifRef.current = turn;
+    if (prev === null) return;
+    if (prev === turn) return;
+    if (!initialRoomId) return;
+    if (gameOverRef.current) return;
+    const currentPlayerId = playersRef.current[turn]?.id;
+    if (!currentPlayerId) return;
+    if (currentPlayerId !== (currentUser?.id || "you")) return;
+
+    playTurnSound();
+    setTurnFlash(true);
+    const t = window.setTimeout(() => setTurnFlash(false), 800);
+    return () => window.clearTimeout(t);
+  }, [turn]);
   useEffect(() => { ownersRef.current = owners; }, [owners]);
   useEffect(() => { improvementsRef.current = improvements; }, [improvements]);
   useEffect(() => { mortgagesRef.current = mortgages; }, [mortgages]);
@@ -9870,7 +9925,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
         {/* Right control panel */}
 <div className="flex h-full w-[140px] shrink-0 flex-col gap-1.5 overflow-y-auto p-1 lg:w-[255px] lg:gap-2 lg:p-1.5">
-          <div className="rounded-2xl border border-card-border bg-card p-2 lg:p-3">
+          <div className={`rounded-2xl border bg-card p-2 lg:p-3 transition-all duration-300 ${turnFlash ? "border-red-500 ring-2 ring-red-500 shadow-[0_0_20px_rgba(239,68,68,0.6)]" : "border-card-border"}`}>
             <div className="flex items-center justify-between">
               <div>
                 <div className="font-mono text-[8px] uppercase tracking-[.15em] text-primary">

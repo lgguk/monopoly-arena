@@ -5647,8 +5647,13 @@ const timeLeftRef = useRef(45);
   const finishGameRef = useRef<() => void>(() => {});
   const handleVoluntaryLeaveRef = useRef<(playerId: string) => void>(() => {});
   const addLogRef = useRef<(entry: string, type?: "default" | "special") => void>(() => {});
-const auctionRef = useRef<AuctionState | null>(null);
-const pendingJailMovementRef = useRef<{ d1: number; d2: number; capturedTurn: number } | null>(null);
+  const auctionRef = useRef<AuctionState | null>(null);
+  const pendingActionRef = useRef<PendingAction | null>(null);
+  const pendingTradeRef = useRef<{
+    initiatorId: string;
+    trade: TradeState;
+  } | null>(null);
+  const pendingJailMovementRef = useRef<{ d1: number; d2: number; capturedTurn: number } | null>(null);
   const [turn, setTurn] = useState(0);
   const [mortgages, setMortgages] = useState<Record<number, number>>({});
   const [globalTurnCounter, setGlobalTurnCounter] = useState(0);
@@ -5931,6 +5936,7 @@ resolveGameDesigns(cleanPlayers);
           doubleCountRef.current = 0;
           setDoubleCount(0);
           setIsDoubleRoll(false);
+          isDoubleRollRef.current = false;
           const cur = playersRef.current[activePlayerIdx];
           if (cur) {
             addLog(`🚔 ${cur.name} — третий дубль подряд, отправляется в тюрьму!`);
@@ -5976,6 +5982,7 @@ resolveGameDesigns(cleanPlayers);
             );
             setRolled(true);
             setIsDoubleRoll(isDoubles);
+            isDoubleRollRef.current = isDoubles;
             processLanding(finalPos, oldPos, activePlayerIdx);
           };
         } else {
@@ -6308,6 +6315,8 @@ resolveGameDesigns(cleanPlayers);
   useEffect(() => { gameOverRef.current = gameOver; }, [gameOver]);
   useEffect(() => { rewardRef.current = reward; }, [reward]);
   useEffect(() => { auctionRef.current = auction; }, [auction]);
+  useEffect(() => { pendingActionRef.current = pendingAction; }, [pendingAction]);
+  useEffect(() => { pendingTradeRef.current = pendingTrade; }, [pendingTrade]);
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState<
     { from: string; text: string; timestamp: number }[]
@@ -6624,7 +6633,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     }
 
     // Если это дубль (1-й или 2-й), мы не переключаем ход, а даём бросать снова тому же игроку
-    if (!forceNext && isDoubleRoll && doubleCountRef.current < 3) {
+    if (!forceNext && isDoubleRollRef.current && doubleCountRef.current < 3) {
       setRolled(false);
       setImprovedGroupsThisTurn([]);
       timeoutHandled.current = false;
@@ -6638,6 +6647,11 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       setMessage(`${playersRef.current[fromIdx].name}, дубль! Бросай кубики снова.`);
       return;
     }
+    // Ход точно переходит — сбрасываем незавершённые состояния,
+    // которые могли остаться от предыдущего хода (полоска договора).
+    setPendingTrade(null);
+    setTradeInitiator(null);
+
     const next = nextAliveIndex(fromIdx);
     setTurn(next);
     
@@ -6646,6 +6660,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     setDoubleCount(0);
     doubleCountRef.current = 0;
     setIsDoubleRoll(false);
+    isDoubleRollRef.current = false;
     timeoutHandled.current = false;
     if (initialRoomId) {
       socket.emit('timer-start', {
@@ -7228,7 +7243,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     if (!pendingAction || pendingAction.type !== "buy") return;
     const { cellIndex, price } = pendingAction;
     setPendingAction(null);
-    const startPrice = Math.max(100, Math.round((price * 0.5) / 100) * 100);
+    const startPrice = Math.max(100, Math.round(price / 100) * 100);
 
     // 1. Определяем следующего по порядку хода живого игрока (после текущего)
     const firstIdx = nextAliveIndex(turn);
@@ -7847,20 +7862,13 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     if (!initialRoomId) return;
   if (isRemoteUpdate.current) return;
   if (!playersRef.current || playersRef.current.length === 0) return;
-  // Suppression window: не отправляем снапшот, если только что применили чужой.
-  // Иначе получаем эхо-петлю A→B→A→B и откаты хода на 3+ игроках.
-  if (Date.now() - remoteAppliedAtRef.current < 250) return;
-  // Не отправляем пустой снапшот от только что вошедшего игрока —
-  // он ещё не получил актуальный стейт и своими пустыми owners/turn
-  // обнулит всё у остальных.
-  if (
-    Object.keys(ownersRef.current).length === 0 &&
-    turnRef.current === 0 &&
-    globalTurnCounterRef.current === 0
-  ) return;
-  // Suppression window: не отправляем снапшот, если только что применили чужой.
-  // Иначе получаем эхо-петлю: A→B→A→B и откаты хода на 3+ игроках.
-  if (Date.now() - remoteAppliedAtRef.current < 250) return;
+  // Suppression window: не отправляем снапшот, если только что применили
+  // чужой — иначе эхо-петля A→B→A→B и откаты хода.
+  // НО: если у нас критичное состояние (аукцион / окно действия / трейд),
+  // suppression НЕ применяем — иначе быстрые действия сразу после
+  // получения чужого снапшота не долетят до других игроков.
+  const hasCriticalState = !!auctionRef.current || !!pendingActionRef.current || !!pendingTradeRef.current;
+  if (!hasCriticalState && Date.now() - remoteAppliedAtRef.current < 250) return;
     // ВАЖНО: Отправляем состояние всегда, когда оно меняется!
     const syncPayload = {
         roomId: initialRoomId,

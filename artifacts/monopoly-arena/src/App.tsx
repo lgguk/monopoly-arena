@@ -335,6 +335,10 @@ type AuctionState = {
 
 const RENT_MULTIPLIERS = [1, 6, 12, 17, 27, 42];
 
+// Таймер в аукционе — фиксированный 30 сек для всех режимов.
+// Аукцион проходит быстрее, чем обычный ход, даже в классике.
+const AUCTION_TIMER_SEC = 30;
+
 // Награды по местам (1-е место максимальное, далее по убыванию).
 // Coins низкие — основной доход игрока идёт с квестов (~500/нед).
 // XP — прогресс уровня, не валюта. VIP: ×2 XP, +20% Coins.
@@ -5647,6 +5651,7 @@ const timeLeftRef = useRef(45);
   const finishGameRef = useRef<() => void>(() => {});
   const handleVoluntaryLeaveRef = useRef<(playerId: string) => void>(() => {});
   const addLogRef = useRef<(entry: string, type?: "default" | "special") => void>(() => {});
+  const auctionDeclineRef = useRef<() => void>(() => {});
   const auctionRef = useRef<AuctionState | null>(null);
   const pendingActionRef = useRef<PendingAction | null>(null);
   const pendingTradeRef = useRef<{
@@ -6774,7 +6779,19 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
   };
 
   const handleTimeout = (expiredPlayerId?: string) => {
-    if (timeoutHandled.current || auction || animPath || diceRolling) return;
+    if (timeoutHandled.current || animPath || diceRolling) return;
+
+    // Если идёт аукцион — не банкротим и не голосуем.
+    // Просто авто-отказ от текущего участника аукциона
+    // (это должен быть именно он — timer-start идёт на него одного).
+    if (auction) {
+      const currentBidderId = auction.participants[auction.currentIdx];
+      if (currentBidderId === (currentUser?.id || "you")) {
+        timeoutHandled.current = true;
+        auctionDeclineRef.current();
+      }
+      return;
+    }
     // Если ход уже сделан и окон не открыто — тайм-аут ни к чему
     if (rolled && !pendingAction) return;
     timeoutHandled.current = true;
@@ -7284,6 +7301,15 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       `🔨 ${player.name} выставил на аукцион «${getCell(cellIndex).name}». Старт: ${startPrice.toLocaleString("ru-RU")} К`,
     );
     addLog(`🔨 ${player.name} отказался от участия в аукционе`);
+
+    // Таймер на первого участника аукциона.
+    if (initialRoomId && rawParticipants.length > 0) {
+      socket.emit('timer-start', {
+        roomId: initialRoomId,
+        durationSec: AUCTION_TIMER_SEC,
+        playerId: rawParticipants[0],
+      });
+    }
   };
 
     const auctionRaise = () => {
@@ -7330,6 +7356,15 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       currentIdx: nextIdx,
       highBidder: bidderId,
     });
+
+    // Таймер на следующего участника аукциона.
+    if (initialRoomId) {
+      socket.emit('timer-start', {
+        roomId: initialRoomId,
+        durationSec: AUCTION_TIMER_SEC,
+        playerId: auction.participants[nextIdx],
+      });
+    }
   };
 
       const auctionDecline = () => {
@@ -7393,9 +7428,15 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         ...auction,
         participants: newParticipants,
         currentIdx: 0,
-        // Если отказался лидер — highBidder больше неактуален.
         highBidder: wasHighBidder ? null : auction.highBidder,
       });
+      if (initialRoomId) {
+        socket.emit('timer-start', {
+          roomId: initialRoomId,
+          durationSec: AUCTION_TIMER_SEC,
+          playerId: newParticipants[0],
+        });
+      }
       return;
     }
 
@@ -7407,6 +7448,13 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       currentIdx: nextIdx,
       highBidder: wasHighBidder ? null : auction.highBidder,
     });
+    if (initialRoomId) {
+      socket.emit('timer-start', {
+        roomId: initialRoomId,
+        durationSec: AUCTION_TIMER_SEC,
+        playerId: newParticipants[nextIdx],
+      });
+    }
   };
 
   const improveProperty = (cellIdx: number) => {
@@ -7833,6 +7881,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     finishGameRef.current = finishGame;
     handleVoluntaryLeaveRef.current = handleVoluntaryLeave;
     addLogRef.current = addLog;
+    auctionDeclineRef.current = auctionDecline;
   });
 
   const cellGridPos = (index: number) => ({

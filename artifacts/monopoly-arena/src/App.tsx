@@ -5688,7 +5688,31 @@ const timeLeftRef = useRef(45);
   if (mortgages[cellIdx] !== undefined && mortgages[cellIdx] > globalTurnCounter) return 0;
   // Базовая рента = 10% от стоимости поля
   const basePrice = getCell(cellIdx).price ?? 0;
-  const rent = basePrice * 0.1 * RENT_MULTIPLIERS[Math.min(impr[cellIdx] ?? 0, 5)] * modeConfig.rentMultiplier;
+  let multiplier = RENT_MULTIPLIERS[Math.min(impr[cellIdx] ?? 0, 5)];
+
+  // Монополия: если владелец поля владеет всей группой этой категории,
+  // рента удваивается (аналог автоматического улучшения в других играх).
+  // Берём owners из ref — функция вызывается и после анимации, где state
+  // owners может быть устаревшим.
+  // Монополия ×2 работает ТОЛЬКО на уровне 0 (без филиалов).
+  // Как только появился первый филиал — обычная формула по уровню,
+  // без бонуса монополии.
+  const currentLevel = impr[cellIdx] ?? 0;
+  if (currentLevel === 0) {
+    const ownersNow = ownersRef.current;
+    const ownerId = ownersNow[cellIdx];
+    if (ownerId) {
+      const group = getCellGroup(cellIdx);
+      if (group && group.cells.length > 0) {
+        const allOwned = (group.cells as readonly number[]).every(
+          (ci) => ownersNow[ci] === ownerId,
+        );
+        if (allOwned) multiplier *= 2;
+      }
+    }
+  }
+
+  const rent = basePrice * 0.1 * multiplier * modeConfig.rentMultiplier;
   return Math.round(rent / 10) * 10;
 };
 

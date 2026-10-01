@@ -10179,18 +10179,12 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   {
                     icon: "🚩",
                     label: "Репорт",
+                    hidden: tp.id === (currentUser?.id || "you"),
                     action: () => {
                       setPlayerHover(null);
                       addLog(
                         `🚩 Жалоба на ${tp.name} отправлена администратору.`,
                       );
-                    },
-                  },
-                  {
-                    icon: "👤",
-                    label: "Профиль",
-                    action: () => {
-                      setPlayerHover(null);
                     },
                   },
                   {

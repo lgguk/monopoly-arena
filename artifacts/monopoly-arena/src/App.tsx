@@ -339,6 +339,28 @@ const RENT_MULTIPLIERS = [1, 6, 12, 17, 27, 42];
 // Аукцион проходит быстрее, чем обычный ход, даже в классике.
 const AUCTION_TIMER_SEC = 30;
 
+// Суммарные активы игрока: деньги + стоимость всех его полей +
+// стоимость улучшений (по цене постройки). Используется в окне
+// «не хватает средств», чтобы показать игроку % потери.
+const getPlayerTotalAssets = (
+  playerId: string,
+  players: Player[],
+  owners: Record<number, string>,
+  improvements: Record<number, number>,
+): number => {
+  const p = players.find((x) => x.id === playerId);
+  if (!p) return 0;
+  let assets = p.money;
+  Object.entries(owners).forEach(([ci, oid]) => {
+    if (oid !== playerId) return;
+    const cellIdx = Number(ci);
+    assets += getCell(cellIdx).price ?? 0;
+    const lvl = improvements[cellIdx] ?? 0;
+    if (lvl > 0) assets += lvl * getImproveCost(cellIdx);
+  });
+  return assets;
+};
+
 // Награды по местам (1-е место максимальное, далее по убыванию).
 // Coins низкие — основной доход игрока идёт с квестов (~500/нед).
 // XP — прогресс уровня, не валюта. VIP: ×2 XP, +20% Coins.
@@ -6030,8 +6052,6 @@ resolveGameDesigns(cleanPlayers);
       setRolled(data.rolled ?? false); 
       setIsDoubleRoll(data.isDoubleRoll ?? false); 
       
-      if (data.gameOver) setGameOver(true);
-      if (data.reward) setReward(data.reward);
       if (data.auction) setAuction(data.auction);
       else setAuction(null); 
     });
@@ -6796,8 +6816,25 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     if (rolled && !pendingAction) return;
     timeoutHandled.current = true;
 
+    // Обязательный платёж (аренда / налог / шанс-потеря) — если не заплатил,
+    // это не «свободный ход», тут решение стола не нужно. Сразу банкрот.
+    const wasObligatoryPayment =
+      pendingAction &&
+      (pendingAction.type === "rent" ||
+       pendingAction.type === "tax" ||
+       (pendingAction.type === "chance" && !pendingAction.gain));
+
     // Закрываем окно действия — игрок проигнорировал
     if (pendingAction) setPendingAction(null);
+
+    if (wasObligatoryPayment) {
+      const targetId2 = expiredPlayerId || playersRef.current[turnRef.current]?.id;
+      const targetIdx2 = playersRef.current.findIndex(p => p.id === targetId2);
+      if (targetIdx2 !== -1) {
+        bankruptPlayer(targetIdx2, "не оплатил обязательный платёж");
+        return;
+      }
+    }
 
     // Определяем игрока, которого наказываем. Приоритет — id из timer-expired,
     // fallback — turn state. Это защищает от рассинхрона: у клиента turn
@@ -7148,6 +7185,10 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     if (!player) return;
     switch (a.type) {
       case "rent":
+        if (player.money < a.amount) {
+          addLog("❌ Недостаточно средств для оплаты аренды.");
+          return;
+        }
         setPlayers((ps) =>
           ps.map((p) => {
             if (p.id === player.id)
@@ -7162,6 +7203,10 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         advanceTurn();
         break;
       case "tax":
+        if (player.money < a.amount) {
+          addLog("❌ Недостаточно средств для оплаты налога.");
+          return;
+        }
         setPlayers((ps) =>
           ps.map((p, i) =>
             i === turn ? { ...p, money: Math.max(0, p.money - a.amount) } : p,
@@ -7218,6 +7263,44 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       }
     }
   };
+    // Добровольная сдача при обязательном платеже. Остаток баланса
+  // перечисляется получателю: владельцу поля при аренде, в джекпот
+  // при налоге и шансе-потере. Затем игрок банкротится.
+  const surrenderPayment = () => {
+    if (!pendingAction || !player) return;
+    const a = pendingAction;
+    const myIdx = playersRef.current.findIndex(p => p.id === player.id);
+    if (myIdx === -1) return;
+    const myMoney = playersRef.current[myIdx].money;
+
+    // Обновляем playersRef синхронно, чтобы bankruptPlayer увидел
+    // актуальные балансы (иначе его inner setPlayers затрёт нашу правку).
+    const newPlayers = playersRef.current.map(p => {
+      if (p.id === player.id) return { ...p, money: 0 };
+      if (a.type === "rent" && p.id === a.ownerId) {
+        return { ...p, money: p.money + myMoney };
+      }
+      return p;
+    });
+    playersRef.current = newPlayers;
+    setPlayers(newPlayers);
+
+    if (a.type === "tax" || (a.type === "chance" && !a.gain)) {
+      setJackpot(j => j + myMoney);
+    }
+
+    if (a.type === "rent" && myMoney > 0) {
+      addLog(`💸 ${player.name} сдался. Остаток ${myMoney.toLocaleString("ru-RU")} К → ${a.ownerName}`);
+    } else if (myMoney > 0) {
+      addLog(`💸 ${player.name} сдался. Остаток ${myMoney.toLocaleString("ru-RU")} К → в джекпот`);
+    } else {
+      addLog(`💸 ${player.name} сдался.`);
+    }
+
+    setPendingAction(null);
+    bankruptPlayer(myIdx, "добровольная сдача");
+  };
+
 
     const buyProperty = () => {
     if (!pendingAction || pendingAction.type !== "buy") return;
@@ -7945,8 +8028,6 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         globalTurnCounter: globalTurnCounterRef.current,
         jackpot: jackpotRef.current,
         mortgages: mortgagesRef.current,
-        gameOver: gameOverRef.current,
-        reward: rewardRef.current,
         auction: auctionRef.current,
         rolled: rolledRef.current,
         isDoubleRoll: isDoubleRollRef.current,
@@ -8646,6 +8727,14 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   {pendingAction?.type === "rent" &&
                     (() => {
                       const a = pendingAction as RentA;
+                      const canAfford = player.money >= a.amount;
+                      const shortfall = Math.max(0, a.amount - player.money);
+                      const totalAssets = getPlayerTotalAssets(
+                        player.id, players, owners, improvements,
+                      );
+                      const percentLoss = totalAssets > 0
+                        ? Math.min(100, Math.round((shortfall / totalAssets) * 100))
+                        : 100;
                       return (
                         <>
                           <div className="text-[10px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
@@ -8658,18 +8747,41 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                             </b>{" "}
                             игрока <b className="text-white">{a.ownerName}</b>.
                           </div>
+                          {!canAfford && (
+                            <div className="mb-2 rounded-lg bg-[#e96852]/15 border border-[#e96852]/40 px-2.5 py-2 text-[10px] leading-snug text-[#ff8a75]">
+                              <div className="font-bold mb-0.5">⚠️ Не хватает {shortfall.toLocaleString("ru-RU")} К</div>
+                              Продайте/заложите поле или улучшение, обменяйте предметы. Это ~{percentLoss}% ваших активов (всего {totalAssets.toLocaleString("ru-RU")} К).
+                            </div>
+                          )}
                           <button
                             onClick={confirmAction}
-                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[11px] font-bold text-white hover:bg-[#d45a43] transition-colors"
+                            disabled={!canAfford}
+                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[11px] font-bold text-white hover:bg-[#d45a43] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           >
                             Заплатить {a.amount.toLocaleString("ru-RU")} К
                           </button>
+                          {!canAfford && (
+                            <button
+                              onClick={surrenderPayment}
+                              className="mt-1.5 w-full rounded-lg border border-[#e96852]/40 bg-white/5 py-1.5 text-[11px] font-bold text-[#ff8a75] hover:bg-[#e96852]/15 transition-colors"
+                            >
+                              🏳️ Сдаться (обанкротиться)
+                            </button>
+                          )}
                         </>
                       );
                     })()}
                   {pendingAction?.type === "tax" &&
                     (() => {
                       const a = pendingAction as NumA;
+                      const canAfford = player.money >= a.amount;
+                      const shortfall = Math.max(0, a.amount - player.money);
+                      const totalAssets = getPlayerTotalAssets(
+                        player.id, players, owners, improvements,
+                      );
+                      const percentLoss = totalAssets > 0
+                        ? Math.min(100, Math.round((shortfall / totalAssets) * 100))
+                        : 100;
                       return (
                         <>
                           <div className="text-[10px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
@@ -8678,18 +8790,41 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                           <div className="text-[11px] text-white/70 mb-2">
                             Штраф уйдёт в копилку джекпота.
                           </div>
+                          {!canAfford && (
+                            <div className="mb-2 rounded-lg bg-[#e96852]/15 border border-[#e96852]/40 px-2.5 py-2 text-[10px] leading-snug text-[#ff8a75]">
+                              <div className="font-bold mb-0.5">⚠️ Не хватает {shortfall.toLocaleString("ru-RU")} К</div>
+                              Продайте/заложите поле или улучшение, обменяйте предметы. Это ~{percentLoss}% ваших активов (всего {totalAssets.toLocaleString("ru-RU")} К).
+                            </div>
+                          )}
                           <button
                             onClick={confirmAction}
-                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[11px] font-bold text-white hover:bg-[#d45a43] transition-colors"
+                            disabled={!canAfford}
+                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[11px] font-bold text-white hover:bg-[#d45a43] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           >
                             Заплатить {a.amount.toLocaleString("ru-RU")} К
                           </button>
+                          {!canAfford && (
+                            <button
+                              onClick={surrenderPayment}
+                              className="mt-1.5 w-full rounded-lg border border-[#e96852]/40 bg-white/5 py-1.5 text-[11px] font-bold text-[#ff8a75] hover:bg-[#e96852]/15 transition-colors"
+                            >
+                              🏳️ Сдаться (обанкротиться)
+                            </button>
+                          )}
                         </>
                       );
                     })()}
                   {pendingAction?.type === "chance" &&
                     (() => {
                       const a = pendingAction as GainA;
+                      const canAfford = a.gain || player.money >= a.amount;
+                      const shortfall = a.gain ? 0 : Math.max(0, a.amount - player.money);
+                      const totalAssets = getPlayerTotalAssets(
+                        player.id, players, owners, improvements,
+                      );
+                      const percentLoss = totalAssets > 0 && shortfall > 0
+                        ? Math.min(100, Math.round((shortfall / totalAssets) * 100))
+                        : 100;
                       return (
                         <>
                           <div className="text-[10px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
@@ -8698,12 +8833,27 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                           <div className="text-[11px] text-white/80 leading-relaxed mb-2">
                             {a.desc}
                           </div>
+                          {!canAfford && (
+                            <div className="mb-2 rounded-lg bg-[#e96852]/15 border border-[#e96852]/40 px-2.5 py-2 text-[10px] leading-snug text-[#ff8a75]">
+                              <div className="font-bold mb-0.5">⚠️ Не хватает {shortfall.toLocaleString("ru-RU")} К</div>
+                              Продайте/заложите поле или улучшение, обменяйте предметы. Это ~{percentLoss}% ваших активов (всего {totalAssets.toLocaleString("ru-RU")} К).
+                            </div>
+                          )}
                           <button
                             onClick={confirmAction}
-                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[11px] font-bold text-white hover:bg-[#d45a43] transition-colors"
+                            disabled={!canAfford}
+                            className="w-full rounded-lg bg-[#e96852] py-1.5 text-[11px] font-bold text-white hover:bg-[#d45a43] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           >
-                            Заплатить {a.amount.toLocaleString("ru-RU")} К
+                            {a.gain ? "Получить" : "Заплатить"} {a.amount.toLocaleString("ru-RU")} К
                           </button>
+                          {!canAfford && (
+                            <button
+                              onClick={surrenderPayment}
+                              className="mt-1.5 w-full rounded-lg border border-[#e96852]/40 bg-white/5 py-1.5 text-[11px] font-bold text-[#ff8a75] hover:bg-[#e96852]/15 transition-colors"
+                            >
+                              🏳️ Сдаться (обанкротиться)
+                            </button>
+                          )}
                         </>
                       );
                     })()}
@@ -9827,14 +9977,18 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           </div>
 
 
-          {player.bankrupt && !player.leftAlive && (
+          {(() => {
+            const me = players.find(p => p.id === (currentUser?.id || "you"));
+            if (!me || !me.bankrupt || me.leftAlive) return null;
+            return (
             <div className="rounded-2xl border border-[#e96852]/40 bg-[#f6dfd7] p-3 text-center">
               <div className="font-bold text-[12px] text-primary">👀 Вы выбыли</div>
               <div className="mt-1 text-[10px] text-muted-foreground">
                 Наблюдайте за партией. Нажмите «Покинуть игру», когда захотите выйти — награда будет показана.
               </div>
             </div>
-          )}
+            );
+          })()}
 
           {/* Players list with hover popup */}
           <div className="rounded-2xl border border-card-border bg-card p-1.5 lg:p-3">
@@ -10010,6 +10164,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   {
                     icon: "🗳",
                     label: "Выгнать",
+                    hidden: tp.id === (currentUser?.id || "you"),
                     action: () => {
                       setPlayerHover(null);
                       if (!initialRoomId) return;
@@ -10041,12 +10196,17 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   {
                     icon: "🏳️",
                     label: "Сдаться",
+                    // Кнопка доступна только в попапе на себя — игрок может
+                    // сдаться только сам, не за соперника.
+                    hidden: tp.id !== (currentUser?.id || "you"),
                     action: () => {
                       setPlayerHover(null);
-                      bankruptPlayer(
-                        players.findIndex((pl) => pl.id === player.id),
-                        "добровольная сдача",
+                      const myIdx = players.findIndex(
+                        (pl) => pl.id === (currentUser?.id || "you"),
                       );
+                      if (myIdx !== -1) {
+                        bankruptPlayer(myIdx, "добровольная сдача");
+                      }
                     },
                   },
 ].filter(item => !item.hidden).map(({ icon, label, action, disabled }) => (

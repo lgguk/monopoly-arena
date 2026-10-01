@@ -759,6 +759,11 @@ async function finalizeGame(roomId) {
     console.log(`🏆 ${p.id} → place ${place}, +${coins} Coins, +${xp} XP${dropName ? ', дроп: ' + dropName : ''}`);
   }
 
+  // Сохраняем результат в gameRooms, чтобы переподключившийся игрок
+  // мог его получить, если пропустил broadcast (был offline в момент).
+  if (gameRooms[roomId]) {
+    gameRooms[roomId].finalResults = results;
+  }
   io.to(roomId).emit('game-rewards', { roomId, results });
 }
 
@@ -2603,6 +2608,13 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     }
 
     io.to(roomId).emit('update-game-players', gameRooms[roomId]);
+
+    // Если партия уже финализирована — отдаём этому игроку его награду
+    // персонально, чтобы он не пропустил game-rewards пока был offline.
+    const finalResults = gameRooms[roomId].finalResults;
+    if (gameRooms[roomId].finalized && Array.isArray(finalResults)) {
+      socket.emit('game-rewards', { roomId, results: finalResults });
+    }
 
     // Отдаём переподключившемуся игроку актуальный остаток таймера.
     // Берём из серверного хранилища — там точный endsAt, а не расчёт от старта.

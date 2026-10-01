@@ -269,7 +269,6 @@ type LobbyRoom = {
   mode: LobbyMode;
   jackpot: boolean;
   teleport: boolean;
-  noRent: boolean;
   password?: string;
   started?: boolean;
   createdAt?: number;
@@ -1397,7 +1396,6 @@ function Dashboard({
   const [createPlayers, setCreatePlayers] = useState(4);
   const [createJackpot, setCreateJackpot] = useState(true);
   const [createTeleport, setCreateTeleport] = useState(true);
-  const [createNoRent, setCreateNoRent] = useState(false);
   const [createPassword, setCreatePassword] = useState("");
   const [findMode, setFindMode] = useState<"Все" | LobbyMode>("Все");
   const [findNotice, setFindNotice] = useState("");
@@ -1589,7 +1587,6 @@ function Dashboard({
     [
       room.jackpot && "Джекпот",
       room.teleport && "Телепорт",
-      room.noRent && "Без аренды",
       room.password && "Пароль",
     ].filter(Boolean) as string[];
 
@@ -1602,7 +1599,6 @@ function Dashboard({
       setCreatePlayers(4);
       setCreateJackpot(true);
       setCreateTeleport(true);
-      setCreateNoRent(false);
       setCreatePassword("");
     }
   }, [createOpen, playerName]);
@@ -1628,7 +1624,6 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
       mode,
       jackpot: createJackpot,
       teleport: createTeleport,
-      noRent: createNoRent,
       password: createPassword.trim() || undefined,
     };
     
@@ -2378,12 +2373,11 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
             </div>
             <div className="mt-5">
               <div className="text-xs font-bold">Бонусы стола</div>
-              <div className="mt-2 grid gap-2 sm:grid-cols-3">
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
                 {(
                   [
                     ["jackpot", "Джекпот", createJackpot, setCreateJackpot],
                     ["teleport", "Телепорт", createTeleport, setCreateTeleport],
-                    ["noRent", "Без аренды", createNoRent, setCreateNoRent],
                   ] as [string, string, boolean, (v: boolean) => void][]
                 ).map(([key, label, checked, setChecked]) => (
                   <label
@@ -9649,7 +9643,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   </div>
                 </div>
               )}
-              <div className="min-h-0 flex-1 relative p-1.5 pt-1 text-[14px] lg:text-[12px]">
+              <div className="min-h-0 min-w-0 flex-1 relative overflow-hidden p-1.5 pt-1 text-[14px] lg:text-[12px]">
                 {/* Сами логи чата (объединенный и отсортированный поток) */}
                 <div
                   ref={logContainerRef}
@@ -9659,7 +9653,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     // 20px — небольшой допуск, чтобы «почти у низа» тоже считалось низом
                     setChatAutoScroll(distanceFromBottom <= 20);
                   }}
-                  className="space-y-px overflow-y-auto h-full pb-2 [&::-webkit-scrollbar]:hidden"
+                  className="space-y-px overflow-y-auto overflow-x-hidden h-full w-full pb-2 [&::-webkit-scrollbar]:hidden"
                 >
                   {[...log, ...chatMessages]
                     .sort((a, b) => a.timestamp - b.timestamp)
@@ -9667,7 +9661,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                       // Проверяем, есть ли поле 'from'. Если есть — это сообщение игрока.
                       if ("from" in item) {
                         return (
-                          <div key={`c-${i}`} className="leading-tight">
+                          <div key={`c-${i}`} className="leading-tight break-words whitespace-pre-wrap">
                             <span className="font-bold text-[#e7ba68]">
                               {item.from}:
                             </span>{" "}
@@ -9683,7 +9677,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                         return (
                           <div
                             key={`l-${i}`}
-                            className={`leading-tight break-words ${isSpecial ? "text-orange-400" : "italic text-white/65"}`}
+                            className={`leading-tight break-words whitespace-pre-wrap ${isSpecial ? "text-orange-400" : "italic text-white/65"}`}
                             style={isSpecial ? { color: "#f97316" } : {}}
                           >
                             {parts.map((part, idx) => {

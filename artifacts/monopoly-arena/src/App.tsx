@@ -7249,9 +7249,11 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     const firstIdx = nextAliveIndex(turn);
     const firstToActId = players[firstIdx].id;
 
-    // 2. Собираем всех живых игроков, кроме того, кто выставил на аукцион
+    // 2. Собираем всех живых игроков, кроме того, кто выставил на аукцион.
+    // Также отсеиваем тех, у кого денег меньше стартовой ставки — они
+    // физически не могут участвовать, им окно аукциона не показываем.
     let rawParticipants = players
-      .filter((p) => !p.bankrupt && p.id !== player.id)
+      .filter((p) => !p.bankrupt && p.id !== player.id && p.money >= startPrice)
       .map((p) => p.id);
 
     // 3. Если игроков больше 1, переставляем список так, чтобы первым шёл следующий по очереди

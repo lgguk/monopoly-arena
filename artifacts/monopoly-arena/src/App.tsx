@@ -6891,6 +6891,41 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       }
       return;
     }
+
+    // Тюрьма. Проверяем ДО rolled-check — при jailPaymentPending
+    // rolled=true, и без этого блока handleTimeout молча вышел бы.
+    const jailTargetId = expiredPlayerId || playersRef.current[turnRef.current]?.id;
+    const jailTargetIdx = playersRef.current.findIndex(p => p.id === jailTargetId);
+    const jailTarget = jailTargetIdx !== -1 ? playersRef.current[jailTargetIdx] : null;
+    if (jailTarget && (jailTarget.jailTurns ?? 0) > 0) {
+      timeoutHandled.current = true;
+
+      // Вариант 1: обязательный выкуп (попытки исчерпаны, кнопка «Заплатить»
+      // висела, игрок её не нажал). Авто-выкуп если хватает денег,
+      // иначе банкрот — это обязательный платёж.
+      if (jailPaymentPending) {
+        if (jailTarget.money >= 500) {
+          addLog(`⏰ ${jailTarget.name} не выкупился сам — авто-выкуп 500 К.`);
+          payBail();
+        } else {
+          addLog(`💀 ${jailTarget.name} — не смог выкупиться из тюрьмы.`);
+          bankruptPlayer(jailTargetIdx, "не смог выкупиться из тюрьмы");
+        }
+        return;
+      }
+
+      // Вариант 2: попытки ещё есть. Игрок не бросил — бросаем за него.
+      // Дальше rollJail обработает результат как обычно.
+      if (initialRoomId) {
+        addLog(`⏰ ${jailTarget.name} — авто-бросок кубиков в тюрьме.`);
+        socket.emit('roll-dice-request', {
+          roomId: initialRoomId,
+          playerId: jailTarget.id,
+        });
+      }
+      return;
+    }
+
     // Если ход уже сделан и окон не открыто — тайм-аут ни к чему
     if (rolled && !pendingAction) return;
     timeoutHandled.current = true;

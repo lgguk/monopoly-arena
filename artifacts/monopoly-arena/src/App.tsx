@@ -5944,6 +5944,25 @@ resolveGameDesigns(cleanPlayers);
         }, 1500);
       }, 600);
     });
+
+    // Анимация «В тюрьму» у наблюдателей: диагональный полёт фишки
+    // от клетки «В тюрьму» (30) к клетке «Тюрьма» (10).
+    socket.on('jail-animation-broadcast', (data: any) => {
+      console.log("[jail-anim] received", data, "myId:", currentUser?.id);
+      if (!data || !data.playerId) return;
+      if (data.playerId === (currentUser?.id || "you")) return;
+      setDiagonalAnim({ from: data.from, to: data.to, playerId: data.playerId });
+      window.setTimeout(() => {
+        setPlayers((ps) =>
+          ps.map((p) =>
+            p.id === data.playerId
+              ? { ...p, position: data.to, jailTurns: modeConfig.jailAttempts, jailAttempts: 0 }
+              : p,
+          ),
+        );
+        setDiagonalAnim(null);
+      }, 1200);
+    });
     socket.on('game-log-add-broadcast', handleGameLogBroadcast);
 
     // Настройки режима с сервера. Приходят сразу после enter-game-room.
@@ -6221,6 +6240,7 @@ resolveGameDesigns(cleanPlayers);
       socket.off('update-game-players', handlePlayersUpdate);
       socket.off('game-chat-message-broadcast', handleBroadcastMessage);
       socket.off('challenge-animation-broadcast');
+      socket.off('jail-animation-broadcast');
       socket.off('server-roll-result');
       socket.off('game-log-add-broadcast', handleGameLogBroadcast);
       socket.off('player-left'); // <--- ДОБАВИТЬ
@@ -7233,6 +7253,15 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
             case "gotojail":
         addLog(`👮 ${cur.name} попал на «В тюрьму»! Отправляется за решётку.`);
         setDiagonalAnim({ from: newPos, to: 10, playerId: cur.id });
+        // Сообщаем наблюдателям — они запустят ту же анимацию.
+        if (initialRoomId) {
+          socket.emit('jail-animation', {
+            roomId: initialRoomId,
+            playerId: cur.id,
+            from: newPos,
+            to: 10,
+          });
+        }
         setTimeout(() => {
           setPlayers((ps) =>
             ps.map((p, i) =>
@@ -7242,6 +7271,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
             ),
           );
           setDiagonalAnim(null);
+          setSyncNudge((n) => n + 1);
           addLog(`🔒 ${cur.name} отправлен в тюрьму (до ${modeConfig.jailAttempts} попыт${modeConfig.jailAttempts === 1 ? "ки" : "ок"} дубля)`);
           advanceTurn(capturedTurn, true);
         }, 1200);
@@ -9866,107 +9896,83 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
             );
           })()}
 
-          {/* Огненный след при испытании (Анимированный шлейф) */}
+                    {/* Огненный след при испытании — пламя за фишкой (4 слоя) */}
           {fireTrailAnim && (() => {
             const from = getCellCenterPct(fireTrailAnim.from);
             const to = getCellCenterPct(fireTrailAnim.to);
             const dp = players.find((pl) => pl.id === fireTrailAnim.playerId);
             if (!dp) return null;
 
-            // Вычисляем контрольную точку для изгиба пламени
-            const midX = (from.x + to.x) / 2 + (to.y - from.y) * 0.1;
-            const midY = (from.y + to.y) / 2 - (to.x - from.x) * 0.1;
-            const pathD = `M ${from.x} ${from.y} Q ${midX} ${midY} ${to.x} ${to.y}`;
+            const lineD = `M ${from.x} ${from.y} L ${to.x} ${to.y}`;
 
             return (
               <div key={`fire-${fireTrailAnim.from}-${fireTrailAnim.to}`} className="pointer-events-none absolute inset-0 z-[100] overflow-visible">
                 <style>{`
-                  @keyframes flameFlicker {
-                    0% { opacity: 0.8; stroke-width: 8; }
-                    50% { opacity: 1; stroke-width: 14; }
-                    100% { opacity: 0.8; stroke-width: 8; }
-                  }
-                  @keyframes flameFlow {
-                    0% { stroke-dashoffset: 0; }
-                    100% { stroke-dashoffset: -40; }
-                  }
+                  @keyframes tailOuter { to { stroke-dashoffset: -82; } }
+                  @keyframes tailMid   { to { stroke-dashoffset: -86; } }
+                  @keyframes tailInner { to { stroke-dashoffset: -91; } }
+                  @keyframes tailCore  { to { stroke-dashoffset: -95; } }
+                  @keyframes flicker1 { 0%,100% { opacity: 0.25; } 50% { opacity: 0.55; } }
+                  @keyframes flicker2 { 0%,100% { opacity: 0.55; } 50% { opacity: 0.9; } }
+                  @keyframes flicker3 { 0%,100% { opacity: 0.7; } 50% { opacity: 1; } }
                   @keyframes emberFloat {
                     0% { transform: translate(0, 0) scale(1); opacity: 1; }
                     100% { transform: translate(-15px, -25px) scale(0); opacity: 0; }
                   }
                 `}</style>
-                <svg className="absolute inset-0 h-full w-full" style={{ overflow: 'visible' }}>
+                <svg
+                  className="absolute inset-0 h-full w-full"
+                  viewBox="0 0 100 100"
+                  preserveAspectRatio="none"
+                  style={{ overflow: 'visible' }}
+                >
                   <defs>
-                    <linearGradient id="fireGradientOuter" x1="0%" y1="0%" x2="100%" y2="100%">
-                      <stop offset="0%" stopColor="#ff0000" stopOpacity="0" />
-                      <stop offset="30%" stopColor="#ff4500" stopOpacity="0.8" />
-                      <stop offset="70%" stopColor="#ff8c00" stopOpacity="1" />
-                      <stop offset="100%" stopColor="#ffff00" stopOpacity="1" />
-                    </linearGradient>
-                    <linearGradient id="fireGradientInner" x1="0%" y1="0%" x2="100%" y2="100%">
-                      <stop offset="0%" stopColor="#ff8c00" stopOpacity="0" />
-                      <stop offset="50%" stopColor="#ffff00" stopOpacity="0.9" />
-                      <stop offset="100%" stopColor="#ffffff" stopOpacity="1" />
-                    </linearGradient>
-                    <filter id="fireGlowOuter">
-                      <feGaussianBlur stdDeviation="6" result="blur1" />
-                      <feMerge>
-                        <feMergeNode in="blur1" />
-                        <feMergeNode in="SourceGraphic" />
-                      </feMerge>
-                    </filter>
-                    <filter id="fireGlowInner">
-                      <feGaussianBlur stdDeviation="3" result="blur2" />
-                      <feMerge>
-                        <feMergeNode in="blur2" />
-                        <feMergeNode in="SourceGraphic" />
-                      </feMerge>
-                    </filter>
+                    <filter id="flameBlurSoft"><feGaussianBlur stdDeviation="1.4" /></filter>
+                    <filter id="flameBlurMed"><feGaussianBlur stdDeviation="0.8" /></filter>
+                    <filter id="flameBlurSharp"><feGaussianBlur stdDeviation="0.4" /></filter>
+                    <filter id="flameBlurCrisp"><feGaussianBlur stdDeviation="0.12" /></filter>
                   </defs>
 
-                  {/* Внешний слой пламени (красный/оранжевый) */}
-                  <path
-                    d={pathD}
-                    fill="none"
-                    stroke="url(#fireGradientOuter)"
-                    strokeWidth="12"
-                    strokeLinecap="round"
-                    filter="url(#fireGlowOuter)"
-                    style={{ animation: "flameFlicker 0.8s infinite ease-in-out" }}
+                  {/* Дым/жара — самый длинный, размытый, тёмно-красный. */}
+                  <path d={lineD} pathLength="100" fill="none"
+                    stroke="#ff2200" strokeWidth="3.2" strokeLinecap="round"
+                    strokeDasharray="20 80"
+                    filter="url(#flameBlurSoft)"
+                    style={{ animation: "tailOuter 1.5s linear forwards, flicker1 0.28s infinite" }}
                   />
-                  {/* Внутренний слой пламени (жёлтый/белый) */}
-                  <path
-                    d={pathD}
-                    fill="none"
-                    stroke="url(#fireGradientInner)"
-                    strokeWidth="6"
-                    strokeLinecap="round"
-                    filter="url(#fireGlowInner)"
-                    style={{ animation: "flameFlicker 0.6s infinite ease-in-out" }}
+                  {/* Основное пламя — оранжевое. */}
+                  <path d={lineD} pathLength="100" fill="none"
+                    stroke="#ff8c00" strokeWidth="2.0" strokeLinecap="round"
+                    strokeDasharray="15 85"
+                    filter="url(#flameBlurMed)"
+                    style={{ animation: "tailMid 1.5s linear forwards, flicker2 0.22s infinite" }}
                   />
-                  {/* Поток искр (анимированный пунктир) */}
-                  <path
-                    d={pathD}
-                    fill="none"
-                    stroke="#ffffff"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeDasharray="4 20"
-                    filter="url(#fireGlowInner)"
-                    style={{ animation: "flameFlow 0.5s infinite linear" }}
+                  {/* Яркая зона — жёлтая. */}
+                  <path d={lineD} pathLength="100" fill="none"
+                    stroke="#ffd700" strokeWidth="1.1" strokeLinecap="round"
+                    strokeDasharray="10 90"
+                    filter="url(#flameBlurSharp)"
+                    style={{ animation: "tailInner 1.5s linear forwards, flicker3 0.18s infinite" }}
+                  />
+                  {/* Ядро — белое, тонкое, едет с фишкой. */}
+                  <path d={lineD} pathLength="100" fill="none"
+                    stroke="#ffffff" strokeWidth="0.5" strokeLinecap="round"
+                    strokeDasharray="6 94"
+                    filter="url(#flameBlurCrisp)"
+                    style={{ animation: "tailCore 1.5s linear forwards" }}
                   />
                 </svg>
 
-                {/* Искры/частицы, летящие от следа */}
+                {/* Искры у головы пламени */}
                 <div className="absolute" style={{ left: `${from.x}%`, top: `${from.y}%` }}>
-                  {[...Array(6)].map((_, i) => (
+                  {[...Array(8)].map((_, i) => (
                     <div
                       key={i}
                       className="absolute h-1.5 w-1.5 rounded-full bg-yellow-300"
                       style={{
-                        left: `${(Math.random() - 0.5) * 30}px`,
-                        top: `${(Math.random() - 0.5) * 30}px`,
-                        animation: `emberFloat ${0.5 + Math.random() * 0.5}s infinite ease-out`,
+                        left: `${(Math.random() - 0.5) * 26}px`,
+                        top: `${(Math.random() - 0.5) * 26}px`,
+                        animation: `emberFloat ${0.4 + Math.random() * 0.5}s infinite ease-out`,
                         animationDelay: `${Math.random() * 0.5}s`,
                         boxShadow: "0 0 8px #ff8c00",
                       }}
@@ -9974,7 +9980,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   ))}
                 </div>
 
-                {/* Фишка игрока (движется вместе с шлейфом) */}
+                {/* Фишка игрока — летит вместе с пламенем */}
                 <div
                   className="arena-chip absolute z-[110] flex w-[23px] h-[23px] items-center justify-center rounded-full"
                   style={{

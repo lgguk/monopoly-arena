@@ -384,21 +384,69 @@ function playGameStartSound() {
   ], 0.35);
 }
 
-// Списание денег — короткий «дзынь» пониже (две ноты вниз).
+// Списание денег — короткий кассовый «бип-буп». Прямоугольный сигнал
+// (как у сканера), два тона 1200 → 950 Гц, быстрые.
 function playSpendSound() {
-  playDingSequence([
-    { freq: 620, start: 0, dur: 0.10 },
-    { freq: 440, start: 0.07, dur: 0.16 },
-  ], 0.35);
+  try {
+    if (!audioCtxRef) {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!Ctx) return;
+      audioCtxRef = new Ctx();
+    }
+    const ctx = audioCtxRef;
+    if (ctx.state === "suspended") ctx.resume();
+    const now = ctx.currentTime;
+    const notes = [
+      { freq: 1200, start: 0, dur: 0.06 },
+      { freq: 950, start: 0.07, dur: 0.12 },
+    ];
+    notes.forEach(({ freq, start, dur }) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "square";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, now + start);
+      gain.gain.exponentialRampToValueAtTime(0.22, now + start + 0.005);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now + start);
+      osc.stop(now + start + dur + 0.02);
+    });
+  } catch {}
 }
 
-// Получение денег — восходящий «динь» (две ноты вверх).
-// Играется у получателя при аренде и у игрока при шансе-выигрыше.
+// Получение денег — сыплющиеся монеты. Серия коротких высоких
+// «кликов» треугольником (металлический оттенок) с рандомной высотой
+// и задержкой — эффект падающих монет.
 function playGainSound() {
-  playDingSequence([
-    { freq: 660, start: 0, dur: 0.12 },
-    { freq: 990, start: 0.08, dur: 0.20 },
-  ], 0.35);
+  try {
+    if (!audioCtxRef) {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!Ctx) return;
+      audioCtxRef = new Ctx();
+    }
+    const ctx = audioCtxRef;
+    if (ctx.state === "suspended") ctx.resume();
+    const now = ctx.currentTime;
+    // 7 «монеток» с разной высотой и микро-задержкой.
+    for (let i = 0; i < 7; i++) {
+      const start = i * 0.045 + Math.random() * 0.02;
+      const freq = 2200 + Math.random() * 1200;
+      const dur = 0.05 + Math.random() * 0.03;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "triangle";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, now + start);
+      gain.gain.exponentialRampToValueAtTime(0.12, now + start + 0.003);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now + start);
+      osc.stop(now + start + dur + 0.02);
+    }
+  } catch {}
 }
 
 // Победа в джекпоте — восходящая трезвучная арпеджио.
@@ -447,13 +495,13 @@ function startSlideSound() {
     source.loop = true;
 
     const filter = ctx.createBiquadFilter();
-    filter.type = "bandpass";
-    filter.frequency.value = 3200; // «дерево» — верхняя середина
-    filter.Q.value = 0.8;
+    filter.type = "lowpass";
+    filter.frequency.value = 380; // мягкий низкий гул вместо «воды»
+    filter.Q.value = 3.5;         // узкий резонанс — «трение дерева»
 
     const gain = ctx.createGain();
     gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    gain.gain.linearRampToValueAtTime(0.35, ctx.currentTime + 0.08);
+    gain.gain.linearRampToValueAtTime(0.20, ctx.currentTime + 0.10);
 
     source.connect(filter);
     filter.connect(gain);
@@ -5939,10 +5987,11 @@ useEffect(() => { animPathRef.current = animPath; }, [animPath]);
   const joinedRef = useRef(false); // <-- ЗАЩИТА ОТ ПОВТОРНОГО ОТПРАВЛЕНИЯ
   const gameStartPlayedRef = useRef(false); // звук старта играет один раз
   const gameRooms_maxPlayersRef = useRef<number>(2);
-  // Счётчик принятых чужих снапшотов. Нужен, чтобы не играть звук
-  // получения на самый первый приём (после входа в игру баланс
-  // «вырастает» с 0 до стартового — это не пополнение).
-  const remoteSyncCountRef = useRef(0);
+  // Предыдущее значение МОЕГО баланса. Нужно для звука траты/пополнения
+  // через useEffect — так автоматически покрываются любые источники
+  // изменения (аренда, налог, шанс, покупка, улучшение, казино, шанс-mass,
+  // сдача и т.д.), не нужно отслеживать каждое действие вручную.
+  const prevMoneyRef = useRef<number | null>(null);
 
   // ---- НАЧАЛО ВСТАВКИ: СИНХРОНИЗАЦИЯ ИГРОКОВ И СОЛО-ГЕНЕРАЦИЯ ----
   useEffect(() => {
@@ -6292,24 +6341,6 @@ resolveGameDesigns(cleanPlayers);
 
       // Обновляем всё, что пришло (даже если игроки пустые, но владельцы/ход изменились!)
       if (data.players && data.players.length > 0) {
-        // Трекинг пополнения баланса: если мой money вырос — играем
-        // восходящий «динь». Так получатель аренды слышит, что ему
-        // заплатили. Первый снапшот после входа пропускаем — там
-        // баланс «растёт» с 0 до стартового, это не пополнение.
-        const myId = currentUser?.id || "you";
-        const oldMe = playersRef.current.find((p) => p.id === myId);
-        const newMe = data.players.find((p: any) => p && p.id === myId);
-        if (
-          remoteSyncCountRef.current > 0 &&
-          oldMe && newMe &&
-          typeof newMe.money === "number" &&
-          typeof oldMe.money === "number" &&
-          newMe.money > oldMe.money
-        ) {
-          playGainSound();
-        }
-        remoteSyncCountRef.current += 1;
-
         setPlayers((prevPlayers) => {
           return data.players
             .filter((p: any) => p !== null && p !== undefined)
@@ -7241,6 +7272,22 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       return () => stopSlideSound();
     }
   }, [animPath]);
+    // Звук траты/пополнения по факту изменения моего баланса. Работает
+  // автоматически при любом изменении: локальные setPlayers (я сам
+  // заплатил/получил), чужие снапшоты (мне заплатили аренду, у меня
+  // списали массовым шансом). Первый рендер пропускаем — иначе gain
+  // сыграл бы при инициализации.
+  useEffect(() => {
+    const myId = currentUser?.id || "you";
+    const me = players.find((p) => p.id === myId);
+    if (!me || typeof me.money !== "number") return;
+    const prev = prevMoneyRef.current;
+    prevMoneyRef.current = me.money;
+    if (prev === null) return;
+    if (prev === me.money) return;
+    if (me.money > prev) playGainSound();
+    else playSpendSound();
+  }, [players]);
 
   // Тикер для модалки голосования: секунды обновляются каждую секунду,
   // пока идёт голосование. Просто force-render, значение не используется.
@@ -7567,12 +7614,6 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     const a = pendingAction;
     setPendingAction(null);
     if (!player) return;
-    // Звук списания при обязательных платежах.
-    if (a.type === "rent" || a.type === "tax" || (a.type === "chance" && !a.gain)) {
-      playSpendSound();
-    } else if (a.type === "chance" && a.gain) {
-      playGainSound();
-    }
     switch (a.type) {
       case "rent":
         if (player.money < a.amount) {
@@ -8265,7 +8306,6 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       setMessage("Недостаточно денег (500 К)!");
       return;
     }
-    playSpendSound();
 
     // Берем сохраненные кубики, если они есть (случай 3-й попытки)
     const pendingMove = pendingJailMovementRef.current;

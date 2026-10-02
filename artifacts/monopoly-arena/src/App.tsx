@@ -1567,6 +1567,7 @@ function Dashboard({
   const [chat, setChat] = useState<GlobalChatMessage[]>([]);
     const [friends, setFriends] = useState<{ id: string; name: string; online: boolean; avatar?: string | null }[]>([]);
   const [friendSearchResults, setFriendSearchResults] = useState<{ id: string; name: string; online: boolean; avatar?: string | null }[]>([]);
+  const [unreadMap, setUnreadMap] = useState<Record<string, number>>({});
   const [isSpinning, setIsSpinning] = useState(false);
   const [jailPaymentPending, setJailPaymentPending] = useState(false);
     type QuestItem = { id: string; title: string; reward: number; icon: string; done: boolean; claimed: boolean; progress: number; target: number };
@@ -1594,6 +1595,9 @@ function Dashboard({
   const [friendsOpen, setFriendsOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [userScrolled, setUserScrolled] = useState(false);
+  const [rateLimitedUntil, setRateLimitedUntil] = useState(0);
+  const [rateLimitNotice, setRateLimitNotice] = useState("");
+  const [, forceTick] = useState(0);
   const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const joinLockRef = useRef(false);
@@ -1602,8 +1606,24 @@ function Dashboard({
     socket.emit('get-rooms');
     socket.on('update-rooms', (serverRooms: LobbyRoom[]) => { setRooms(serverRooms); });
     socket.on('chat-message', (msg: GlobalChatMessage) => {
-  setChat(prev => [...prev, msg].slice(-200));
+  // Храним только последние 300 сообщений. Новое вытесняет старое.
+  setChat(prev => [...prev, msg].slice(-300));
 });
+
+    // При заходе на главную подтягиваем последние 20 сообщений.
+    // Мерджим по timestamp|nickname, чтобы повторные переподключения
+    // и двойной вызов (connect + mount) не задвоили записи.
+    socket.on('chat-history', (history: GlobalChatMessage[]) => {
+      if (!Array.isArray(history)) return;
+      setChat(prev => {
+        const known = new Set(prev.map(m => `${m.timestamp}|${m.nickname}`));
+        const fresh = history.filter(
+          m => !known.has(`${m.timestamp}|${m.nickname}`),
+        );
+        return [...fresh, ...prev].slice(-300);
+      });
+    });
+    socket.emit('get-chat-history');
     
     // Обработчик запуска игры (теперь ВНУТРИ основного useEffect)
     socket.on('start-game', (roomData: LobbyRoom) => {
@@ -1623,9 +1643,39 @@ function Dashboard({
     return () => {
         socket.off('update-rooms');
         socket.off('chat-message');
+        socket.off('chat-history');
         socket.off('start-game');
     };
   }, [onJoinGame]);
+
+  // Авто-скролл главного чата вниз при новых сообщениях, если игрок
+  // не пролистал вверх. Кнопка «↓» показывается при userScrolled === true.
+  useEffect(() => {
+    const el = chatContainerRef.current;
+    if (!el) return;
+    if (!userScrolled) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [chat, userScrolled]);
+
+  // Блокировка ввода в общем чате после срабатывания rate-limit.
+  // Тикаем раз в 500мс, чтобы плейсхолдер «Подождите N с…» менялся,
+  // и снимаем блок ровно по истечении until.
+  useEffect(() => {
+    if (rateLimitedUntil <= Date.now()) return;
+    const id = window.setInterval(() => forceTick((t) => t + 1), 500);
+    return () => window.clearInterval(id);
+  }, [rateLimitedUntil]);
+
+  useEffect(() => {
+    if (!rateLimitedUntil) return;
+    const ms = Math.max(0, rateLimitedUntil - Date.now());
+    const id = window.setTimeout(() => {
+      setRateLimitedUntil(0);
+      setRateLimitNotice("");
+    }, ms);
+    return () => window.clearTimeout(id);
+  }, [rateLimitedUntil]);
 
     // Квесты (daily + weekly)
   useEffect(() => {
@@ -1713,6 +1763,26 @@ function Dashboard({
       socket.off('friends-updated', reload);
     };
   }, [player?.id]);
+
+  // Непрочитанные личные сообщения — для бейджа у кнопки чата в списке друзей.
+  // Источник: localStorage arena-unread-<userId> = { [friendId]: count }.
+  // Home инкрементит при friend-message-received, ChatPanel сбрасывает
+  // при открытии. Здесь только читаем и перерисовываемся на события.
+  useEffect(() => {
+    if (!player?.id || player.guest) { setUnreadMap({}); return; }
+    const key = "arena-unread-" + player.id;
+    const refresh = () => {
+      try { setUnreadMap(JSON.parse(localStorage.getItem(key) || "{}")); }
+      catch { setUnreadMap({}); }
+    };
+    refresh();
+    window.addEventListener("arena-unread-changed", refresh);
+    window.addEventListener("storage", refresh);
+    return () => {
+      window.removeEventListener("arena-unread-changed", refresh);
+      window.removeEventListener("storage", refresh);
+    };
+  }, [player?.id, player?.guest]);
 
   // Поиск игроков через сервер (работает, даже если своих друзей нет)
   useEffect(() => {
@@ -1893,12 +1963,38 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
     const sendGlobalChat = (event: FormEvent) => {
     event.preventDefault();
     if (!chatText.trim()) return;
-    socket.emit('chat-message', {
-      nickname: playerName || "Гость клуба",
-      text: chatText.trim(),
-      timestamp: new Date().toISOString(),
-    });
-    setChatText("");
+    // Локальная блокировка — сервер уже сказал подождать.
+    if (rateLimitedUntil > Date.now()) {
+      const left = Math.max(1, Math.ceil((rateLimitedUntil - Date.now()) / 1000));
+      setRateLimitNotice(`Подождите ${left} с…`);
+      return;
+    }
+    const text = chatText.trim();
+    socket.emit(
+      'chat-message',
+      {
+        nickname: playerName || "Гость клуба",
+        text,
+        timestamp: new Date().toISOString(),
+      },
+      (res: any) => {
+        if (res?.ok) {
+          // Сообщение придёт через io.emit всем, включая нас —
+          // state обновится сам. Просто чистим поле и скроллим вниз.
+          setChatText("");
+          setUserScrolled(false);
+          window.setTimeout(() => {
+            const el = chatContainerRef.current;
+            if (el) el.scrollTop = el.scrollHeight;
+          }, 0);
+        } else if (res?.error === 'rate-limit') {
+          const until = Number(res.until) || (Date.now() + 5000);
+          setRateLimitedUntil(until);
+          const left = Math.max(1, Math.ceil((until - Date.now()) / 1000));
+          setRateLimitNotice(`Слишком часто. Подождите ${left} с.`);
+        }
+      },
+    );
   };
 
     const refreshRooms = () => {
@@ -2151,10 +2247,15 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
                     ) : (
                       <button
                         onClick={() => onOpenFriendChat?.(f)}
-                        className="shrink-0 rounded-lg p-1.5 text-muted-foreground hover:bg-primary/10 hover:text-primary"
+                        className="relative shrink-0 rounded-lg p-1.5 text-muted-foreground hover:bg-primary/10 hover:text-primary"
                         title="Открыть чат"
                       >
                         <MessageCircle size={14} />
+                        {(unreadMap[f.id] || 0) > 0 && (
+                          <span className="absolute -right-0.5 -top-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[9px] font-bold text-white">
+                            {unreadMap[f.id] > 99 ? "99+" : unreadMap[f.id]}
+                          </span>
+                        )}
                       </button>
                     )}
                   </div>
@@ -2202,19 +2303,51 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
     </div>
   </div>
   <div className={`${chatOpen ? "block" : "hidden"} lg:block`}>
-    <div className="flex flex-col min-h-[250px] max-h-[360px] gap-2 overflow-x-hidden overflow-y-auto rounded-xl bg-[#f1eadc] p-3 [&::-webkit-scrollbar]:hidden" style={{ scrollbarWidth: "none" }}>
-    {chat.map((message, index) => (
+    <div className="relative">
       <div
-        key={`${message.timestamp}-${index}`}
-        className={`flex w-full items-start ${message.nickname === playerName ? "justify-end" : "justify-start"}`}
+        ref={chatContainerRef}
+        onScroll={() => {
+          const el = chatContainerRef.current;
+          if (!el) return;
+          const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+          // ~5 сообщений ≈ 250px — как в личке.
+          setUserScrolled(distanceFromBottom > 250);
+        }}
+        className="flex flex-col min-h-[250px] max-h-[360px] gap-2 overflow-x-hidden overflow-y-auto rounded-xl bg-[#f1eadc] p-3 [&::-webkit-scrollbar]:hidden"
+        style={{ scrollbarWidth: "none" }}
       >
-        <div className="group relative max-w-[80%] break-words rounded-2xl bg-[#e96852] px-3.5 py-2.5 text-white">
-          <div className="text-[11px] font-bold">{message.nickname}</div>
-          <div className="mt-1 text-xs">{message.text}</div>
-        </div>
+        {chat.map((message, index) => (
+          <div
+            key={`${message.timestamp}-${index}`}
+            className={`flex w-full items-start ${message.nickname === playerName ? "justify-end" : "justify-start"}`}
+          >
+            <div className="group relative max-w-[80%] break-words rounded-2xl bg-[#e96852] px-3.5 py-2.5 text-white">
+              <div className="text-[11px] font-bold">{message.nickname}</div>
+              <div className="mt-1 text-xs">{message.text}</div>
+            </div>
+          </div>
+        ))}
       </div>
-    ))}
-  </div>
+      {userScrolled && (
+        <button
+          type="button"
+          onClick={() => {
+            const el = chatContainerRef.current;
+            if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+            setUserScrolled(false);
+          }}
+          className="absolute bottom-3 right-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg hover:brightness-95"
+          aria-label="Прокрутить вниз"
+        >
+          <ChevronDown size={18} />
+        </button>
+      )}
+    </div>
+      {rateLimitNotice && (
+        <div className="mt-2 rounded-lg border border-primary/30 bg-[#f6dfd7] px-3 py-2 text-xs font-medium text-primary">
+          ⏳ {rateLimitNotice}
+        </div>
+      )}
       <form
     onSubmit={sendGlobalChat}
     className="mt-3 flex items-end gap-2"
@@ -2223,6 +2356,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
       ref={textareaRef}
       rows={1}
       value={chatText}
+      disabled={rateLimitedUntil > Date.now()}
       onChange={(event) => {
         setChatText(event.target.value);
         const target = event.target;
@@ -2242,12 +2376,17 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
             );
         }
       }}
-      placeholder="Напиши что-нибудь..."
-       className="min-w-0 flex-1 rounded-xl border border-input bg-[#f1eadc] px-3 py-2 text-base outline-none resize-none overflow-hidden placeholder:text-base focus:ring-2 focus:ring-primary/30 min-h-[44px] max-h-[120px]"
+      placeholder={
+        rateLimitedUntil > Date.now()
+          ? `Подождите ${Math.max(1, Math.ceil((rateLimitedUntil - Date.now()) / 1000))} с...`
+          : "Напиши что-нибудь..."
+      }
+       className={`min-w-0 flex-1 rounded-xl border border-input bg-[#f1eadc] px-3 py-2 text-base outline-none resize-none overflow-hidden placeholder:text-base focus:ring-2 focus:ring-primary/30 min-h-[44px] max-h-[120px] ${rateLimitedUntil > Date.now() ? "opacity-50 cursor-not-allowed" : ""}`}
     />
     <button
       type="submit"
-      className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:brightness-95"
+      disabled={rateLimitedUntil > Date.now()}
+      className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:brightness-95 disabled:opacity-50"
     >
       <Send size={17} />
     </button>
@@ -2997,36 +3136,177 @@ function ChatPanel({
     const storageKey = `arena-chat-${targetFriend.id}`;
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useLocalStorage<ChatMessage[]>(storageKey, []);
+  const myUserId = getSessionUserId();
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const isAtBottomRef = useRef(true);
+  const [showScrollBtn, setShowScrollBtn] = useState(false);
+  const [rateLimitedUntil, setRateLimitedUntil] = useState(0);
+  const [rateLimitNotice, setRateLimitNotice] = useState("");
+  const [, forceTick] = useState(0);
+
+    // Пока активен блок — обновляем UI раз в 500мс, чтобы плейсхолдер
+  // «Подождите N с…» менялся и кнопка разблокировалась ровно в срок.
+  useEffect(() => {
+    if (rateLimitedUntil <= Date.now()) return;
+    const id = window.setInterval(() => forceTick((t) => t + 1), 500);
+    return () => window.clearInterval(id);
+  }, [rateLimitedUntil]);
+
+  // Снимаем блок и notice ровно тогда, когда истекает until.
+  useEffect(() => {
+    if (!rateLimitedUntil) return;
+    const ms = Math.max(0, rateLimitedUntil - Date.now());
+    const id = window.setTimeout(() => {
+      setRateLimitedUntil(0);
+      setRateLimitNotice("");
+    }, ms);
+    return () => window.clearTimeout(id);
+  }, [rateLimitedUntil]);
 
   // Автоочистка: удаляем сообщения старше 24 часов при открытии чата
   useEffect(() => {
     const DAY_MS = 24 * 60 * 60 * 1000;
     const now = Date.now();
-    const fresh = messages.filter((m) => !m.timestamp || now - m.timestamp < DAY_MS);
+    // Чистим старше 24 часов и режем до 40 — один проход при открытии чата.
+    const fresh = messages
+      .filter((m) => !m.timestamp || now - m.timestamp < DAY_MS)
+      .slice(-40);
     if (fresh.length !== messages.length) {
       setMessages(fresh);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targetFriend.id]);
 
+  // При смене друга — прыгаем в самый низ и сбрасываем флаг «внизу».
+  useEffect(() => {
+    const el = messagesRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    isAtBottomRef.current = true;
+    setShowScrollBtn(false);
+  }, [targetFriend.id]);
+    // Открыли чат — сбрасываем счётчик непрочитанных для этого друга.
+  useEffect(() => {
+    if (!myUserId) return;
+    const key = "arena-unread-" + myUserId;
+    try {
+      const cur = JSON.parse(localStorage.getItem(key) || "{}");
+      if (cur[targetFriend.id]) {
+        delete cur[targetFriend.id];
+        localStorage.setItem(key, JSON.stringify(cur));
+        window.dispatchEvent(new Event("arena-unread-changed"));
+      }
+    } catch {}
+  }, [targetFriend.id, myUserId]);
+
+  // Авто-скролл при новых сообщениях — только если игрок уже был внизу.
+  useEffect(() => {
+    const el = messagesRef.current;
+    if (!el) return;
+    if (isAtBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages]);
+
+  // Приём входящих сообщений от этого друга.
+  useEffect(() => {
+    const handler = (data: any) => {
+      if (!data || data.fromId !== targetFriend.id) return;
+      // Пользователь видит сообщение — сбрасываем unread для этого друга.
+      if (myUserId) {
+        const key = "arena-unread-" + myUserId;
+        try {
+          const cur = JSON.parse(localStorage.getItem(key) || "{}");
+          if (cur[targetFriend.id]) {
+            delete cur[targetFriend.id];
+            localStorage.setItem(key, JSON.stringify(cur));
+            window.dispatchEvent(new Event("arena-unread-changed"));
+          }
+        } catch {}
+      }
+      // Сохраняем в свой localStorage-чат. setMessages добавляет к messages,
+      // но т.к. это useLocalStorage, читаем актуальный массив через функцию.
+      setMessages((prev: ChatMessage[]) => {
+        const already = prev.some(
+          (m) => m.timestamp === data.timestamp && m.text === data.text,
+        );
+        if (already) return prev;
+        return [
+          ...prev,
+          {
+            from: data.fromName,
+            text: data.text,
+            time: new Date(data.timestamp).toLocaleTimeString("ru-RU", {
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+            timestamp: data.timestamp,
+            recipient: myUserId || undefined,
+          },
+        ].slice(-40);
+      });
+    };
+    socket.on("friend-message-received", handler);
+    return () => {
+      socket.off("friend-message-received", handler);
+    };
+  }, [targetFriend.id, myUserId]);
+
   const send = (e: FormEvent) => {
     e.preventDefault();
     if (!message.trim()) return;
-        setMessages([
-      ...messages,
+    if (!myUserId) return;
+    // Локальная блокировка — если сервер уже сказал подождать.
+    if (rateLimitedUntil > Date.now()) {
+      const left = Math.max(1, Math.ceil((rateLimitedUntil - Date.now()) / 1000));
+      setRateLimitNotice(`Подождите ${left} с…`);
+      return;
+    }
+    const text = message.trim();
+    const ts = Date.now();
+    // Отправляем на сервер и ждём ACK. Локально добавляем ТОЛЬКО после ok —
+    // иначе при блоке у отправителя появлялось бы "фантомное" сообщение.
+    socket.emit(
+      "send-friend-message",
       {
-        from: currentUserName,
-        text: message.trim(),
-        time: new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }),
-        timestamp: Date.now(),
-        recipient: targetFriend.id,
+        fromUserId: myUserId,
+        fromName: currentUserName,
+        toUserId: targetFriend.id,
+        text,
+        timestamp: ts,
       },
-    ]);
-    setMessage("");
+      (res: any) => {
+        if (res?.ok) {
+          setMessages((prev: ChatMessage[]) => [
+            ...prev,
+            {
+              from: currentUserName,
+              text,
+              time: new Date(ts).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }),
+              timestamp: ts,
+              recipient: targetFriend.id,
+            },
+          ].slice(-40));
+          setMessage("");
+          window.setTimeout(() => {
+            const el = messagesRef.current;
+            if (el) el.scrollTop = el.scrollHeight;
+            isAtBottomRef.current = true;
+            setShowScrollBtn(false);
+          }, 0);
+        } else if (res?.error === "rate-limit") {
+          const until = Number(res.until) || (Date.now() + 5000);
+          setRateLimitedUntil(until);
+          const left = Math.max(1, Math.ceil((until - Date.now()) / 1000));
+          setRateLimitNotice(`Слишком часто. Подождите ${left} с.`);
+        }
+      },
+    );
   };
 
   return (
-    <div className="flex min-h-[440px] flex-col rounded-2xl border border-card-border bg-card p-5">
+    <div className="flex h-[min(560px,calc(100vh-140px))] flex-col rounded-2xl border border-card-border bg-card p-5">
       <div className="flex items-center justify-between border-b border-border pb-4">
         <div className="flex items-center gap-2">
           <MessageCircle size={17} className="text-primary" />
@@ -3045,38 +3325,94 @@ function ChatPanel({
           <X size={16} />
         </button>
       </div>
-      <div className="flex-1 space-y-3 overflow-auto py-5">
-        {messages.length === 0 && (
-          <div className="text-center text-sm text-muted-foreground">
-            Нет сообщений. Напиши первым!
-          </div>
-        )}
-        {messages.map((m, i) => (
-          <div
-            key={`${m.time}-${i}`}
-            className={`flex ${m.from === currentUserName ? "justify-end" : "justify-start"}`}
-          >
+      <div className="relative flex-1 min-h-0">
+        <div
+          ref={messagesRef}
+          onScroll={() => {
+            const el = messagesRef.current;
+            if (!el) return;
+            const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+            isAtBottomRef.current = distanceFromBottom <= 20;
+            // ~5 сообщений ≈ 250px. Порог подобран эмпирически.
+            setShowScrollBtn(distanceFromBottom > 250);
+          }}
+          className="absolute inset-0 space-y-3 overflow-y-auto overflow-x-hidden py-5 [&::-webkit-scrollbar]:hidden"
+          style={{ scrollbarWidth: "none" }}
+        >
+          {messages.length === 0 && (
+            <div className="text-center text-sm text-muted-foreground">
+              Нет сообщений. Напиши первым!
+            </div>
+          )}
+          {messages.map((m, i) => (
             <div
-              className={`max-w-[75%] rounded-2xl px-3.5 py-2.5 text-sm ${m.from === currentUserName ? "rounded-br-sm bg-primary text-primary-foreground" : "rounded-bl-sm bg-muted text-foreground"}`}
+              key={`${m.time}-${i}`}
+              className={`flex ${m.from === currentUserName ? "justify-end" : "justify-start"}`}
             >
-              <div>{m.text}</div>
-              <div className={`mt-1 text-[9px] ${m.from === currentUserName ? "text-white/65" : "text-muted-foreground"}`}>
-                {m.time}
+              <div
+                className={`max-w-[75%] break-words rounded-2xl px-3.5 py-2.5 text-sm ${m.from === currentUserName ? "rounded-br-sm bg-primary text-primary-foreground" : "rounded-bl-sm bg-muted text-foreground"}`}
+              >
+                <div>{m.text}</div>
+                <div className={`mt-1 text-[9px] ${m.from === currentUserName ? "text-white/65" : "text-muted-foreground"}`}>
+                  {m.time}
+                </div>
               </div>
             </div>
-          </div>
-        ))}
+          ))}
+        </div>
+        {showScrollBtn && (
+          <button
+            type="button"
+            onClick={() => {
+              const el = messagesRef.current;
+              if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+              isAtBottomRef.current = true;
+              setShowScrollBtn(false);
+            }}
+            className="absolute bottom-3 right-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg hover:brightness-95"
+            aria-label="Прокрутить вниз"
+          >
+            <ChevronDown size={18} />
+          </button>
+        )}
       </div>
-      <form onSubmit={send} className="flex gap-2 border-t border-border pt-4">
-        <input
+      {rateLimitNotice && (
+        <div className="mb-2 rounded-lg border border-primary/30 bg-[#f6dfd7] px-3 py-2 text-xs font-medium text-primary">
+          ⏳ {rateLimitNotice}
+        </div>
+      )}
+      <form onSubmit={send} className="flex items-end gap-2 border-t border-border pt-4">
+        <textarea
+          rows={1}
           value={message}
-          onChange={(e) => setMessage(e.target.value)}
-          placeholder={`Написать ${targetFriend.name}...`}
-          className="min-w-0 flex-1 rounded-xl border border-input bg-background px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-primary/30"
+          disabled={rateLimitedUntil > Date.now()}
+          onChange={(e) => {
+            setMessage(e.target.value);
+            const t = e.target;
+            t.style.height = "auto";
+            t.style.height = Math.min(t.scrollHeight, 120) + "px";
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              const form = e.currentTarget.closest("form");
+              if (form)
+                form.dispatchEvent(
+                  new Event("submit", { cancelable: true, bubbles: true }),
+                );
+            }
+          }}
+          placeholder={
+            rateLimitedUntil > Date.now()
+              ? `Подождите ${Math.max(1, Math.ceil((rateLimitedUntil - Date.now()) / 1000))} с...`
+              : `Написать ${targetFriend.name}...`
+          }
+          className={`min-w-0 flex-1 resize-none overflow-hidden rounded-xl border border-input bg-background px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-primary/30 min-h-[44px] max-h-[120px] ${rateLimitedUntil > Date.now() ? "opacity-50 cursor-not-allowed" : ""}`}
         />
         <button
           type="submit"
-          className="flex h-11 w-11 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:brightness-95"
+          disabled={rateLimitedUntil > Date.now()}
+          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:brightness-95 disabled:opacity-50"
         >
           <Send size={17} />
         </button>
@@ -3104,6 +3440,7 @@ function Friends({
   const [notice, setNotice] = useState("");
   const [chatFriend, setChatFriend] = useState<{ id: string; name: string; online: boolean } | null>(null);
   const userId = player?.id;
+  const [unreadMap, setUnreadMap] = useState<Record<string, number>>({});
     // Автооткрытие чата, если перешли с главной страницы
   useEffect(() => {
     if (pendingChatFriend) {
@@ -3142,6 +3479,25 @@ function Friends({
       socket.off('friends-updated', reload);
     };
   }, [userId, isGuest]);
+
+  // Непрочитанные личные сообщения — источник localStorage
+  // arena-unread-<userId> = { [friendId]: count }. Обновляется через
+  // событие arena-unread-changed (эмитит Home) и storage (другие вкладки).
+  useEffect(() => {
+    if (!userId) { setUnreadMap({}); return; }
+    const key = "arena-unread-" + userId;
+    const refresh = () => {
+      try { setUnreadMap(JSON.parse(localStorage.getItem(key) || "{}")); }
+      catch { setUnreadMap({}); }
+    };
+    refresh();
+    window.addEventListener("arena-unread-changed", refresh);
+    window.addEventListener("storage", refresh);
+    return () => {
+      window.removeEventListener("arena-unread-changed", refresh);
+      window.removeEventListener("storage", refresh);
+    };
+  }, [userId]);
 
   const handleSearch = (query: string) => {
     setSearch(query);
@@ -3284,22 +3640,29 @@ function Friends({
                         <Avatar initials={initials} color={color} size="sm" avatar={friend.avatar} />
                         {friend.online && <span className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-card bg-accent" />}
                       </div>
-                                            <div className="min-w-0 flex-1">
-                        <div className="flex justify-between gap-2">
-                          <b className="truncate text-sm">{friend.name}</b>
-                          <button
-                            onClick={() => setChatFriend(friend)}
-                            className={`rounded-lg p-1 transition-colors ${chatFriend?.id === friend.id ? "bg-primary text-white" : "text-muted-foreground hover:bg-primary/10 hover:text-primary"}`}
-                            title="Открыть чат"
-                          >
-                            <MessageCircle size={16} />
-                          </button>
-                        </div>
+                      <div className="min-w-0 flex-1">
+                        <b className="truncate text-sm">{friend.name}</b>
                         <div className="truncate text-[11px] text-muted-foreground">
                           {friend.id} · {friend.online ? 'В сети' : 'Не в сети'}
                         </div>
                       </div>
-                      <button onClick={() => removeFriend(friend.id)} className="rounded-lg p-2 text-muted-foreground hover:bg-red-50 hover:text-red-500" title="Удалить">
+                      <button
+                        onClick={() => setChatFriend(friend)}
+                        className={`relative shrink-0 rounded-lg p-2 transition-colors ${chatFriend?.id === friend.id ? "bg-primary text-white" : "text-muted-foreground hover:bg-primary/10 hover:text-primary"}`}
+                        title="Открыть чат"
+                      >
+                        <MessageCircle size={16} />
+                        {(unreadMap[friend.id] || 0) > 0 && (
+                          <span className="absolute -right-0.5 -top-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[9px] font-bold text-white">
+                            {unreadMap[friend.id] > 99 ? "99+" : unreadMap[friend.id]}
+                          </span>
+                        )}
+                      </button>
+                      <button
+                        onClick={() => removeFriend(friend.id)}
+                        className="shrink-0 rounded-lg p-2 text-muted-foreground hover:bg-red-50 hover:text-red-500"
+                        title="Удалить"
+                      >
                         <Trash2 size={15} />
                       </button>
                     </div>
@@ -7267,10 +7630,9 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
   // Звук скольжения фишки — играем, пока animPath активен.
   useEffect(() => {
-    if (animPath && animPath.length > 0) {
-      startSlideSound();
-      return () => stopSlideSound();
-    }
+    if (!animPath || animPath.length === 0) return;
+    startSlideSound();
+    return () => stopSlideSound();
   }, [animPath]);
     // Звук траты/пополнения по факту изменения моего баланса. Работает
   // автоматически при любом изменении: локальные setPlayers (я сам
@@ -13218,6 +13580,7 @@ function AppShell({
   gameMode = false,
   incomingTradesCount = 0,
   friendRequestsCount = 0,
+  unreadMessagesCount = 0,
   onOpenWallet,
 }: {
   tab: Tab;
@@ -13230,6 +13593,7 @@ function AppShell({
   gameMode?: boolean;
   incomingTradesCount?: number;
   friendRequestsCount?: number;
+  unreadMessagesCount?: number;
   onOpenWallet?: () => void;
 }) {
   const [mobileNav, setMobileNav] = useState(false);
@@ -13412,9 +13776,9 @@ useEffect(() => {
                     {incomingTradesCount}
                   </span>
                 )}
-                {id === "friends" && friendRequestsCount > 0 && (
+                {id === "friends" && (friendRequestsCount + unreadMessagesCount) > 0 && (
                   <span className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[#e7ba68] px-1 text-[9px] font-bold text-[#29233e]">
-                    {friendRequestsCount}
+                    {friendRequestsCount + unreadMessagesCount}
                   </span>
                 )}
               </button>
@@ -13755,6 +14119,7 @@ const [currentRoomId, setCurrentRoomId] = useState<string | null>(null);
   const [activeGame, setActiveGame] = useState<{ roomId: string; roomName: string; disconnected: boolean } | null>(null);
   const [incomingTradesCount, setIncomingTradesCount] = useState(0);
   const [friendRequestsCount, setFriendRequestsCount] = useState(0);
+  const [unreadMessagesCount, setUnreadMessagesCount] = useState(0);
 
   useEffect(() => {
     if (!player?.id || player.guest) {
@@ -13773,6 +14138,49 @@ const [currentRoomId, setCurrentRoomId] = useState<string | null>(null);
       socket.off("friend-status-changed", fetch);
     };
   }, [player?.id, player?.guest]);
+
+  // Непрочитанные личные сообщения от друзей. Хранятся в localStorage
+  // ключом arena-unread-<myUserId> в виде { [friendId]: count }.
+  // Home инкрементит при каждом friend-message-received; ChatPanel
+  // сбрасывает при открытии/просмотре чата. Бейдж на «Друзья» =
+  // friendRequestsCount + unreadMessagesCount.
+  useEffect(() => {
+    if (!player?.id || player.guest) {
+      setUnreadMessagesCount(0);
+      return;
+    }
+    const key = "arena-unread-" + player.id;
+
+    const read = (): Record<string, number> => {
+      try { return JSON.parse(localStorage.getItem(key) || "{}"); } catch { return {}; }
+    };
+    const recompute = () => {
+      const obj = read();
+      const total = Object.values(obj).reduce((s, v) => s + (Number(v) || 0), 0);
+      setUnreadMessagesCount(total);
+    };
+
+    recompute();
+
+    const onMessage = (data: any) => {
+      if (!data || !data.fromId) return;
+      const cur = read();
+      cur[data.fromId] = (cur[data.fromId] || 0) + 1;
+      try { localStorage.setItem(key, JSON.stringify(cur)); } catch {}
+      recompute();
+    };
+    const onChanged = () => recompute();
+
+    socket.on("friend-message-received", onMessage);
+    window.addEventListener("arena-unread-changed", onChanged);
+    window.addEventListener("storage", onChanged);
+    return () => {
+      socket.off("friend-message-received", onMessage);
+      window.removeEventListener("arena-unread-changed", onChanged);
+      window.removeEventListener("storage", onChanged);
+    };
+  }, [player?.id, player?.guest]);
+
   const [walletOpen, setWalletOpen] = useState(false);
   useEffect(() => {
     if (!player?.id) {
@@ -14072,6 +14480,7 @@ if (vipUntil) {
         onLogout={logout}
         incomingTradesCount={incomingTradesCount}
         friendRequestsCount={friendRequestsCount}
+        unreadMessagesCount={unreadMessagesCount}
         onOpenWallet={() => setWalletOpen(true)}
       >
         {adminContent}
@@ -14157,6 +14566,7 @@ if (vipUntil) {
         onLogout={logout}
         incomingTradesCount={incomingTradesCount}
         friendRequestsCount={friendRequestsCount}
+        unreadMessagesCount={unreadMessagesCount}
         onOpenWallet={() => setWalletOpen(true)}
       >
         {content}

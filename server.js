@@ -432,6 +432,11 @@ async function saveUserDataOne(uid) {
   {
     const d = userData[uid];
     if (!d) return;
+    // Гости в таблицу users не пишутся (см. register) — значит, писать их
+    // user_data нельзя: FK user_data_user_id_fkey падает.
+    // Гости эфемерны, их данные живут только в памяти до disconnect.
+    const u = users.find((x) => x.id === uid);
+    if (!u || u.guest) return;
     try {
       // ===== user_data (плоские поля) =====
       await db.query(

@@ -2,35 +2,20 @@
 
 ## Текущая рабочая версия
 
-- **48ddbd5** — чат-система: лимиты, авто-скролл, бейджи непрочитанных, история
+- **1e25dfe** — fix(db): не писать user_data для гостей (FK user_data_user_id_fkey)
 - Дата: 02.10.2026
-
-### Что вошло в 48ddbd5 + d8e8a37
-
-**Фронт (App.tsx):**
-- ChatPanel (личка): фикс. высота h-[min(560px,...)], textarea autosize до 120px,
-  break-words, Enter=отправить / Shift+Enter=перенос.
-- Авто-скролл вниз при новых сообщениях; кнопка «↓» при отдалении от низа >250px.
-- Лимит 40 сообщений в личке (slice(-40) при send / receive / автоочистке).
-- ACK для send-friend-message: локально добавляем только после {ok:true}.
-- Блокировка ввода на 5 сек при rate-limit (rateLimitedUntil), плашка
-  «⏳ Слишком часто…».
-- Бейдж у кнопки чата в Friends и Dashboard (unreadMap из localStorage
-  arena-unread-<userId>).
-- Бейдж «Друзья» в сайдбаре = friendRequestsCount + unreadMessagesCount.
-- Главный чат (Dashboard): лимит 300 сообщений, авто-скролл + кнопка «↓»,
-  ACK, блокировка на 5 сек, запрос истории (get-chat-history) при заходе.
-
-**Бэк (server.js):**
-- send-friend-message: callback-ACK, валидация сокета, rate-limit 5/3сек,
-  отказ при не-друзьях.
-- chat-message: callback-ACK, санитизация nickname/text, rate-limit 10/5сек.
-- globalChatHistory — кольцевой буфер последних 300 сообщений главного чата
-  в памяти (без БД).
-- get-chat-history — отдаёт последние 20 при запросе клиента.
 
 ## Предыдущие
 
+- **48ddbd5** — чат-система: лимиты, авто-скролл, бейджи непрочитанных, история
+  - Фронт (App.tsx): ChatPanel — фикс. высота, textarea autosize до 120px,
+    break-words; авто-скролл + кнопка «↓» при отдалении >250px; лимит 40 (личка)
+    и 300 (общий чат); ACK-обработка; блокировка ввода на 5 сек при rate-limit;
+    бейджи непрочитанных (Friends/Dashboard/сайдбар); запрос истории главного чата.
+  - Бэк (server.js): ACK + rate-limit для send-friend-message (5/3с) и
+    chat-message (10/5с); globalChatHistory — кольцевой буфер 300 в памяти;
+    get-chat-history — отдаёт последние 20.
+- **d8e8a37** — feat(chat): rate-limit, ACK, история общего чата на сервере
 - **ed8d612** — звук траты/пополнения привязан к изменению баланса
 - **64cc004** — звуки (ход/старт/трата/пополнение/джекпот) + фикс квеста
 - **720acd2** — огненный след (4 слоя) + jail-animation для наблюдателей

@@ -936,6 +936,51 @@ let serverStatus = "online";
 const onlineUsers = new Map();
 // Защита от параллельных покупок одного игрока (двойной клик/React StrictMode).
 const buyLocks = new Set();
+
+// Rate limit для личных сообщений: не больше 5 сообщений за 3 секунды.
+// Защита от спама и от перегрузки socket-ретрансляции при большом онлайне.
+// Ключ — userId отправителя. Запись перезаписывается при следующем сообщении.
+const friendMsgRate = new Map();
+const FRIEND_MSG_LIMIT = 5;
+const FRIEND_MSG_WINDOW_MS = 3000;
+
+function checkFriendMsgRate(userId) {
+  const now = Date.now();
+  const rec = friendMsgRate.get(userId);
+  if (!rec || now > rec.resetAt) {
+    friendMsgRate.set(userId, { count: 1, resetAt: now + FRIEND_MSG_WINDOW_MS });
+    return true;
+  }
+  if (rec.count >= FRIEND_MSG_LIMIT) return false;
+  rec.count++;
+  return true;
+}
+// Rate limit для общего чата на главной. Порог выше, чем в личке —
+// там пишут чаще. 10 сообщений за 5 секунд. Ключ — socket.id
+// (для глобала у гостей нет userId).
+const chatMsgRate = new Map();
+const CHAT_MSG_LIMIT = 10;
+const CHAT_MSG_WINDOW_MS = 5000;
+
+// История общего чата на главной. Храним последние 300 сообщений
+// в памяти процесса (не в БД — при рестарте сервера история сбрасывается).
+// Клиент при заходе на главную запрашивает последние 20, чтобы чат
+// не был пустым после F5. Полная история с сервера не отдаётся.
+const globalChatHistory = [];
+const GLOBAL_CHAT_HISTORY_MAX = 300;
+const GLOBAL_CHAT_HISTORY_SEND = 20;
+
+function checkChatMsgRate(socketId) {
+  const now = Date.now();
+  const rec = chatMsgRate.get(socketId);
+  if (!rec || now > rec.resetAt) {
+    chatMsgRate.set(socketId, { count: 1, resetAt: now + CHAT_MSG_WINDOW_MS });
+    return true;
+  }
+  if (rec.count >= CHAT_MSG_LIMIT) return false;
+  rec.count++;
+  return true;
+}
 // 5 fixed, maximally-distinct player slot colors
 const PLAYER_COLORS = ["#e63946", "#2ecc71", "#3a86ff", "#9b5de5", "#f77f00"];
 
@@ -2678,8 +2723,41 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     console.log(`Лобби ${roomId} удалено хостом`);
   });
 
-  socket.on('chat-message', (msg) => {
-    io.emit('chat-message', msg);
+  socket.on('chat-message', (msg, callback) => {
+    if (!msg || typeof msg.text !== 'string' || !msg.text.trim()) {
+      return callback?.({ ok: false, error: 'invalid' });
+    }
+    if (!checkChatMsgRate(socket.id)) {
+      const rec = chatMsgRate.get(socket.id);
+      const until = rec ? rec.resetAt : (Date.now() + CHAT_MSG_WINDOW_MS);
+      return callback?.({ ok: false, error: 'rate-limit', until });
+    }
+    // Санитизация: обрезаем nickname и text, чтобы нельзя было
+    // протащить гигантские строки и подделать формат.
+    const safe = {
+      nickname: String(msg.nickname || 'Гость клуба').slice(0, 40),
+      text: String(msg.text).trim().slice(0, 500),
+      timestamp: msg.timestamp || new Date().toISOString(),
+    };
+    io.emit('chat-message', safe);
+    // Кладём в буфер истории. Обрезаем до последних 300.
+    globalChatHistory.push(safe);
+    if (globalChatHistory.length > GLOBAL_CHAT_HISTORY_MAX) {
+      globalChatHistory.splice(
+        0,
+        globalChatHistory.length - GLOBAL_CHAT_HISTORY_MAX,
+      );
+    }
+    callback?.({ ok: true });
+  });
+
+  // Клиент запрашивает последние 20 сообщений при заходе на главную
+  // (после F5 или после переключения вкладок).
+  socket.on('get-chat-history', () => {
+    socket.emit(
+      'chat-history',
+      globalChatHistory.slice(-GLOBAL_CHAT_HISTORY_SEND),
+    );
   });
 
   // Обработчик игрового лога (чтобы все видели действия друг друга)
@@ -2696,6 +2774,13 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     if (!data || !data.roomId || !data.playerId) return;
     socket.to(data.roomId).emit('challenge-animation-broadcast', data);
     console.log('[challenge-anim] server broadcast to room', data.roomId);
+  });
+
+  // Анимация «В тюрьму»: диагональное перемещение от клетки 30 к клетке 10.
+  // Наблюдатели воспроизводит ту же последовательность.
+  socket.on('jail-animation', (data) => {
+    if (!data || !data.roomId || !data.playerId) return;
+    socket.to(data.roomId).emit('jail-animation-broadcast', data);
   });
   socket.on('trade-proposed', ({ roomId, initiatorId, trade }) => {
     socket.to(roomId).emit('trade-proposed-broadcast', { initiatorId, trade });
@@ -2786,6 +2871,46 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
         console.log(`🗑 Комната ${roomId} удалена после завершения игры`);
       }, 8000);
     }
+  });
+  // ---- ЛИЧНЫЕ СООБЩЕНИЯ МЕЖДУ ДРУЗЬЯМИ ----
+  // Отправитель: socket.emit('send-friend-message', {fromUserId, fromName, toUserId, text, timestamp})
+  // Получатель: socket.on('friend-message-received', {fromId, fromName, text, timestamp})
+  // Отправителю: socket.emit('friend-message-sent', {toId, timestamp}) — для возможного echo/лога
+  socket.on('send-friend-message', (data, callback) => {
+    if (!data || !data.fromUserId || !data.toUserId || !data.text) {
+      return callback?.({ ok: false, error: 'invalid' });
+    }
+    // Валидация: сообщение должно идти от владельца этого сокета.
+    const senderSocketId = onlineUsers.get(data.fromUserId);
+    if (senderSocketId !== socket.id) {
+      return callback?.({ ok: false, error: 'forbidden' });
+    }
+    // Rate limit — защита от спама. Клиент получит until и заблокирует
+    // поле ввода до этой метки.
+    if (!checkFriendMsgRate(data.fromUserId)) {
+      const rec = friendMsgRate.get(data.fromUserId);
+      const until = rec ? rec.resetAt : (Date.now() + FRIEND_MSG_WINDOW_MS);
+      return callback?.({ ok: false, error: 'rate-limit', until });
+    }
+    // Проверяем, что это действительно друзья.
+    const friends = userData[data.fromUserId]?.friends || [];
+    if (!friends.includes(data.toUserId)) {
+      return callback?.({ ok: false, error: 'not-friends' });
+    }
+
+    const payload = {
+      fromId: data.fromUserId,
+      fromName: data.fromName || "Игрок",
+      text: String(data.text).slice(0, 2000),
+      timestamp: Number(data.timestamp) || Date.now(),
+    };
+
+    const targetSocketId = onlineUsers.get(data.toUserId);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('friend-message-received', payload);
+    }
+    // ACK отправителю — клиент добавит сообщение локально только при ok:true.
+    callback?.({ ok: true });
   });
 
     // --- ДРУЗЬЯ ---

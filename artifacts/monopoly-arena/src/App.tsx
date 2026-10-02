@@ -5710,6 +5710,12 @@ const timeLeftRef = useRef(45);
   } | null>(null);
   const pendingJailMovementRef = useRef<{ d1: number; d2: number; capturedTurn: number } | null>(null);
   const [turn, setTurn] = useState(0);
+  // Триггер принудительной отправки sync-game-state. Если его увеличить —
+  // useEffect с deps сработает и снапшот улетит немедленно, не дожидаясь
+  // изменения owners/turn и т.д. Нужно, чтобы наблюдатели сразу видели
+  // смену позиции после испытания (иначе телепорт виден только
+  // после следующего действия игрока).
+  const [syncNudge, setSyncNudge] = useState(0);
   const [turnFlash, setTurnFlash] = useState(false);
   const [mortgages, setMortgages] = useState<Record<number, number>>({});
   const [globalTurnCounter, setGlobalTurnCounter] = useState(0);
@@ -5921,6 +5927,23 @@ resolveGameDesigns(cleanPlayers);
     // Подписываемся на события сервера строго один раз при монтировании
     socket.on('update-game-players', handlePlayersUpdate);
     socket.on('game-chat-message-broadcast', handleBroadcastMessage);
+
+    // Анимация испытания у наблюдателей: получаем {playerId, from, to}
+    // и воспроизводим ту же последовательность, что активный игрок.
+    socket.on('challenge-animation-broadcast', (data: any) => {
+      console.log("[challenge-anim] received", data, "myId:", currentUser?.id);
+      if (!data || !data.playerId) return;
+      if (data.playerId === (currentUser?.id || "you")) return;
+      setFireTrailAnim({ from: data.from, to: data.to, playerId: data.playerId });
+      window.setTimeout(() => {
+        setPlayers((ps) =>
+          ps.map((p) => (p.id === data.playerId ? { ...p, position: data.to } : p))
+        );
+        window.setTimeout(() => {
+          setFireTrailAnim(null);
+        }, 1500);
+      }, 600);
+    });
     socket.on('game-log-add-broadcast', handleGameLogBroadcast);
 
     // Настройки режима с сервера. Приходят сразу после enter-game-room.
@@ -6098,6 +6121,12 @@ resolveGameDesigns(cleanPlayers);
       }
       setOwners(data.owners);
       setImprovements(data.improvements);
+      // Если ход перешёл к другому игроку — сбрасываем историю улучшений
+      // этого хода. Без этого improvedGroupsThisTurn остаётся старым
+      // (от моего прошлого хода), и кнопка «Улучшить» блокируется.
+      if (data.turn !== turnRef.current) {
+        setImprovedGroupsThisTurn([]);
+      }
       setTurn(data.turn);
       setGlobalTurnCounter(data.globalTurnCounter);
       setJackpot(data.jackpot);
@@ -6191,6 +6220,7 @@ resolveGameDesigns(cleanPlayers);
         return () => {
       socket.off('update-game-players', handlePlayersUpdate);
       socket.off('game-chat-message-broadcast', handleBroadcastMessage);
+      socket.off('challenge-animation-broadcast');
       socket.off('server-roll-result');
       socket.off('game-log-add-broadcast', handleGameLogBroadcast);
       socket.off('player-left'); // <--- ДОБАВИТЬ
@@ -7170,6 +7200,17 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         const desc = ev.desc.replace(/{name}/g, cur.name);
         addLog(`⚡ ${desc} → «${getCell(nPos).name}»`);
 
+        // Сообщаем наблюдателям — они запустят ту же анимацию и
+        // переставят фишку в тот же момент, что и у нас.
+        if (initialRoomId) {
+          socket.emit('challenge-animation', {
+            roomId: initialRoomId,
+            playerId: cur.id,
+            from: newPos,
+            to: nPos,
+          });
+        }
+
         // Запускаем огненный след
         setFireTrailAnim({ from: newPos, to: nPos, playerId: cur.id });
 
@@ -7177,6 +7218,9 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           setPlayers((ps) =>
             ps.map((p, i) => (i === capturedTurn ? { ...p, position: nPos } : p))
           );
+          // Принудительная отправка снапшота — чтобы наблюдатели
+          // сразу увидели новую позицию, не дожидаясь действия.
+          setSyncNudge((n) => n + 1);
 
           setTimeout(() => {
             setFireTrailAnim(null);
@@ -8158,7 +8202,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       console.warn(`⚠️ sync: ${syncTotal}B | players: ${syncPlayers}B | skins: ${syncSkins}B — выше нормы`);
     }
     socket.emit('sync-game-state', syncPayload);
-    }, [turn, owners, improvements, jackpot, mortgages, gameOver, reward, auction, rolled, isDoubleRoll]);
+    }, [turn, owners, improvements, jackpot, mortgages, gameOver, reward, auction, rolled, isDoubleRoll, syncNudge]);
 
   // Заглушка для мобильных в портретной ориентации — играем только в ландшафте.
   if (isPortraitMobile) {

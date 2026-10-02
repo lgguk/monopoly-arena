@@ -2688,6 +2688,15 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     // socket.to(roomId) отправляет всем в комнате, КРОМЕ отправителя (убирает дубли)
     socket.to(data.roomId).emit('game-log-add-broadcast', data.entry);
   });
+
+  // Анимация испытания: активный игрок попал на клетку «Испытание»,
+  // отдаём наблюдателям координаты {from, to} для огненного следа.
+  socket.on('challenge-animation', (data) => {
+    console.log('[challenge-anim] server got', data);
+    if (!data || !data.roomId || !data.playerId) return;
+    socket.to(data.roomId).emit('challenge-animation-broadcast', data);
+    console.log('[challenge-anim] server broadcast to room', data.roomId);
+  });
   socket.on('trade-proposed', ({ roomId, initiatorId, trade }) => {
     socket.to(roomId).emit('trade-proposed-broadcast', { initiatorId, trade });
   });

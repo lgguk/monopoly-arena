@@ -342,9 +342,61 @@ const AUCTION_TIMER_SEC = 30;
 // без интернета. Громкость 0.35 (35%), два тона (880 + 1320 Гц) с
 // быстрым затуханием. AudioContext создаётся один раз и переиспользуется.
 let audioCtxRef: AudioContext | null = null;
+
+// Звуковой замок: пока он активен, базовые звуки (трата / пополнение /
+// ход) не играют. Ставится спец-звуками (старт игры, джекпот win/lose),
+// чтобы не накладываться, например:
+//  - старт партии + звук уведомления о первом ходе;
+//  - джекпот (победа/поражение) + звук списания/начисления ставки и приза.
+let soundLockUntil = 0;
+function lockSounds(ms: number) {
+  soundLockUntil = Math.max(soundLockUntil, Date.now() + ms);
+}
+function isSoundLocked() {
+  return Date.now() < soundLockUntil;
+}
 // Общий «динь»-проигрыватель: принимает массив {freq, start, dur, volume}.
 // Используется для turn/start/spend/jackpot-win. Экспоненциальное
 // затухание — звук мягко уходит в ноль.
+// Хелпер для прослушки прямо из консоли браузера (F12):
+//   setSlideProfile("plastic") — пластик по дереву
+//   setSlideProfile("ceramic") — керамика по сукну
+//   setSlideProfile("wooden")  — дерево по картону (по умолчанию)
+// Выбор сохраняется в localStorage.
+(window as any).setSlideProfile = (name: string) => {
+  if (name !== "plastic" && name !== "ceramic" && name !== "wooden") {
+    console.log("Доступные профили: plastic | ceramic | wooden");
+    return;
+  }
+  currentSlideProfile = name as SlideProfile;
+  try { localStorage.setItem("arena-slide-profile", name); } catch {}
+  // Если звук уже играет — перезапускаем с новым профилем.
+  if (slideSourceRef) {
+    stopSlideSound();
+    window.setTimeout(() => startSlideSound(), 200);
+  }
+  console.log(`🎵 Slide profile: ${name}`);
+};
+(window as any).setSpendProfile = (name: string) => {
+  if (name !== "banknotes" && name !== "chips") {
+    console.log("Доступные профили траты: banknotes | chips");
+    return;
+  }
+  currentSpendProfile = name as SpendProfile;
+  try { localStorage.setItem("arena-spend-profile", name); } catch {}
+  console.log(`💰 Spend profile: ${name}`);
+};
+
+(window as any).setGainProfile = (name: string) => {
+  if (name !== "coin_rain" && name !== "coins") {
+    console.log("Доступные профили пополнения: coin_rain | coins");
+    return;
+  }
+  currentGainProfile = name as GainProfile;
+  try { localStorage.setItem("arena-gain-profile", name); } catch {}
+  console.log(`💵 Gain profile: ${name}`);
+};
+
 function playDingSequence(
   notes: { freq: number; start: number; dur: number; volume?: number }[],
   masterVolume = 0.35,
@@ -377,6 +429,9 @@ function playDingSequence(
 
 // Старт игры — восходящая торжественная фигура из 4 нот.
 function playGameStartSound() {
+  // Блокируем базовые звуки на 1.5 сек — пока звучит старт партии,
+  // не должно вклиниться уведомление о первом ходе.
+  lockSounds(1500);
   playDingSequence([
     { freq: 660, start: 0, dur: 0.18 },
     { freq: 880, start: 0.12, dur: 0.20 },
@@ -385,8 +440,86 @@ function playGameStartSound() {
   ], 0.35);
 }
 
-// Списание денег — короткий кассовый «бип-буп». Прямоугольный сигнал
-// (как у сканера), два тона 1200 → 950 Гц, быстрые.
+// Профили звука траты (оплата аренды, налог, покупка, штраф).
+//   banknotes — «шуршание банкнот»: хрустящие купюры на стол
+//   chips     — «глухой расчет фишками»: 4 керамические фишки по сукну
+type SpendProfile = "banknotes" | "chips";
+let currentSpendProfile: SpendProfile = (() => {
+  try {
+    const saved = localStorage.getItem("arena-spend-profile");
+    if (saved === "banknotes" || saved === "chips") return saved;
+  } catch {}
+  return "banknotes"; // дефолт — шуршание банкнот
+})();
+
+// «Шуршание банкнот». Три короткие вспышки шума в высоких частотах,
+// без тона — сухо, матово, «хруст-хруст-хруст».
+function playSpendBanknotes(ctx: AudioContext) {
+  const now = ctx.currentTime;
+  const buffer = makeNoiseBuffer(ctx, "white");
+  for (let i = 0; i < 3; i++) {
+    const start = now + i * 0.055 + Math.random() * 0.01;
+    const dur = 0.035 + Math.random() * 0.02;
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.loop = true;
+
+    const hp = ctx.createBiquadFilter();
+    hp.type = "highpass";
+    hp.frequency.value = 1800 + Math.random() * 800;
+    hp.Q.value = 0.7;
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = "lowpass";
+    lp.frequency.value = 6500;
+    lp.Q.value = 0.6;
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, start);
+    g.gain.exponentialRampToValueAtTime(0.18, start + 0.005);
+    g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+
+    src.connect(hp);
+    hp.connect(lp);
+    lp.connect(g);
+    g.connect(ctx.destination);
+    src.start(start, Math.random() * buffer.duration * 0.5);
+    src.stop(start + dur + 0.02);
+  }
+}
+
+// «Глухой расчет фишками». 4 коротких треугольных удара 500-700 Гц
+// с понижением тона и низкочастотным фильтром — деревянно-керамический стук.
+function playSpendChips(ctx: AudioContext) {
+  const now = ctx.currentTime;
+  const baseFreqs = [520, 620, 560, 680];
+  for (let i = 0; i < 4; i++) {
+    const start = now + i * 0.06 + Math.random() * 0.015;
+    const dur = 0.075 + Math.random() * 0.02;
+    const base = baseFreqs[i] + (Math.random() - 0.5) * 40;
+    const osc = ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.setValueAtTime(base, start);
+    osc.frequency.exponentialRampToValueAtTime(base * 0.75, start + dur);
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, start);
+    g.gain.exponentialRampToValueAtTime(0.28, start + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = "lowpass";
+    lp.frequency.value = 1600;
+    lp.Q.value = 0.7;
+
+    osc.connect(lp);
+    lp.connect(g);
+    g.connect(ctx.destination);
+    osc.start(start);
+    osc.stop(start + dur + 0.02);
+  }
+}
+
 function playSpendSound() {
   try {
     if (!audioCtxRef) {
@@ -396,30 +529,95 @@ function playSpendSound() {
     }
     const ctx = audioCtxRef;
     if (ctx.state === "suspended") ctx.resume();
-    const now = ctx.currentTime;
-    const notes = [
-      { freq: 1200, start: 0, dur: 0.06 },
-      { freq: 950, start: 0.07, dur: 0.12 },
-    ];
-    notes.forEach(({ freq, start, dur }) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "square";
-      osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0.0001, now + start);
-      gain.gain.exponentialRampToValueAtTime(0.22, now + start + 0.005);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(now + start);
-      osc.stop(now + start + dur + 0.02);
-    });
+    // См. playGainSound.
+    lockSounds(currentSpendProfile === "banknotes" ? 450 : 550);
+    if (currentSpendProfile === "banknotes") playSpendBanknotes(ctx);
+    else playSpendChips(ctx);
   } catch {}
 }
 
-// Получение денег — сыплющиеся монеты. Серия коротких высоких
-// «кликов» треугольником (металлический оттенок) с рандомной высотой
-// и задержкой — эффект падающих монет.
+// Профили звука пополнения (аренда получена, зарплата, +К из шанса).
+//   coin_rain — «монетный дождь»: горсть монет рассыпается, дзинь-дзинь
+//   coins     — «короткий звон»: 2-3 монеты друг об друга, чисто и коротко
+type GainProfile = "coin_rain" | "coins";
+let currentGainProfile: GainProfile = (() => {
+  try {
+    const saved = localStorage.getItem("arena-gain-profile");
+    if (saved === "coin_rain" || saved === "coins") return saved;
+  } catch {}
+  return "coins"; // дефолт — короткий звон: играет часто, не утомляет
+})();
+
+// «Монетный дождь». 12 «монеток» — треугольник + синус-обертон ×1.5
+// для металличности, рандомная высота 2600-4600 Гц.
+function playGainCoinRain(ctx: AudioContext) {
+  const now = ctx.currentTime;
+  for (let i = 0; i < 12; i++) {
+    const start = i * 0.032 + Math.random() * 0.03;
+    const freq = 2600 + Math.random() * 2000;
+    const dur = 0.05 + Math.random() * 0.04;
+
+    const osc = ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.value = freq;
+
+    const osc2 = ctx.createOscillator();
+    osc2.type = "sine";
+    osc2.frequency.value = freq * 1.5;
+    const g2 = ctx.createGain();
+    g2.gain.value = 0.4;
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now + start);
+    g.gain.exponentialRampToValueAtTime(0.11, now + start + 0.003);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
+
+    osc.connect(g);
+    osc2.connect(g2);
+    g2.connect(g);
+    g.connect(ctx.destination);
+    osc.start(now + start);
+    osc.stop(now + start + dur + 0.02);
+    osc2.start(now + start);
+    osc2.stop(now + start + dur + 0.02);
+  }
+}
+
+// «Короткий звон». 3 монеты, чисто и коротко: подходит для «круга Вперёд»,
+// чтобы не утомлять при частом повторении.
+function playGainCoins(ctx: AudioContext) {
+  const now = ctx.currentTime;
+  const freqs = [2800, 3400, 3900];
+  for (let i = 0; i < 3; i++) {
+    const start = now + i * 0.055 + Math.random() * 0.01;
+    const dur = 0.045 + Math.random() * 0.015;
+
+    const osc = ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.value = freqs[i] + (Math.random() - 0.5) * 120;
+
+    const osc2 = ctx.createOscillator();
+    osc2.type = "sine";
+    osc2.frequency.value = osc.frequency.value * 1.6;
+    const g2 = ctx.createGain();
+    g2.gain.value = 0.35;
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, start);
+    g.gain.exponentialRampToValueAtTime(0.16, start + 0.002);
+    g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+
+    osc.connect(g);
+    osc2.connect(g2);
+    g2.connect(g);
+    g.connect(ctx.destination);
+    osc.start(start);
+    osc.stop(start + dur + 0.02);
+    osc2.start(start);
+    osc2.stop(start + dur + 0.02);
+  }
+}
+
 function playGainSound() {
   try {
     if (!audioCtxRef) {
@@ -429,29 +627,20 @@ function playGainSound() {
     }
     const ctx = audioCtxRef;
     if (ctx.state === "suspended") ctx.resume();
-    const now = ctx.currentTime;
-    // 7 «монеток» с разной высотой и микро-задержкой.
-    for (let i = 0; i < 7; i++) {
-      const start = i * 0.045 + Math.random() * 0.02;
-      const freq = 2200 + Math.random() * 1200;
-      const dur = 0.05 + Math.random() * 0.03;
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "triangle";
-      osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0.0001, now + start);
-      gain.gain.exponentialRampToValueAtTime(0.12, now + start + 0.003);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(now + start);
-      osc.stop(now + start + dur + 0.02);
-    }
+    // Замок на время звука: если сразу за этим идёт уведомление о ходе,
+    // оно отложится до конца пополнения, а не наложится.
+    lockSounds(currentGainProfile === "coin_rain" ? 700 : 450);
+    if (currentGainProfile === "coin_rain") playGainCoinRain(ctx);
+    else playGainCoins(ctx);
   } catch {}
 }
 
 // Победа в джекпоте — восходящая трезвучная арпеджио.
 function playJackpotWinSound() {
+  // Блокируем трату/пополнение на 1.2 сек: джекпот меняет баланс
+  // (списание ставки + начисление приза) → без замка играли бы ещё
+  // звук списания и/или начисления поверх.
+  lockSounds(1200);
   playDingSequence([
     { freq: 880, start: 0, dur: 0.15 },
     { freq: 1100, start: 0.10, dur: 0.15 },
@@ -462,6 +651,8 @@ function playJackpotWinSound() {
 
 // Поражение в джекпоте — нисходящая фигура, минорная.
 function playJackpotLoseSound() {
+  // См. playJackpotWinSound — тот же смысл.
+  lockSounds(1200);
   playDingSequence([
     { freq: 660, start: 0, dur: 0.18 },
     { freq: 550, start: 0.14, dur: 0.20 },
@@ -469,10 +660,106 @@ function playJackpotLoseSound() {
   ], 0.35);
 }
 
-// Скольжение фишки — зацикленный шумовой эффект «шшшк» через bandpass.
-// Плавный fade-in/out при старте/стопе, чтобы не было щелчков.
+// Скольжение фишки. Движок — зацикленный шум, пропущенный через
+// фильтры + LFO-модуляция. Три профиля под разные материалы:
+//   plastic — пластиковая фишка по лакированному дереву (звонко, резко)
+//   ceramic — керамика по сукну покерного стола (глухо, мягко)
+//   wooden  — деревянный мипл по картону (шершаво, матово)
+type SlideProfile = "plastic" | "ceramic" | "wooden";
+
+const SLIDE_PROFILES: Record<SlideProfile, {
+  noiseColor: "white" | "brown" | "pink";
+  filterType: BiquadFilterType;
+  frequency: number;
+  Q: number;
+  secondFilter?: { type: BiquadFilterType; frequency: number; Q: number };
+  gain: number;
+  lfoHz: number;
+  lfoDepth: number;
+}> = {
+  // 1) Пластик по дереву. Узкий bandpass высоко, лёгкая LFO — «шшшик».
+  plastic: {
+    noiseColor: "white",
+    filterType: "bandpass",
+    frequency: 2200,
+    Q: 7,
+    gain: 0.09,
+    lfoHz: 0.08,
+    lfoDepth: 0.15,
+  },
+  // 2) Керамика по сукну. Низкий brown noise, двойной lowpass — «фффшух».
+  ceramic: {
+    noiseColor: "brown",
+    filterType: "lowpass",
+    frequency: 320,
+    Q: 1.2,
+    secondFilter: { type: "lowpass", frequency: 800, Q: 0.7 },
+    gain: 0.16,
+    lfoHz: 0.05,
+    lfoDepth: 0.20,
+  },
+  // 3) Дерево по картону. Средний bandpass + второй «шершавый» слой
+  //    с быстрой LFO — «шшух-шшух» с зернистостью.
+  wooden: {
+    noiseColor: "white",
+    filterType: "bandpass",
+    frequency: 950,
+    Q: 3.5,
+    secondFilter: { type: "bandpass", frequency: 2600, Q: 2 },
+    gain: 0.0825,
+    lfoHz: 0.10,
+    lfoDepth: 0.25,
+  },
+};
+
 let slideSourceRef: AudioBufferSourceNode | null = null;
 let slideGainRef: GainNode | null = null;
+let slideLfoRef: OscillatorNode | null = null;
+let currentSlideProfile: SlideProfile = (() => {
+  try {
+    const saved = localStorage.getItem("arena-slide-profile");
+    if (saved === "plastic" || saved === "ceramic" || saved === "wooden") {
+      return saved;
+    }
+  } catch {}
+  // По умолчанию — «дерево по картону»: ближе всего к настольной игре.
+  return "wooden";
+})();
+
+// Окрашивание шума. white — равномерный, brown — низкочастотный,
+// pink — между ними. Логика классическая (Paul Kellet для pink).
+function makeNoiseBuffer(
+  ctx: AudioContext,
+  color: "white" | "brown" | "pink",
+): AudioBuffer {
+  const size = 2 * ctx.sampleRate;
+  const buffer = ctx.createBuffer(1, size, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  if (color === "white") {
+    for (let i = 0; i < size; i++) data[i] = Math.random() * 2 - 1;
+  } else if (color === "brown") {
+    let last = 0;
+    for (let i = 0; i < size; i++) {
+      const white = Math.random() * 2 - 1;
+      last = (last + 0.02 * white) / 1.02;
+      data[i] = last * 3.5;
+    }
+  } else {
+    let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+    for (let i = 0; i < size; i++) {
+      const white = Math.random() * 2 - 1;
+      b0 = 0.99886 * b0 + white * 0.0555179;
+      b1 = 0.99332 * b1 + white * 0.0750759;
+      b2 = 0.96900 * b2 + white * 0.1538520;
+      b3 = 0.86650 * b3 + white * 0.3104856;
+      b4 = 0.55000 * b4 + white * 0.5329522;
+      b5 = -0.7616 * b5 - white * 0.0168980;
+      data[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362) * 0.11;
+      b6 = white * 0.115926;
+    }
+  }
+  return buffer;
+}
 
 function startSlideSound() {
   try {
@@ -485,32 +772,51 @@ function startSlideSound() {
     if (ctx.state === "suspended") ctx.resume();
     if (slideSourceRef) return; // уже играет
 
-    // 2 секунды белого шума, играем по кругу.
-    const bufSize = 2 * ctx.sampleRate;
-    const buffer = ctx.createBuffer(1, bufSize, ctx.sampleRate);
-    const data = buffer.getChannelData(0);
-    for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+    const p = SLIDE_PROFILES[currentSlideProfile];
+    const buffer = makeNoiseBuffer(ctx, p.noiseColor);
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.loop = true;
 
     const filter = ctx.createBiquadFilter();
-    filter.type = "lowpass";
-    filter.frequency.value = 380; // мягкий низкий гул вместо «воды»
-    filter.Q.value = 3.5;         // узкий резонанс — «трение дерева»
+    filter.type = p.filterType;
+    filter.frequency.value = p.frequency;
+    filter.Q.value = p.Q;
+    source.connect(filter);
+
+    let lastNode: AudioNode = filter;
+    if (p.secondFilter) {
+      const f2 = ctx.createBiquadFilter();
+      f2.type = p.secondFilter.type;
+      f2.frequency.value = p.secondFilter.frequency;
+      f2.Q.value = p.secondFilter.Q;
+      filter.connect(f2);
+      lastNode = f2;
+    }
 
     const gain = ctx.createGain();
     gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    gain.gain.linearRampToValueAtTime(0.20, ctx.currentTime + 0.10);
-
-    source.connect(filter);
-    filter.connect(gain);
+    gain.gain.linearRampToValueAtTime(p.gain, ctx.currentTime + 0.10);
+    lastNode.connect(gain);
     gain.connect(ctx.destination);
+
+    // LFO модулирует частоту фильтра — даёт «шершавость» и неровность,
+    // как будто фишка проходит по шероховатостям стола.
+    const lfo = ctx.createOscillator();
+    lfo.type = "sine";
+    lfo.frequency.value = p.lfoHz;
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.value = p.frequency * p.lfoDepth;
+    lfo.connect(lfoGain);
+    lfoGain.connect(filter.frequency);
+    lfo.start();
+
     source.start();
 
     slideSourceRef = source;
     slideGainRef = gain;
+    slideLfoRef = lfo;
   } catch {}
 }
 
@@ -520,14 +826,17 @@ function stopSlideSound() {
     const ctx = audioCtxRef;
     const gain = slideGainRef;
     const source = slideSourceRef;
+    const lfo = slideLfoRef;
     gain.gain.cancelScheduledValues(ctx.currentTime);
     gain.gain.setValueAtTime(gain.gain.value, ctx.currentTime);
     gain.gain.linearRampToValueAtTime(0.0001, ctx.currentTime + 0.12);
     window.setTimeout(() => {
       try { source?.stop(); } catch {}
+      try { lfo?.stop(); } catch {}
     }, 200);
     slideSourceRef = null;
     slideGainRef = null;
+    slideLfoRef = null;
   } catch {}
 }
 
@@ -551,7 +860,7 @@ function playTurnSound() {
       osc.type = "sine";
       osc.frequency.value = freq;
       gain.gain.setValueAtTime(0.0001, now + start);
-      gain.gain.exponentialRampToValueAtTime(0.35, now + start + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.2975, now + start + 0.01);
       gain.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
       osc.connect(gain);
       gain.connect(ctx.destination);
@@ -7175,10 +7484,27 @@ resolveGameDesigns(cleanPlayers);
     if (!currentPlayerId) return;
     if (currentPlayerId !== (currentUser?.id || "you")) return;
 
-    playTurnSound();
+    // Звук глушим, если играет спец-звук (старт партии, джекпот,
+    // а также трата/пополнение — чтобы не накладывались).
+    // Вспышку панели показываем сразу — это визуальный индикатор.
     setTurnFlash(true);
-    const t = window.setTimeout(() => setTurnFlash(false), 800);
-    return () => window.clearTimeout(t);
+    const flashT = window.setTimeout(() => setTurnFlash(false), 800);
+
+    const playDelayed = () => {
+      playTurnSound();
+    };
+    let soundT: number | undefined;
+    if (!isSoundLocked()) {
+      playDelayed();
+    } else {
+      // Откладываем звук хода до конца текущего замка + небольшой отступ.
+      const delay = Math.max(0, soundLockUntil - Date.now()) + 80;
+      soundT = window.setTimeout(playDelayed, delay);
+    }
+    return () => {
+      window.clearTimeout(flashT);
+      if (soundT !== undefined) window.clearTimeout(soundT);
+    };
   }, [turn]);
   useEffect(() => { ownersRef.current = owners; }, [owners]);
   useEffect(() => { improvementsRef.current = improvements; }, [improvements]);
@@ -7843,6 +8169,8 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     prevMoneyRef.current = me.money;
     if (prev === null) return;
     if (prev === me.money) return;
+    // Спец-звук (старт игры, джекпот) уже играет — не накладываемся.
+    if (isSoundLocked()) return;
     if (me.money > prev) playGainSound();
     else playSpendSound();
   }, [players]);

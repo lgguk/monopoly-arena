@@ -662,7 +662,34 @@ async function finalizeGame(roomId) {
   if (aliveCount > 1) return;
 
   room.finalized = true;
-  console.log(`🏁 Финализация партии ${roomId}. Живых: ${aliveCount}`);
+
+  // === АНТИ-ФАРМ ===
+  // Полная (полноценная) партия требует ОБА условия:
+  //   1) длительность >= 5 минут;
+  //   2) каждый живой на момент финализации сделал >= 7 бросков.
+  // Плюс победитель должен быть живым — это гарантируется тем, что
+  // place 1 получает только игрок из `alive` (см. ниже). Если все
+  // вышли живыми или все банкроты — place 1 никому не присваивается.
+  //
+  // Если хотя бы одно из условий не выполнено — партия считается
+  // короткой: всем не-leftAlive даётся 1 coin + 10 xp без VIP-бонусов
+  // и без дропа.
+  const startedAt = Number(room.startedAt) || 0;
+  const gameDurationMs = startedAt > 0 ? Date.now() - startedAt : 0;
+  const durationOk = gameDurationMs >= 5 * 60 * 1000;
+  const rollsByPlayer = room.rollsByPlayer || {};
+  const finalAlive = players.filter(p => !p.bankrupt && !p.leftAlive);
+  const rollsOk =
+    finalAlive.length === 1 &&
+    finalAlive.every(p => (rollsByPlayer[p.id] || 0) > 6);
+  const isFullGame = durationOk && rollsOk;
+
+  console.log(
+    `🏁 Финализация партии ${roomId}. Живых: ${aliveCount}. ` +
+    `Длительность: ${Math.round(gameDurationMs / 1000)}с (${durationOk ? "≥5мин" : "<5мин"}). ` +
+    `Броски: ${finalAlive.map(p => `${p.name}:${rollsByPlayer[p.id] || 0}`).join(", ") || "—"}. ` +
+    `Полная партия: ${isFullGame ? "ДА" : "НЕТ"}`,
+  );
 
   const eliminationOrder = Array.isArray(room.eliminationOrder) ? room.eliminationOrder : [];
   const alive = players.filter(p => !p.bankrupt);
@@ -681,64 +708,86 @@ async function finalizeGame(roomId) {
     placeMap[pid] = basePlace + idx;
   });
 
-  // Считаем награды для каждого
+  const SHORT_GAME_COINS = 1;
+  const SHORT_GAME_XP = 10;
+
   const results = [];
   for (const p of players) {
     const place = placeMap[p.id] || 0;
 
+    // leftAlive или никому не присвоено место — награду не получает.
     if (place === 0) {
-      results.push({ userId: p.id, place: 0, coins: 0, xp: 0, dropName: null, leftAlive: !!p.leftAlive });
+      results.push({
+        userId: p.id,
+        place: 0,
+        coins: 0,
+        xp: 0,
+        dropName: null,
+        leftAlive: !!p.leftAlive,
+        shortGame: false,
+      });
       continue;
     }
 
-    const reward = PLACE_REWARDS[Math.min(place - 1, PLACE_REWARDS.length - 1)] || { coins: 0, xp: 0 };
-
-    // VIP × 2 к XP и +20% к Coins
-    const isVip = p.vipUntil ? new Date(p.vipUntil) > new Date() : false;
-    const xp = isVip ? Math.round(reward.xp * 1.5) : reward.xp;
-    const coins = isVip ? Math.round(reward.coins * 1.2) : reward.coins;
-
-    // Дроп предмета (25%)
+    let coins;
+    let xp;
     let dropName = null;
-    const realItems = marketItems.filter(i => i.isActive !== false);
-    if (Math.random() < 0.25 && realItems.length > 0) {
-      const drop = realItems[Math.floor(Math.random() * realItems.length)];
-      if (drop.category === 'vip') {
-        const days = Number(drop.vipDuration) || 7;
-        const now = Date.now();
-        const currentUntil = userData[p.id]?.vipUntil ? new Date(userData[p.id].vipUntil).getTime() : 0;
-        const baseTime = currentUntil > now ? currentUntil : now;
-        const vipEnd = new Date(baseTime + days * 24 * 60 * 60 * 1000);
-        if (userData[p.id]) userData[p.id].vipUntil = vipEnd.toISOString();
-        dropName = `${drop.name} (VIP +${days} дн.)`;
-      } else {
-        const ownedItem = {
-          id: `${drop.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          name: drop.name,
-          type: drop.category === 'dice' ? 'dice' : 'board',
-          rarity: drop.rarity,
-          color: '#29233e',
-          price: drop.price,
-          description: drop.description || (drop.category === 'dice' ? 'Скин кубиков' : 'Карточка поля'),
-          ownedAt: new Date().toISOString(),
-          slotIndex: drop.slotIndex,
-          imageDataUrl: drop.imageDataUrl,
-          marketItemId: drop.id,
-          cardWidth: drop.cardWidth,
-          cardHeight: drop.cardHeight,
-          imageHeight: drop.imageHeight,
-          shopScale: drop.shopScale,
-        };
-        if (userData[p.id]) {
-          if (!userData[p.id].inventory) userData[p.id].inventory = [];
-          userData[p.id].inventory.push(ownedItem);
+
+    if (isFullGame) {
+      const reward = PLACE_REWARDS[Math.min(place - 1, PLACE_REWARDS.length - 1)] || { coins: 0, xp: 0 };
+      const isVip = p.vipUntil ? new Date(p.vipUntil) > new Date() : false;
+      xp = isVip ? Math.round(reward.xp * 1.5) : reward.xp;
+      coins = isVip ? Math.round(reward.coins * 1.2) : reward.coins;
+
+      // Дроп — только в полной партии, шанс 25%.
+      const realItems = marketItems.filter(i => i.isActive !== false);
+      if (Math.random() < 0.25 && realItems.length > 0) {
+        const drop = realItems[Math.floor(Math.random() * realItems.length)];
+        if (drop.category === 'vip') {
+          const days = Number(drop.vipDuration) || 7;
+          const now = Date.now();
+          const currentUntil = userData[p.id]?.vipUntil ? new Date(userData[p.id].vipUntil).getTime() : 0;
+          const baseTime = currentUntil > now ? currentUntil : now;
+          const vipEnd = new Date(baseTime + days * 24 * 60 * 60 * 1000);
+          if (userData[p.id]) userData[p.id].vipUntil = vipEnd.toISOString();
+          dropName = `${drop.name} (VIP +${days} дн.)`;
+        } else {
+          const ownedItem = {
+            id: `${drop.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            name: drop.name,
+            type: drop.category === 'dice' ? 'dice' : 'board',
+            rarity: drop.rarity,
+            color: '#29233e',
+            price: drop.price,
+            description: drop.description || (drop.category === 'dice' ? 'Скин кубиков' : 'Карточка поля'),
+            ownedAt: new Date().toISOString(),
+            slotIndex: drop.slotIndex,
+            imageDataUrl: drop.imageDataUrl,
+            marketItemId: drop.id,
+            cardWidth: drop.cardWidth,
+            cardHeight: drop.cardHeight,
+            imageHeight: drop.imageHeight,
+            shopScale: drop.shopScale,
+          };
+          if (userData[p.id]) {
+            if (!userData[p.id].inventory) userData[p.id].inventory = [];
+            userData[p.id].inventory.push(ownedItem);
+          }
+          dropName = drop.name;
         }
-        dropName = drop.name;
       }
+    } else {
+      // Короткая партия — утешительная награда, без VIP-бонусов, без дропа.
+      coins = SHORT_GAME_COINS;
+      xp = SHORT_GAME_XP;
     }
 
     // Начисляем Coins
-    const change = await changeBalance(p.id, 'game_reward', coins, { place, dropName });
+    const change = await changeBalance(p.id, 'game_reward', coins, {
+      place,
+      dropName,
+      shortGame: !isFullGame,
+    });
     if (change.success) {
       const d = userData[p.id];
       if (d) {
@@ -748,24 +797,37 @@ async function finalizeGame(roomId) {
         d.stats.xp = (d.stats.xp || 0) + xp;
         d.stats.level = getLevelFromXp(d.stats.xp);
       }
-      // Квесты: сыграл партию — всем, кто не leftAlive (place > 0).
-      // Победил — только place === 1.
       markQuestProgress(p.id, 'playGame');
       if (place === 1) markQuestProgress(p.id, 'winGame');
       await saveUserData(p.id);
 
-      // Уведомление
       const placeWord = place === 1 ? "1 место" : `${place}-е место`;
       const dropInfo = dropName ? ` Дроп: «${dropName}».` : "";
-      await notifyUser(p.id, `🏆 Партия завершена: ${placeWord}, +${coins} Coins, +${xp} XP.${dropInfo}`);
+      const shortNote = !isFullGame
+        ? " Партия короткая — утешительная награда."
+        : "";
+      await notifyUser(
+        p.id,
+        `🏆 Партия завершена: ${placeWord}, +${coins} Coins, +${xp} XP.${dropInfo}${shortNote}`,
+      );
     }
 
-    results.push({ userId: p.id, place, coins, xp, dropName, leftAlive: false });
-    console.log(`🏆 ${p.id} → place ${place}, +${coins} Coins, +${xp} XP${dropName ? ', дроп: ' + dropName : ''}`);
+    results.push({
+      userId: p.id,
+      place,
+      coins,
+      xp,
+      dropName,
+      leftAlive: false,
+      shortGame: !isFullGame,
+    });
+    console.log(
+      `🏆 ${p.id} → place ${place}, +${coins} Coins, +${xp} XP` +
+      `${dropName ? ', дроп: ' + dropName : ''}` +
+      `${!isFullGame ? ' (короткая партия)' : ''}`,
+    );
   }
 
-  // Сохраняем результат в gameRooms, чтобы переподключившийся игрок
-  // мог его получить, если пропустил broadcast (был offline в момент).
   if (gameRooms[roomId]) {
     gameRooms[roomId].finalResults = results;
   }
@@ -964,8 +1026,63 @@ function checkFriendMsgRate(userId) {
 // там пишут чаще. 10 сообщений за 5 секунд. Ключ — socket.id
 // (для глобала у гостей нет userId).
 const chatMsgRate = new Map();
-const CHAT_MSG_LIMIT = 10;
+const CHAT_MSG_LIMIT = 5;
 const CHAT_MSG_WINDOW_MS = 5000;
+
+// Детект дублей в общем чате. Считаем подряд идущие одинаковые сообщения
+// (после нормализации: lowercase, без пунктуации, одиночные пробелы).
+// 3 подряд → блок на 30 секунд.
+const chatMsgHistory = new Map();
+const CHAT_DUP_LIMIT = 3;
+const CHAT_DUP_BLOCK_MS = 30000;
+
+function normalizeChatText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Возвращает { ok: true } либо { ok: false, blockMs }.
+// Хранит только последнее сообщение + счётчик повторов подряд на socketId.
+function checkChatDupes(socketId, text) {
+  const norm = normalizeChatText(text);
+  if (!norm) return { ok: true };
+  const last = chatMsgHistory.get(socketId) || { text: null, count: 0 };
+  if (last.text === norm) {
+    last.count += 1;
+  } else {
+    last.text = norm;
+    last.count = 1;
+  }
+  chatMsgHistory.set(socketId, last);
+  // 1-е сообщение — count=1 (ok). 2-е одинаковое — count=2 (ok).
+  // 3-е одинаковое подряд — count=3 → блок.
+  if (last.count >= CHAT_DUP_LIMIT) {
+    chatMsgHistory.set(socketId, { text: null, count: 0 });
+    return { ok: false, blockMs: CHAT_DUP_BLOCK_MS };
+  }
+  return { ok: true };
+}
+
+// Rate limit для игрового чата (внутри партии). Ключ — socket.id.
+// 5 сообщений за 3 секунды, лимит истории не нужен — комната живёт партию.
+const gameChatRate = new Map();
+const GAME_CHAT_LIMIT = 5;
+const GAME_CHAT_WINDOW_MS = 3000;
+
+function checkGameChatRate(socketId) {
+  const now = Date.now();
+  const rec = gameChatRate.get(socketId);
+  if (!rec || now > rec.resetAt) {
+    gameChatRate.set(socketId, { count: 1, resetAt: now + GAME_CHAT_WINDOW_MS });
+    return true;
+  }
+  if (rec.count >= GAME_CHAT_LIMIT) return false;
+  rec.count++;
+  return true;
+}
 
 // История общего чата на главной. Храним последние 300 сообщений
 // в памяти процесса (не в БД — при рестарте сервера история сбрасывается).
@@ -2372,9 +2489,23 @@ socket.on('admin-save-cases', async (newCases) => {
 socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases));
 
 
-  socket.on('game-chat-message', (data) => {
-    console.log(`[Чат комнаты ${data.roomId}] ${data.from}: ${data.text}`);
-    io.to(data.roomId).emit('game-chat-message-broadcast', data);
+  socket.on('game-chat-message', (data, callback) => {
+    if (!data || !data.roomId || typeof data.text !== 'string' || !data.text.trim()) {
+      return callback?.({ ok: false, error: 'invalid' });
+    }
+    if (!checkGameChatRate(socket.id)) {
+      const rec = gameChatRate.get(socket.id);
+      const until = rec ? rec.resetAt : (Date.now() + GAME_CHAT_WINDOW_MS);
+      return callback?.({ ok: false, error: 'rate-limit', until });
+    }
+    const safe = {
+      roomId: data.roomId,
+      from: String(data.from || 'Игрок').slice(0, 40),
+      text: String(data.text).trim().slice(0, 500),
+      timestamp: data.timestamp || Date.now(),
+    };
+    io.to(data.roomId).emit('game-chat-message-broadcast', safe);
+    callback?.({ ok: true });
   });
 
     // ============ ГОЛОСОВАНИЕ ЗА ИСКЛЮЧЕНИЕ ============
@@ -2629,6 +2760,10 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
           [arr[i], arr[j]] = [arr[j], arr[i]];
         }
         gameRooms[roomId].shuffled = true;
+        // Момент старта партии — для проверки минимальной длительности
+        // при финализации (анти-фарм). Плюс обнуляем счётчики бросков.
+        gameRooms[roomId].startedAt = Date.now();
+        gameRooms[roomId].rollsByPlayer = {};
         const order = arr.map(p => p.name).join(' → ');
         console.log(`🎲 Комната ${roomId}: порядок хода — ${order}`);
 
@@ -2710,6 +2845,15 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
   socket.on('roll-dice-request', ({ roomId, playerId }) => {
     const d1 = Math.floor(Math.random() * 6) + 1;
     const d2 = Math.floor(Math.random() * 6) + 1;
+
+    // Анти-фарм: считаем броски каждого игрока за партию.
+    // Используется в finalizeGame, чтобы отсеять «зашли-вышли-забрали».
+    if (roomId && playerId && gameRooms[roomId]) {
+      const room = gameRooms[roomId];
+      if (!room.rollsByPlayer) room.rollsByPlayer = {};
+      room.rollsByPlayer[playerId] = (room.rollsByPlayer[playerId] || 0) + 1;
+    }
+
     io.to(roomId).emit('server-roll-result', { d1, d2, playerId });
   });
 
@@ -2736,6 +2880,16 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       const rec = chatMsgRate.get(socket.id);
       const until = rec ? rec.resetAt : (Date.now() + CHAT_MSG_WINDOW_MS);
       return callback?.({ ok: false, error: 'rate-limit', until });
+    }
+    // Детект дублей — 3 одинаковых подряд → блок 30 секунд.
+    const dup = checkChatDupes(socket.id, msg.text);
+    if (!dup.ok) {
+      return callback?.({
+        ok: false,
+        error: 'rate-limit',
+        reason: 'duplicate',
+        until: Date.now() + dup.blockMs,
+      });
     }
     // Санитизация: обрезаем nickname и text, чтобы нельзя было
     // протащить гигантские строки и подделать формат.
@@ -3239,6 +3393,11 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
   socket.on('disconnect', async () => {
     console.log('Игрок отключился:', socket.id);
 
+    // Чистим rate-limit записи этого сокета (общий чат, игровой, дубли).
+    chatMsgRate.delete(socket.id);
+    chatMsgHistory.delete(socket.id);
+    gameChatRate.delete(socket.id);
+
     // НЕ удаляем игрока — помечаем как disconnected и запускаем таймер на 2 минуты
     for (const roomId in gameRooms) {
       const p = gameRooms[roomId].find(x => x.socketId === socket.id);
@@ -3266,17 +3425,17 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
         if (!player || !player.disconnected) return; // уже вернулся или вышел
         // Авто-банкротство по таймауту
         player.bankrupt = true;
+        // Игрок отвалился и не вернулся — награды не получит.
+        // leftAlive=true → finalizeGame не присвоит ему place.
+        player.leftAlive = true;
         player.money = 0;
         player.socketId = null;
         player.disconnected = false;
         io.to(roomId).emit('update-game-players', room);
         io.to(roomId).emit('player-left', player.id);
-        console.log(`⏰ ${player.name} не переподключился — авто-банкрот`);
+        console.log(`⏰ ${player.name} не переподключился — авто-банкрот (без награды)`);
 
-        // Записываем в eliminationOrder, если ещё нет
-        if (Array.isArray(room.eliminationOrder) && !room.eliminationOrder.includes(player.id)) {
-          room.eliminationOrder.push(player.id);
-        }
+        // НЕ пишем в eliminationOrder: place этому игроку не присваивается.
 
         const remainingAlive = room.filter(x => !x.bankrupt).length;
         if (remainingAlive <= 1) {

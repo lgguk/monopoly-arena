@@ -355,6 +355,107 @@ function lockSounds(ms: number) {
 function isSoundLocked() {
   return Date.now() < soundLockUntil;
 }
+
+// ============================================================
+// СЭМПЛЫ (mp3). Файлы лежат в public/sounds/, Vite копирует их в
+// dist/sounds/, URL — /sounds/<name>.mp3. Если файл не загрузился —
+// fallback на старый синтез (см. playGainSound / playSpendSound).
+// ============================================================
+
+// Кэш HTMLAudioElement. Ключ — короткое имя.
+const sampleCache = new Map<string, HTMLAudioElement>();
+// Сэмплы, которые не удалось загрузить — больше не пробуем, сразу fallback.
+const sampleFailed = new Set<string>();
+
+// Громкости по умолчанию. Меняются из консоли:
+//   setSoundVolume("casino-win", 0.7)
+// Сохраняются в localStorage.
+const soundVolumes: Record<string, number> = (() => {
+  const base: Record<string, number> = {
+    "casino-win": 0.7,
+    "casino-bet": 0.7,
+    gain: 0.7,
+    spend: 0.6,
+  };
+  for (const k of Object.keys(base)) {
+    try {
+      const saved = localStorage.getItem("arena-vol-" + k);
+      if (saved !== null) {
+        const v = Number(saved);
+        if (Number.isFinite(v) && v >= 0 && v <= 1) base[k] = v;
+      }
+    } catch {}
+  }
+  return base;
+})();
+
+// Длительности mp3 в миллисекундах (определены через ffprobe).
+// Нужны для lockSounds — чтобы turn/gain-звуки не накладывались.
+const sampleDurations: Record<string, number> = {
+  "casino-win": 4600,
+  "casino-bet": 1640,
+  gain: 1000,
+  spend: 563,
+};
+
+function playSample(name: string): boolean {
+  if (sampleFailed.has(name)) return false;
+  let el = sampleCache.get(name);
+  if (!el) {
+    try {
+      el = new Audio(`/sounds/${name}.mp3`);
+      el.preload = "auto";
+      el.volume = soundVolumes[name] ?? 0.7;
+      sampleCache.set(name, el);
+    } catch {
+      sampleFailed.add(name);
+      return false;
+    }
+  }
+  try {
+    // Клонируем — два быстрых клика подряд не должны ждать завершения.
+    const clone = el.cloneNode(true) as HTMLAudioElement;
+    clone.volume = soundVolumes[name] ?? 0.7;
+    const p = clone.play();
+    if (p && typeof p.catch === "function") p.catch(() => {});
+    return true;
+  } catch {
+    sampleFailed.add(name);
+    return false;
+  }
+}
+
+(window as any).setSoundVolume = (name: string, vol: number) => {
+  if (!(name in soundVolumes)) {
+    console.log(
+      "Доступные сэмплы: casino-win | casino-bet | gain | spend",
+    );
+    return;
+  }
+  if (typeof vol !== "number" || !Number.isFinite(vol) || vol < 0 || vol > 1) {
+    console.log("Громкость должна быть числом от 0 до 1");
+    return;
+  }
+  soundVolumes[name] = vol;
+  try { localStorage.setItem("arena-vol-" + name, String(vol)); } catch {}
+  console.log(`🔊 ${name}: ${vol}`);
+};
+
+// Предзагрузка при старте — чтобы первый клик не ждал загрузки mp3.
+if (typeof window !== "undefined") {
+  window.setTimeout(() => {
+    ["casino-win", "casino-bet", "gain", "spend"].forEach((n) => {
+      if (sampleCache.has(n) || sampleFailed.has(n)) return;
+      try {
+        const el = new Audio(`/sounds/${n}.mp3`);
+        el.preload = "auto";
+        el.volume = soundVolumes[n] ?? 0.7;
+        el.load();
+        sampleCache.set(n, el);
+      } catch {}
+    });
+  }, 400);
+}
 // Общий «динь»-проигрыватель: принимает массив {freq, start, dur, volume}.
 // Используется для turn/start/spend/jackpot-win. Экспоненциальное
 // затухание — звук мягко уходит в ноль.
@@ -396,6 +497,29 @@ function isSoundLocked() {
   try { localStorage.setItem("arena-gain-profile", name); } catch {}
   console.log(`💵 Gain profile: ${name}`);
 };
+
+(window as any).setJackpotWinProfile = (name: string) => {
+  if (name !== "bell_cascade" && name !== "synth_arpeggio") {
+    console.log("Доступные профили победы: bell_cascade | synth_arpeggio");
+    return;
+  }
+  currentJackpotWinProfile = name as JackpotWinProfile;
+  try { localStorage.setItem("arena-jackpot-win", name); } catch {}
+  console.log(`🎰 Jackpot WIN profile: ${name}`);
+};
+
+(window as any).setJackpotLoseProfile = (name: string) => {
+  if (name !== "comic_deflate" && name !== "buzzer_drop") {
+    console.log("Доступные профили поражения: comic_deflate | buzzer_drop");
+    return;
+  }
+  currentJackpotLoseProfile = name as JackpotLoseProfile;
+  try { localStorage.setItem("arena-jackpot-lose", name); } catch {}
+  console.log(`🎰 Jackpot LOSE profile: ${name}`);
+};
+
+(window as any).testJackpotWin = () => playJackpotWinSound();
+(window as any).testJackpotLose = () => playJackpotLoseSound();
 
 function playDingSequence(
   notes: { freq: number; start: number; dur: number; volume?: number }[],
@@ -522,6 +646,10 @@ function playSpendChips(ctx: AudioContext) {
 
 function playSpendSound() {
   try {
+    if (playSample("spend")) {
+      lockSounds(sampleDurations["spend"] + 100);
+      return;
+    }
     if (!audioCtxRef) {
       const Ctx = window.AudioContext || (window as any).webkitAudioContext;
       if (!Ctx) return;
@@ -529,7 +657,6 @@ function playSpendSound() {
     }
     const ctx = audioCtxRef;
     if (ctx.state === "suspended") ctx.resume();
-    // См. playGainSound.
     lockSounds(currentSpendProfile === "banknotes" ? 450 : 550);
     if (currentSpendProfile === "banknotes") playSpendBanknotes(ctx);
     else playSpendChips(ctx);
@@ -545,7 +672,7 @@ let currentGainProfile: GainProfile = (() => {
     const saved = localStorage.getItem("arena-gain-profile");
     if (saved === "coin_rain" || saved === "coins") return saved;
   } catch {}
-  return "coins"; // дефолт — короткий звон: играет часто, не утомляет
+  return "coin_rain"; // дефолт — монетный дождь
 })();
 
 // «Монетный дождь». 12 «монеток» — треугольник + синус-обертон ×1.5
@@ -620,6 +747,12 @@ function playGainCoins(ctx: AudioContext) {
 
 function playGainSound() {
   try {
+    // Основной путь — mp3-сэмпл.
+    if (playSample("gain")) {
+      lockSounds(sampleDurations["gain"] + 100);
+      return;
+    }
+    // Fallback — синтез (если файл не загрузился).
     if (!audioCtxRef) {
       const Ctx = window.AudioContext || (window as any).webkitAudioContext;
       if (!Ctx) return;
@@ -627,37 +760,225 @@ function playGainSound() {
     }
     const ctx = audioCtxRef;
     if (ctx.state === "suspended") ctx.resume();
-    // Замок на время звука: если сразу за этим идёт уведомление о ходе,
-    // оно отложится до конца пополнения, а не наложится.
     lockSounds(currentGainProfile === "coin_rain" ? 700 : 450);
     if (currentGainProfile === "coin_rain") playGainCoinRain(ctx);
     else playGainCoins(ctx);
   } catch {}
 }
 
-// Победа в джекпоте — восходящая трезвучная арпеджио.
-function playJackpotWinSound() {
-  // Блокируем трату/пополнение на 1.2 сек: джекпот меняет баланс
-  // (списание ставки + начисление приза) → без замка играли бы ещё
-  // звук списания и/или начисления поверх.
-  lockSounds(1200);
-  playDingSequence([
-    { freq: 880, start: 0, dur: 0.15 },
-    { freq: 1100, start: 0.10, dur: 0.15 },
-    { freq: 1320, start: 0.20, dur: 0.15 },
-    { freq: 1760, start: 0.30, dur: 0.30 },
-  ], 0.40);
+// Звук «сделал ставку» — играет, когда игрок нажал на выбор
+// количества кубиков в окне джекпот-казино (1 / 2 / 3).
+function playCasinoBetSound() {
+  try {
+    if (playSample("casino-bet")) {
+      lockSounds(sampleDurations["casino-bet"] + 100);
+      return;
+    }
+    // Fallback — короткий «динь».
+    playDingSequence([{ freq: 1200, start: 0, dur: 0.08 }], 0.30);
+  } catch {}
 }
 
-// Поражение в джекпоте — нисходящая фигура, минорная.
+// Профили звука победы в джекпоте.
+//   bell_cascade   — «Удар по кушу»: гонг + каскад монет (слот-автомат)
+//   synth_arpeggio — «Электронный триумф»: ретро-арпеджио вверх (80-90е)
+type JackpotWinProfile = "bell_cascade" | "synth_arpeggio";
+let currentJackpotWinProfile: JackpotWinProfile = (() => {
+  try {
+    const saved = localStorage.getItem("arena-jackpot-win");
+    if (saved === "bell_cascade" || saved === "synth_arpeggio") return saved;
+  } catch {}
+  return "bell_cascade";
+})();
+
+// A: Удар в колокол + каскад монет.
+function playJackpotWinBellCascade(ctx: AudioContext) {
+  const now = ctx.currentTime;
+  // Колокол — три обертона с быстрым затуханием.
+  [1600, 2400, 3200].forEach((f, i) => {
+    const osc = ctx.createOscillator();
+    osc.type = "sine";
+    osc.frequency.value = f;
+    const g = ctx.createGain();
+    const vol = 0.22 / (i + 1);
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(vol, now + 0.005);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.6);
+    osc.connect(g);
+    g.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.65);
+  });
+  // Каскад монет — 20 быстрых кликов, чуть позже удара.
+  for (let i = 0; i < 20; i++) {
+    const start = now + 0.15 + i * 0.045 + Math.random() * 0.03;
+    const freq = 2400 + Math.random() * 2200;
+    const dur = 0.05 + Math.random() * 0.04;
+    const osc = ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.value = freq;
+    const osc2 = ctx.createOscillator();
+    osc2.type = "sine";
+    osc2.frequency.value = freq * 1.5;
+    const g2 = ctx.createGain();
+    g2.gain.value = 0.4;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, start);
+    g.gain.exponentialRampToValueAtTime(0.13, start + 0.003);
+    g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+    osc.connect(g);
+    osc2.connect(g2);
+    g2.connect(g);
+    g.connect(ctx.destination);
+    osc.start(start); osc.stop(start + dur + 0.02);
+    osc2.start(start); osc2.stop(start + dur + 0.02);
+  }
+}
+
+// B: Ретро-арпеджио вверх (C-major).
+function playJackpotWinSynthArpeggio(ctx: AudioContext) {
+  const now = ctx.currentTime;
+  const notes = [523, 659, 784, 1047, 1319, 1568, 2093];
+  notes.forEach((f, i) => {
+    const start = now + i * 0.09;
+    const dur = 0.14;
+    [1, 2].forEach((mult, h) => {
+      const osc = ctx.createOscillator();
+      osc.type = h === 0 ? "triangle" : "sine";
+      osc.frequency.value = f * mult;
+      const g = ctx.createGain();
+      const vol = h === 0 ? 0.20 : 0.08;
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(vol, start + 0.005);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      osc.connect(g);
+      g.connect(ctx.destination);
+      osc.start(start); osc.stop(start + dur + 0.02);
+    });
+  });
+}
+
+function playJackpotWinSound() {
+  try {
+    if (playSample("casino-win")) {
+      // Замок на всю длину файла (4.6 сек) — чтобы turn-звук
+      // не полез под джекпот при переходе хода.
+      lockSounds(sampleDurations["casino-win"] + 100);
+      return;
+    }
+    if (!audioCtxRef) {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!Ctx) return;
+      audioCtxRef = new Ctx();
+    }
+    const ctx = audioCtxRef;
+    if (ctx.state === "suspended") ctx.resume();
+    lockSounds(2000);
+    if (currentJackpotWinProfile === "bell_cascade") playJackpotWinBellCascade(ctx);
+    else playJackpotWinSynthArpeggio(ctx);
+  } catch {}
+}
+
+// Профили звука поражения в джекпоте.
+//   comic_deflate — «Упущенный шанс»: комичный нисходящий «уа-уа»
+//   buzzer_drop   — «Резкий обрыв»: низкий баззер + упавшая фишка
+type JackpotLoseProfile = "comic_deflate" | "buzzer_drop";
+let currentJackpotLoseProfile: JackpotLoseProfile = (() => {
+  try {
+    const saved = localStorage.getItem("arena-jackpot-lose");
+    if (saved === "comic_deflate" || saved === "buzzer_drop") return saved;
+  } catch {}
+  return "comic_deflate";
+})();
+
+// A: Комичный нисходящий «уа-уа-уа-ууу».
+function playJackpotLoseComicDeflate(ctx: AudioContext) {
+  const now = ctx.currentTime;
+  const baseFreqs = [660, 550, 440];
+  baseFreqs.forEach((base, i) => {
+    const start = now + i * 0.16;
+    const dur = 0.15;
+    const osc = ctx.createOscillator();
+    osc.type = "sawtooth";
+    osc.frequency.setValueAtTime(base, start);
+    osc.frequency.exponentialRampToValueAtTime(base * 0.6, start + dur);
+    const lp = ctx.createBiquadFilter();
+    lp.type = "lowpass";
+    lp.frequency.value = 900;
+    lp.Q.value = 4;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, start);
+    g.gain.exponentialRampToValueAtTime(0.14, start + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+    osc.connect(lp); lp.connect(g); g.connect(ctx.destination);
+    osc.start(start); osc.stop(start + dur + 0.02);
+  });
+  // Финальное «ууу» вниз — длинное.
+  const tEnd = now + baseFreqs.length * 0.16 + 0.1;
+  const osc = ctx.createOscillator();
+  osc.type = "sawtooth";
+  osc.frequency.setValueAtTime(380, tEnd);
+  osc.frequency.exponentialRampToValueAtTime(150, tEnd + 0.35);
+  const lp = ctx.createBiquadFilter();
+  lp.type = "lowpass"; lp.frequency.value = 700; lp.Q.value = 4;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, tEnd);
+  g.gain.exponentialRampToValueAtTime(0.13, tEnd + 0.03);
+  g.gain.exponentialRampToValueAtTime(0.0001, tEnd + 0.4);
+  osc.connect(lp); lp.connect(g); g.connect(ctx.destination);
+  osc.start(tEnd); osc.stop(tEnd + 0.42);
+}
+
+// B: Низкий баззер + глухой удар фишки о сукно.
+function playJackpotLoseBuzzerDrop(ctx: AudioContext) {
+  const now = ctx.currentTime;
+  {
+    const osc = ctx.createOscillator();
+    osc.type = "square";
+    osc.frequency.setValueAtTime(130, now);
+    osc.frequency.exponentialRampToValueAtTime(90, now + 0.22);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(0.18, now + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
+    osc.connect(g); g.connect(ctx.destination);
+    osc.start(now); osc.stop(now + 0.27);
+  }
+  const tThud = now + 0.32;
+  const osc = ctx.createOscillator();
+  osc.type = "triangle";
+  osc.frequency.setValueAtTime(280, tThud);
+  osc.frequency.exponentialRampToValueAtTime(120, tThud + 0.12);
+  const lp = ctx.createBiquadFilter();
+  lp.type = "lowpass"; lp.frequency.value = 500; lp.Q.value = 1.5;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, tThud);
+  g.gain.exponentialRampToValueAtTime(0.22, tThud + 0.005);
+  g.gain.exponentialRampToValueAtTime(0.0001, tThud + 0.18);
+  osc.connect(lp); lp.connect(g); g.connect(ctx.destination);
+  osc.start(tThud); osc.stop(tThud + 0.2);
+}
+
 function playJackpotLoseSound() {
-  // См. playJackpotWinSound — тот же смысл.
-  lockSounds(1200);
-  playDingSequence([
-    { freq: 660, start: 0, dur: 0.18 },
-    { freq: 550, start: 0.14, dur: 0.20 },
-    { freq: 415, start: 0.30, dur: 0.32 },
-  ], 0.35);
+  // ⏸ Временно отключено (5 окт 2026): нашли сэмпл поражения,
+  // но пока не включили. Старые синтезные профили
+  // (playJackpotLoseComicDeflate / playJackpotLoseBuzzerDrop) остались
+  // в файле — включаются возвратом тела ниже.
+  return;
+  /* eslint-disable no-unreachable */
+  try {
+    if (!audioCtxRef) {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!Ctx) return;
+      audioCtxRef = new Ctx();
+    }
+    const ctx = audioCtxRef!;
+    if (ctx.state === "suspended") ctx.resume();
+    lockSounds(1500);
+    if (currentJackpotLoseProfile === "comic_deflate") playJackpotLoseComicDeflate(ctx);
+    else playJackpotLoseBuzzerDrop(ctx);
+  } catch {}
+  /* eslint-enable no-unreachable */
 }
 
 // Скольжение фишки. Движок — зацикленный шум, пропущенный через
@@ -1020,7 +1341,7 @@ const CHANCE_EVENTS_DATA = [
   // Массовые
   { desc: "Все игроки скинулись игроку {name} на день рождения, он получает по 500 К с каждого.", kind: "birthday" as const, amount: 500 },
   { desc: "Игрок {name} устроил корпоратив и заплатил каждому игроку по 300 К.", kind: "pay_each" as const, amount: 300 },
-  { desc: "Игрок {name} оплатил коммунальный сбор: по 500 К за каждый свой филиал/отель.", kind: "hotels" as const, amount: 500 },
+  { desc: "{name} необходимо заплатить коммунальный сбор в размере 500 К за каждый свой филиал/отель.", kind: "hotels" as const, amount: 500 },
   { desc: "Государство выделило субсидию: каждый игрок получает по 700 К.", kind: "mass_gain" as const, amount: 700 },
   { desc: "Экономический кризис: все игроки теряют по 1 000 К.", kind: "mass_lose" as const, amount: 1000 },
 ] as const;
@@ -7490,20 +7811,23 @@ resolveGameDesigns(cleanPlayers);
     setTurnFlash(true);
     const flashT = window.setTimeout(() => setTurnFlash(false), 800);
 
-    const playDelayed = () => {
-      playTurnSound();
-    };
-    let soundT: number | undefined;
-    if (!isSoundLocked()) {
-      playDelayed();
-    } else {
-      // Откладываем звук хода до конца текущего замка + небольшой отступ.
-      const delay = Math.max(0, soundLockUntil - Date.now()) + 80;
-      soundT = window.setTimeout(playDelayed, delay);
-    }
+    // Небольшая задержка 30 мс, чтобы useEffect на `players` успел
+    // сработать первым и поставить замок звука (playGainSound /
+    // playSpendSound). Иначе при батчинге React'а turn-эффект играет
+    // раньше, чем players-эффект, и звук хода накладывается на
+    // пополнение (например, когда соперник заплатил мне аренду).
+    const soundT = window.setTimeout(() => {
+      if (isSoundLocked()) {
+        const delay = Math.max(0, soundLockUntil - Date.now()) + 80;
+        window.setTimeout(playTurnSound, delay);
+      } else {
+        playTurnSound();
+      }
+    }, 30);
+
     return () => {
       window.clearTimeout(flashT);
-      if (soundT !== undefined) window.clearTimeout(soundT);
+      window.clearTimeout(soundT);
     };
   }, [turn]);
   useEffect(() => { ownersRef.current = owners; }, [owners]);
@@ -8320,7 +8644,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
             break;
           case "hotels":
             if (totalAmt <= 0) {
-              addLog(`🎲 ${cur.name} встал на «Шанс»: «${desc}». Ничего не должен, так как нет филиалов и отелей.`);
+              addLog(`🚫 ${cur.name} — ничего не должен, так как нет филиалов и отелей.`);
               advanceTurn(capturedTurn);
             } else {
               setPendingAction({ type: "chance", amount: totalAmt, gain: false, desc });
@@ -9943,9 +10267,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                             objectFit: "contain",
                             transform: `scale(${design?.scale ?? 1})`,
                             transformOrigin: "center center",
-                            filter: ownerPlayer
-                              ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(0,0,0,0.15))"
-                              : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
+                            filter: ownerPlayer ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(0,0,0,0.15))" : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
                           }}
                         />
                       </div>
@@ -9963,9 +10285,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                     : "18px",
                               lineHeight: 1,
                               marginBottom: "1px",
-                              filter: ownerPlayer
-                                ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(0,0,0,0.15))"
-                                : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
+                              filter: ownerPlayer ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(0,0,0,0.15))" : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
                             }}
                           >
                             {logo}
@@ -9982,9 +10302,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                     ? "17px"
                                     : "20px",
                               lineHeight: 1,
-                              filter: ownerPlayer
-                                ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(0,0,0,0.15))"
-                                : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
+                              filter: ownerPlayer ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(0,0,0,0.15))" : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
                             }}
                           >
                             {specialIcon}
@@ -10295,6 +10613,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                           addLog(`❌ ${player.name} — недостаточно средств для ставки ${fee} К (есть ${player.money.toLocaleString("ru-RU")} К).`);
                                           return;
                                         }
+                                        playCasinoBetSound();
                                         setPendingAction({
                                           ...a,
                                           diceCount: dc,

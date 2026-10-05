@@ -1991,7 +1991,11 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
           const until = Number(res.until) || (Date.now() + 5000);
           setRateLimitedUntil(until);
           const left = Math.max(1, Math.ceil((until - Date.now()) / 1000));
-          setRateLimitNotice(`Слишком часто. Подождите ${left} с.`);
+          const msg =
+            res?.reason === 'duplicate'
+              ? `Повтор сообщений. Подождите ${left} с.`
+              : `Слишком часто. Подождите ${left} с.`;
+          setRateLimitNotice(msg);
         }
       },
     );
@@ -6162,6 +6166,39 @@ function Profile({ onInventory, onOpenWallet, player }: { onInventory: () => voi
   );
 }
 
+// Ищет в тексте лога имена игроков партии и оборачивает их в <span>
+// с fontStyle:normal + fontWeight:700. Нужно, чтобы ники в логах были
+// ровные и чуть жирнее, а сам лог оставался курсивом/оранжевым как был.
+// Сортировка по длине — чтобы «Иван Петров» матчился раньше «Иван».
+function highlightNamesInLog(
+  text: string,
+  players: Player[],
+  keyPrefix: string,
+): ReactNode[] {
+  if (!text) return [text];
+  const names = players.map((p) => p.name).filter(Boolean);
+  if (names.length === 0) return [text];
+  const sorted = [...names].sort((a, b) => b.length - a.length);
+  const escaped = sorted.map((n) =>
+    n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+  );
+  const re = new RegExp(`(${escaped.join("|")})`, "g");
+  const segs = text.split(re);
+  return segs.map((seg, i) => {
+    if (sorted.includes(seg)) {
+      return (
+        <span
+          key={`${keyPrefix}-${i}`}
+          style={{ fontStyle: "normal", fontWeight: 700 }}
+        >
+          {seg}
+        </span>
+      );
+    }
+    return <span key={`${keyPrefix}-${i}`}>{seg}</span>;
+  });
+}
+
 function BoardGame({ onExit, initialRoomId, currentUser }: { onExit: () => void; initialRoomId?: string | null; currentUser?: AuthUser | null }) {
   const [settings] = useServerSync<AdminSettings>(
   "arena-admin-settings",
@@ -7049,6 +7086,10 @@ resolveGameDesigns(cleanPlayers);
   >([]);
   const logContainerRef = useRef<HTMLDivElement>(null);
   const [chatAutoScroll, setChatAutoScroll] = useState(true);
+  const [showGameChatScrollBtn, setShowGameChatScrollBtn] = useState(false);
+  const [gameChatRateLimitedUntil, setGameChatRateLimitedUntil] = useState(0);
+  const [gameChatRateLimitNotice, setGameChatRateLimitNotice] = useState("");
+  const [, forceGameChatTick] = useState(0);
   const [globalCustomSkins, setGlobalCustomSkins] = useState<Record<number, string>>({});
   const timeoutHandled = useRef(false);
   const voteHandled = useRef(false);
@@ -7287,15 +7328,34 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     const sendChat = (e: FormEvent) => {
     e.preventDefault();
     if (!chatInput.trim()) return;
-
-    // Отправляем сообщение на сервер в конкретную комнату
-    socket.emit('game-chat-message', {
-      roomId: initialRoomId,
-      from: currentUser?.name || "Игрок",
-      text: chatInput.trim(),
-      timestamp: Date.now()
-    });
-    setChatInput("");
+    // Локальная блокировка — сервер уже сказал подождать.
+    if (gameChatRateLimitedUntil > Date.now()) {
+      const left = Math.max(1, Math.ceil((gameChatRateLimitedUntil - Date.now()) / 1000));
+      setGameChatRateLimitNotice(`Подождите ${left} с…`);
+      return;
+    }
+    const text = chatInput.trim();
+    // Отправляем на сервер и ждём ACK. При ok:true сервер сам ретранслирует
+    // сообщение всем в комнате (включая нас) через game-chat-message-broadcast.
+    socket.emit(
+      'game-chat-message',
+      {
+        roomId: initialRoomId,
+        from: currentUser?.name || "Игрок",
+        text,
+        timestamp: Date.now(),
+      },
+      (res: any) => {
+        if (res?.ok) {
+          setChatInput("");
+        } else if (res?.error === 'rate-limit') {
+          const until = Number(res.until) || (Date.now() + 3000);
+          setGameChatRateLimitedUntil(until);
+          const left = Math.max(1, Math.ceil((until - Date.now()) / 1000));
+          setGameChatRateLimitNotice(`Слишком часто. Подождите ${left} с.`);
+        }
+      },
+    );
   };
 
   // Автоскролл вниз при новых логах/сообщениях, если пользователь у нижнего края
@@ -7320,6 +7380,24 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     }, 60_000); // 60 секунд
     return () => window.clearTimeout(timer);
   }, [chatAutoScroll]);
+
+  // Блокировка ввода игрового чата после rate-limit. Тикаем раз в 500мс,
+  // чтобы плейсхолдер «Подождите N с…» менялся, и снимаем блок ровно в срок.
+  useEffect(() => {
+    if (gameChatRateLimitedUntil <= Date.now()) return;
+    const id = window.setInterval(() => forceGameChatTick((t) => t + 1), 500);
+    return () => window.clearInterval(id);
+  }, [gameChatRateLimitedUntil]);
+
+  useEffect(() => {
+    if (!gameChatRateLimitedUntil) return;
+    const ms = Math.max(0, gameChatRateLimitedUntil - Date.now());
+    const id = window.setTimeout(() => {
+      setGameChatRateLimitedUntil(0);
+      setGameChatRateLimitNotice("");
+    }, ms);
+    return () => window.clearTimeout(id);
+  }, [gameChatRateLimitedUntil]);
 
     const nextAliveIndex = (from: number) => {
     // Фильтруем null/undefined игроков, чтобы не было краха и застревания хода
@@ -10332,6 +10410,8 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
                     // 20px — небольшой допуск, чтобы «почти у низа» тоже считалось низом
                     setChatAutoScroll(distanceFromBottom <= 20);
+                    // ~5 сообщений ≈ 250px — порог для показа кнопки «↓».
+                    setShowGameChatScrollBtn(distanceFromBottom > 250);
                   }}
                   className="space-y-px overflow-y-auto overflow-x-hidden h-full w-full pb-2 [&::-webkit-scrollbar]:hidden"
                 >
@@ -10342,7 +10422,14 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                       if ("from" in item) {
                         return (
                           <div key={`c-${i}`} className="leading-tight break-words whitespace-pre-wrap">
-                            <span className="font-bold text-[#e7ba68]">
+                            <span
+                              className="font-bold"
+                              style={{
+                                color:
+                                  players.find((p) => p.name === item.from)?.color ||
+                                  "#e7ba68",
+                              }}
+                            >
                               {item.from}:
                             </span>{" "}
                             {item.text}
@@ -10365,13 +10452,33 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                               if (val) {
                                 return <DiceFace key={idx} value={val} size={18} />;
                               }
-                              return <span key={idx}>{part}</span>;
+                              return (
+                                <span key={idx}>
+                                  {highlightNamesInLog(part, players, `${i}-${idx}`)}
+                                </span>
+                              );
                             })}
                           </div>
                         );
                       }
                     })}
                 </div>
+
+                {showGameChatScrollBtn && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const el = logContainerRef.current;
+                      if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+                      setChatAutoScroll(true);
+                      setShowGameChatScrollBtn(false);
+                    }}
+                    className="absolute bottom-3 right-3 z-30 flex h-8 w-8 items-center justify-center rounded-full bg-[#e96852] text-white shadow-lg hover:brightness-95"
+                    aria-label="Прокрутить вниз"
+                  >
+                    <ChevronDown size={16} />
+                  </button>
+                )}
 
                 {/* ОВЕРЛЕЙ С 3D КУБИКАМИ */}
                 {diceRolling && (
@@ -10390,6 +10497,11 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   </div>
                 )}
               </div>
+              {gameChatRateLimitNotice && (
+                <div className="shrink-0 mx-1.5 mb-1 rounded border border-[#e96852]/40 bg-[#e96852]/20 px-2 py-1 text-[10px] font-bold text-[#ff8a75]">
+                  ⏳ {gameChatRateLimitNotice}
+                </div>
+              )}
               <form
                 onSubmit={sendChat}
                 className="shrink-0 flex gap-1.5 border-t border-white/10 p-1.5"
@@ -10397,12 +10509,18 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 <input
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
-                  placeholder="Сообщение…"
-                  className="min-w-0 flex-1 rounded bg-white/10 px-2 py-1 text-[12px] text-white placeholder:text-white/35 outline-none lg:px-2.5 lg:py-1.5"
+                  disabled={gameChatRateLimitedUntil > Date.now()}
+                  placeholder={
+                    gameChatRateLimitedUntil > Date.now()
+                      ? `Подождите ${Math.max(1, Math.ceil((gameChatRateLimitedUntil - Date.now()) / 1000))} с…`
+                      : "Сообщение…"
+                  }
+                  className={`min-w-0 flex-1 rounded bg-white/10 px-2 py-1 text-[12px] text-white placeholder:text-white/35 outline-none lg:px-2.5 lg:py-1.5 ${gameChatRateLimitedUntil > Date.now() ? "opacity-50 cursor-not-allowed" : ""}`}
                 />
                 <button
                   type="submit"
-                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-[#e96852] text-white lg:h-8 lg:w-8"
+                  disabled={gameChatRateLimitedUntil > Date.now()}
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-[#e96852] text-white lg:h-8 lg:w-8 disabled:opacity-50"
                 >
                   <Send size={12} />
                 </button>

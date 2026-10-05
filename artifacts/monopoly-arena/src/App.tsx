@@ -7977,7 +7977,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         const bet3 = settings.jackpotBet3 ?? defaultSettings.jackpotBet3;
         const secret = 1 + Math.floor(Math.random() * 6);
         addLog(
-          `🎰 ${cur.name} встал на «Джекпот»! Выбери сколько кубиков бросить: 1 (${bet1.toLocaleString("ru-RU")}М), 2 (${bet2.toLocaleString("ru-RU")}М), 3 (${bet3.toLocaleString("ru-RU")}М).`,
+          `🎰 ${cur.name} встал на «Джекпот»! Делает ставку: 1 (${bet1.toLocaleString("ru-RU")} К), 2 (${bet2.toLocaleString("ru-RU")} К), 3 (${bet3.toLocaleString("ru-RU")} К).`,
         );
         setPendingAction({
           type: "jackpot-casino",
@@ -8026,6 +8026,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       ),
     );
     setJackpot((j) => j + entryFee);
+    const pickedText = pickedNums.join(" и ");
     if (won) {
       playJackpotWinSound();
       setPlayers((ps) =>
@@ -8037,12 +8038,12 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         (j) => j - entryFee + (entryFee - prize < 0 ? 0 : entryFee - prize),
       );
       addLog(
-        `🎰 ${player.name} угадал! Секретное число: ${secret}. Выиграл ${prize.toLocaleString("ru-RU")} К! (ставка ${entryFee.toLocaleString("ru-RU")} К)`,
+        `🎰 ${player.name} угадал! Поставил на ${pickedText}. Выиграл ${prize.toLocaleString("ru-RU")} К! (ставка ${entryFee.toLocaleString("ru-RU")} К)`,
       );
     } else {
       playJackpotLoseSound();
       addLog(
-        `🎰 ${player.name} не угадал. Секретное число: ${secret}. Потерял ${entryFee.toLocaleString("ru-RU")} К.`,
+        `🎰 ${player.name} — неудача :( Поставил на ${pickedText}. Проиграл ${entryFee.toLocaleString("ru-RU")} К.`,
       );
     }
     advanceTurn();
@@ -8069,7 +8070,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           }),
         );
         addLog(
-          `💸 Аренда ${a.amount.toLocaleString("ru-RU")} К → ${a.ownerName}`,
+          `💸 ${player.name} заплатил аренду ${a.amount.toLocaleString("ru-RU")} К игроку ${a.ownerName}`,
         );
         advanceTurn();
         break;
@@ -8085,7 +8086,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         );
         setJackpot((j) => j + a.amount);
         addLog(
-          `💸 ${player.name} заплатил налог ${a.amount.toLocaleString("ru-RU")} К в джекпот`,
+          `💸 ${player.name} заплатил налог ${a.amount.toLocaleString("ru-RU")} К в казну`,
         );
         advanceTurn();
         break;
@@ -8135,7 +8136,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     }
   };
     // Добровольная сдача при обязательном платеже. Остаток баланса
-  // перечисляется получателю: владельцу поля при аренде, в джекпот
+  // перечисляется получателю: владельцу поля при аренде, в казну
   // при налоге и шансе-потере. Затем игрок банкротится.
   const surrenderPayment = () => {
     if (!pendingAction || !player) return;
@@ -8163,7 +8164,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     if (a.type === "rent" && myMoney > 0) {
       addLog(`💸 ${player.name} сдался. Остаток ${myMoney.toLocaleString("ru-RU")} К → ${a.ownerName}`);
     } else if (myMoney > 0) {
-      addLog(`💸 ${player.name} сдался. Остаток ${myMoney.toLocaleString("ru-RU")} К → в джекпот`);
+      addLog(`💸 ${player.name} сдался. Остаток ${myMoney.toLocaleString("ru-RU")} К → в казну`);
     } else {
       addLog(`💸 ${player.name} сдался.`);
     }

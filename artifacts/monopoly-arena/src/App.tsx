@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { createPortal } from "react-dom";
 import {
   useEffect,
   useMemo,
@@ -3792,6 +3793,13 @@ function Shop() {
     }
   })();
   const isGuest = !!player?.guest;
+  // Тултип «Все предметы» рендерится через портал в document.body —
+  // иначе он обрезается overflow-hidden карточки кейса. Храним координаты
+  // кнопки «i» и уже развёрнутый список предметов (без повторного find).
+  const [tooltip, setTooltip] = useState<{
+    top: number; bottom: number; left: number; width: number;
+    items: { id: string; name: string; category: string; rarity: string }[];
+  } | null>(null);
   const [coins, setCoins] = useLocalStorage("arena-coins", 2400);
   const [inventory, setInventory] = useServerSync<OwnedItem[]>("arena-inventory", [], ['user-inventory-updated'], 'get-user-inventory');
   const [marketItems] = useServerSync<MarketItem[]>("arena-market-items", [], ['custom-items-updated'], 'get-custom-items');
@@ -3981,34 +3989,28 @@ const buyVip = (vip: MarketItem) => {
                         );
                       })}
                       {caseItems.length > 5 && (
-                        <div className="group relative inline-flex">
-                          <span className="flex h-5 w-5 cursor-help items-center justify-center rounded-full bg-muted text-[10px] font-bold text-muted-foreground">
-                            i
-                          </span>
-                          <div className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-1 hidden w-max max-w-[220px] -translate-x-1/2 rounded-lg border border-card-border bg-card p-2 text-[10px] shadow-xl group-hover:block">
-                            <div className="mb-1 font-bold">
-                              Все предметы ({caseItems.length}):
-                            </div>
-                            <div className="flex flex-wrap gap-1">
-                              {caseItems.map((it) => {
-                                const rarityBg =
-                                  it!.category === "vip" ? "#d3a247" :
-                                  it!.rarity === "rare" ? "#2563eb" :
-                                  it!.rarity === "epic" ? "#9b5de5" :
-                                  "#b0b0b0";
-                                return (
-                                  <span
-                                    key={it!.id}
-                                    className="rounded px-1.5 py-0.5 text-[9px] font-bold text-white"
-                                    style={{ backgroundColor: rarityBg }}
-                                  >
-                                    {it!.name}
-                                  </span>
-                                );
-                              })}
-                            </div>
-                          </div>
-                        </div>
+                        <button
+                          type="button"
+                          onMouseEnter={(e) => {
+                            const r = e.currentTarget.getBoundingClientRect();
+                            setTooltip({
+                              top: r.top,
+                              bottom: r.bottom,
+                              left: r.left,
+                              width: r.width,
+                              items: caseItems.map((it) => ({
+                                id: it!.id,
+                                name: it!.name,
+                                category: it!.category,
+                                rarity: it!.rarity,
+                              })),
+                            });
+                          }}
+                          onMouseLeave={() => setTooltip(null)}
+                          className="flex h-5 w-5 cursor-help items-center justify-center rounded-full bg-muted text-[10px] font-bold text-muted-foreground transition-colors hover:bg-primary hover:text-white"
+                        >
+                          i
+                        </button>
                       )}
                     </div>
                   )}
@@ -4239,6 +4241,52 @@ const buyVip = (vip: MarketItem) => {
             ))}
           </div>
         </div>
+      )}
+
+      {tooltip && createPortal(
+        (() => {
+          // Открываем вверх, если хватает места над кнопкой (≥180px),
+          // иначе — вниз.
+          const openDown = tooltip.top < 180;
+          return (
+            <div
+              style={{
+                position: "fixed",
+                top: openDown ? tooltip.bottom + 8 : tooltip.top - 8,
+                left: tooltip.left + tooltip.width / 2,
+                transform: openDown
+                  ? "translate(-50%, 0)"
+                  : "translate(-50%, -100%)",
+                zIndex: 9999,
+                pointerEvents: "none",
+              }}
+              className="w-max max-w-[240px] rounded-lg border border-card-border bg-card p-2 text-[10px] shadow-2xl"
+            >
+              <div className="mb-1 font-bold">
+                Все предметы ({tooltip.items.length}):
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {tooltip.items.map((it) => {
+                  const rarityBg =
+                    it.category === "vip" ? "#d3a247" :
+                    it.rarity === "rare" ? "#2563eb" :
+                    it.rarity === "epic" ? "#9b5de5" :
+                    "#b0b0b0";
+                  return (
+                    <span
+                      key={it.id}
+                      className="rounded px-1.5 py-0.5 text-[9px] font-bold text-white"
+                      style={{ backgroundColor: rarityBg }}
+                    >
+                      {it.name}
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })(),
+        document.body
       )}
     </div>
   );

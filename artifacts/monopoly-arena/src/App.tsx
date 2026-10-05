@@ -9466,7 +9466,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                             transform: `scale(${design?.scale ?? 1})`,
                             transformOrigin: "center center",
                             filter: ownerPlayer
-                              ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(255,255,255,0.47))"
+                              ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(0,0,0,0.15))"
                               : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
                           }}
                         />
@@ -9486,7 +9486,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                               lineHeight: 1,
                               marginBottom: "1px",
                               filter: ownerPlayer
-                                ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(255,255,255,0.47))"
+                                ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(0,0,0,0.15))"
                                 : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
                             }}
                           >
@@ -9505,7 +9505,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                     : "20px",
                               lineHeight: 1,
                               filter: ownerPlayer
-                                ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(255,255,255,0.47))"
+                                ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(0,0,0,0.15))"
                                 : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
                             }}
                           >

@@ -2598,9 +2598,24 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
                       </span>
                     ) : (
                       <button
-                        onClick={() =>
-                          room.password ? setJoinTarget(room) : joinRoom(room)
-                        }
+                        onClick={() => {
+                          // Не авторизован: не эмитим join-room (иначе
+                          // игрок зайдёт как «Гость»). Открываем модалку
+                          // авторизации через Home.
+                          if (!player?.id) {
+                            if (room.password) {
+                              // Парольная — просто авторизация, после
+                              // входа игрок кликнет снова и введёт пароль.
+                              onJoinGame();
+                            } else {
+                              // Открытая — Home запомнит roomId и эмитит
+                              // join-room сразу после авторизации.
+                              onJoinGame(room.id);
+                            }
+                            return;
+                          }
+                          room.password ? setJoinTarget(room) : joinRoom(room);
+                        }}
                         disabled={room.players >= room.maxPlayers}
                         className="rounded-lg bg-secondary px-4 py-2 text-xs font-bold text-secondary-foreground disabled:cursor-not-allowed disabled:opacity-45"
                       >
@@ -14420,6 +14435,7 @@ const [currentRoomId, setCurrentRoomId] = useState<string | null>(null);
   const [pending, setPending] = useState<"create" | "find" | "join" | null>(
     null,
   );
+  const [pendingJoinRoomId, setPendingJoinRoomId] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [findOpen, setFindOpen] = useState(false);
 
@@ -14538,6 +14554,20 @@ const [currentRoomId, setCurrentRoomId] = useState<string | null>(null);
     return () => { socket.off('connect', fetchActive); };
   }, [player?.id]);
 
+  // Слушаем start-game на уровне Home: пока игрок не в Dashboard,
+  // Dashboard-обработчик не активен, но start-game всё равно должен
+  // перевести игрока в игровой экран. Основной кейс — join после
+  // авторизации (гость кликнул «Присоединиться», зашёл, ждём старт).
+  useEffect(() => {
+    const handler = (roomData: any) => {
+      if (!roomData?.id) return;
+      setCurrentRoomId(roomData.id);
+      setGame(true);
+    };
+    socket.on('start-game', handler);
+    return () => { socket.off('start-game', handler); };
+  }, []);
+
   const isAuthed = !!(player || adminAuthed);
 
   // Gate actions behind login when not authenticated
@@ -14625,6 +14655,9 @@ const requestJoin = (roomId?: string) => {
         // Запоминаем, что нужно запустить игру, но ждём обновления currentRoomId
         gameTriggerRef.current = roomId || null;
     } else {
+        // Не авторизован — запоминаем комнату и открываем авторизацию.
+        // Реальный join-room эмитится только после успешного входа.
+        setPendingJoinRoomId(roomId || null);
         setPending("join");
         setAuthOpen(true);
     }
@@ -14694,10 +14727,22 @@ if (vipUntil) {
     });
   }
   const action = pending;
+  const joinRoomId = pendingJoinRoomId;
   setPending(null);
+  setPendingJoinRoomId(null);
   if (action === "create") setCreateOpen(true);
   else if (action === "find") setFindOpen(true);
-  else if (action === "join") setGame(true);
+  else if (action === "join") {
+    if (joinRoomId) {
+      // Эмитим join-room под уже авторизованным именем. start-game
+      // придёт после заполнения комнаты — Home / Dashboard переведут
+      // игрока в GameShell.
+      socket.emit('join-room', {
+        roomId: joinRoomId,
+        playerName: result.user?.name || "Игрок",
+      });
+    }
+  }
 };
   const logout = () => {
     setPlayer(null);
@@ -14821,6 +14866,7 @@ if (vipUntil) {
             onClose={() => {
               setAuthOpen(false);
               setPending(null);
+              setPendingJoinRoomId(null);
             }}
             onSuccess={onAuthSuccess}
           />
@@ -14898,6 +14944,7 @@ if (vipUntil) {
           onClose={() => {
             setAuthOpen(false);
             setPending(null);
+            setPendingJoinRoomId(null);
           }}
           onSuccess={onAuthSuccess}
         />

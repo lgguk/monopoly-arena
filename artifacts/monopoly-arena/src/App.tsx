@@ -6247,6 +6247,48 @@ function highlightNamesInLog(
   });
 }
 
+// Маленькая белая плитка с логотипом поля для окна обмена.
+// Логотипы с верхнего/нижнего ряда доски поворачиваем на 90° вправо —
+// исходно эти поля вертикальные, а в квадрате нужны горизонтально.
+function TradeCardLogo({ slotIndex }: { slotIndex: number }) {
+  const isTopBottom =
+    (slotIndex >= 1 && slotIndex <= 9) ||
+    (slotIndex >= 21 && slotIndex <= 29);
+  // Приоритет: кастомный/админский дизайн → эмодзи-лого → заглушка
+  const design = globalCardDesigns.find((d) => d.slotIndex === slotIndex);
+  const imageUrl = design?.imageDataUrl;
+  const logo = CELL_LOGOS[slotIndex];
+  return (
+    <div
+      className="flex h-[53px] w-[63px] shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white shadow-sm"
+      title={getCell(slotIndex).name}
+    >
+      {imageUrl ? (
+        <img
+          src={imageUrl}
+          alt=""
+          style={{
+            maxWidth: "90%",
+            maxHeight: "90%",
+            objectFit: "contain",
+            transform: isTopBottom ? "rotate(90deg)" : "none",
+          }}
+        />
+      ) : (
+        <span
+          style={{
+            fontSize: 22,
+            lineHeight: 1,
+            transform: isTopBottom ? "rotate(90deg)" : "none",
+          }}
+        >
+          {logo ?? "🏢"}
+        </span>
+      )}
+    </div>
+  );
+}
+
 function BoardGame({ onExit, initialRoomId, currentUser }: { onExit: () => void; initialRoomId?: string | null; currentUser?: AuthUser | null }) {
   const [settings] = useServerSync<AdminSettings>(
   "arena-admin-settings",
@@ -7634,6 +7676,12 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
   const handleTimeout = (expiredPlayerId?: string) => {
     if (timeoutHandled.current || animPath || diceRolling) return;
+
+    // Таймер истёк — любое открытое окно договора отменяем. Иначе оно
+    // висит поверх, пока параллельно стартует голосование.
+    setTrade(null);
+    setPendingTrade(null);
+    setTradeInitiator(null);
 
     // Если идёт аукцион — не банкротим и не голосуем.
     // Просто авто-отказ от текущего участника аукциона
@@ -9232,6 +9280,12 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
               const isHighlighted =
                 pendingAction?.type === "buy" &&
                 (pendingAction as BuyA).cellIndex === index;
+              // Поле участвует в открытом договоре — обводим оранжевым,
+              // чтобы обе стороны видели, что уже выбрано для обмена.
+              const isInTrade =
+                !!trade &&
+                (trade.myCards.includes(index) ||
+                  trade.theirCards.includes(index));
               const logo = CELL_LOGOS[index];
               const specialIcon = !logo ? SPECIAL_ICONS[cell.type] : null;
                 const playersHere = players.filter(
@@ -9318,11 +9372,37 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                       ? ownerPlayer.color + "B3"
                       : cellBg,
                   }}
-                  className={`relative flex flex-col items-center justify-center overflow-visible cursor-default ${isHighlighted ? "ring-2 ring-primary ring-inset" : ""}`}
+                  className={`relative flex flex-col items-center justify-center overflow-visible cursor-default ${isHighlighted ? "ring-2 ring-primary ring-inset" : ""} ${isInTrade ? "ring-[3px] ring-[#ff5a00] ring-inset shadow-[inset_0_0_20px_rgba(255,90,0,0.85)]" : ""}`}
                   onClick={
                     cell.type === "property"
                       ? (e) => {
                           e.stopPropagation();
+                          // Если открыт договор — клик по полю добавляет/убирает
+                          // его из сделки. Своё поле → в мою часть, поле
+                          // соперника → в его часть. Чужие поля игнорируем.
+                          if (trade) {
+                            const ownerId = owners[index];
+                            if (ownerId === player.id) {
+                              setTrade({
+                                ...trade,
+                                myCards: trade.myCards.includes(index)
+                                  ? trade.myCards.filter((x) => x !== index)
+                                  : trade.myCards.length < 10
+                                    ? [...trade.myCards, index]
+                                    : trade.myCards,
+                              });
+                            } else if (ownerId === trade.targetId) {
+                              setTrade({
+                                ...trade,
+                                theirCards: trade.theirCards.includes(index)
+                                  ? trade.theirCards.filter((x) => x !== index)
+                                  : trade.theirCards.length < 10
+                                    ? [...trade.theirCards, index]
+                                    : trade.theirCards,
+                              });
+                            }
+                            return;
+                          }
                           setSelectedCell(index);
                           setSelectedPos({ x: e.clientX, y: e.clientY });
                         }
@@ -10125,27 +10205,111 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                         (p) => p.id === pendingTrade.initiatorId,
                       );
                       if (!target || !initiator) return null;
+                      const myTotal =
+                        pendingTrade.trade.myMoney +
+                        pendingTrade.trade.myCards.reduce(
+                          (s, ci) => s + (getCell(ci).price ?? 0),
+                          0,
+                        );
+                      const theirTotal =
+                        pendingTrade.trade.theirMoney +
+                        pendingTrade.trade.theirCards.reduce(
+                          (s, ci) => s + (getCell(ci).price ?? 0),
+                          0,
+                        );
                       return (
-                        <div className="shrink-0 mx-1.5 mt-1.5 rounded-xl bg-[#1e1b2e] border border-white/20 p-2.5 shadow-xl">
-                          <div className="text-[7.5px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
-                            🤝 Предложение договора
+                        <div className="shrink-0 mx-1.5 mt-1.5 rounded-xl bg-[#1a1729] border border-[#e7ba68]/30 overflow-hidden">
+                          <div className="flex items-center justify-between px-3 py-1.5 bg-[#29233e] border-b border-white/10">
+                            <span className="font-mono text-[12px] font-bold text-[#e7ba68] uppercase tracking-wide">
+                              🤝 Предложение договора
+                            </span>
                           </div>
-                          <div className="text-[9px] text-white/80 mb-2">
-                            {initiator.name} предлагает тебе обмен.
-                       </div>
-                      <div className="flex flex-col gap-1 text-[8px] text-white/60 mb-2">
-                    <div>
-                       <b className="text-white">{initiator.name}</b> отдаёт: 
-                        {pendingTrade.trade.myMoney > 0 && ` 💵${pendingTrade.trade.myMoney}`}
-                      {pendingTrade.trade.myCards.length > 0 && " 🃏" + pendingTrade.trade.myCards.map(ci => boardCells[ci].name).join(", ")}
-                      </div>
-                       <div>
-                    <b className="text-white">Вы</b> отдаёте: 
-                        {pendingTrade.trade.theirMoney > 0 && ` 💵${pendingTrade.trade.theirMoney}`}
-                       {pendingTrade.trade.theirCards.length > 0 && " 🃏" + pendingTrade.trade.theirCards.map(ci => boardCells[ci].name).join(", ")}
-                     </div>
-                       </div>
-                          <div className="flex gap-1.5">
+                          <div className="px-3 py-1.5 text-[10px] text-white/70 bg-[#0f0d1a] border-b border-white/5">
+                            <span className="font-bold text-white">
+                              {initiator.name}
+                            </span>{" "}
+                            предлагает тебе обмен
+                          </div>
+                          <div className="grid grid-cols-2 gap-px bg-white/10">
+                            {/* Left — инициатор отдаёт тебе */}
+                            <div className="bg-[#1a1729] p-2">
+                              <div className="text-[11px] font-bold mb-1">
+                                <span className="text-[#32786d]">
+                                  {initiator.name}
+                                </span>{" "}
+                                <span className="text-white/40 font-normal">
+                                  отдаёт тебе
+                                </span>
+                              </div>
+                              <div className="mb-1.5 rounded bg-[#32786d]/15 border border-[#32786d]/40 px-2 py-0.5 text-[11px] font-bold text-[#5aa89a] text-center">
+                                Стоимость:{" "}
+                                {myTotal.toLocaleString("ru-RU")} К
+                              </div>
+                              {pendingTrade.trade.myMoney > 0 && (
+                                <div className="text-[11px] text-white/70 mb-1">
+                                  💵{" "}
+                                  {pendingTrade.trade.myMoney.toLocaleString(
+                                    "ru-RU",
+                                  )}{" "}
+                                  К
+                                </div>
+                              )}
+                              <div className="min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
+                                {pendingTrade.trade.myCards.length === 0 ? (
+                                  <div className="w-full text-center text-[9px] text-white/25 self-center py-3">
+                                    —
+                                  </div>
+                                ) : (
+                                  pendingTrade.trade.myCards.map((ci) => (
+                                    <TradeCardLogo key={ci} slotIndex={ci} />
+                                  ))
+                                )}
+                              </div>
+                            </div>
+                            {/* Right — ты отдаёшь */}
+                            <div className="bg-[#1a1729] p-2">
+                              <div className="text-[11px] font-bold mb-1">
+                                <span style={{ color: target.color }}>
+                                  Ты
+                                </span>{" "}
+                                <span className="text-white/40 font-normal">
+                                  отдаёшь
+                                </span>
+                              </div>
+                              <div
+                                className="mb-1.5 rounded border px-2 py-0.5 text-[11px] font-bold text-center"
+                                style={{
+                                  backgroundColor: target.color + "25",
+                                  borderColor: target.color + "66",
+                                  color: target.color,
+                                }}
+                              >
+                                Стоимость:{" "}
+                                {theirTotal.toLocaleString("ru-RU")} К
+                              </div>
+                              {pendingTrade.trade.theirMoney > 0 && (
+                                <div className="text-[11px] text-white/70 mb-1">
+                                  💵{" "}
+                                  {pendingTrade.trade.theirMoney.toLocaleString(
+                                    "ru-RU",
+                                  )}{" "}
+                                  К
+                                </div>
+                              )}
+                              <div className="min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
+                                {pendingTrade.trade.theirCards.length === 0 ? (
+                                  <div className="w-full text-center text-[9px] text-white/25 self-center py-3">
+                                    —
+                                  </div>
+                                ) : (
+                                  pendingTrade.trade.theirCards.map((ci) => (
+                                    <TradeCardLogo key={ci} slotIndex={ci} />
+                                  ))
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex gap-1.5 p-2 bg-[#0f0d1a]">
                             <button
                               onClick={() => {
                                 // Применить сделку
@@ -10189,8 +10353,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                 setPendingTrade(null);
                                 setTradeInitiator(null);
                                 if (initInfo) {
-                                  setImprovedGroupsThisTurn([]); // Сбрасываем историю улучшений при возврате хода
-                                  // Если у инициатора был дубль и он не исчерпан, вернём ему ход с дублем
+                                  setImprovedGroupsThisTurn([]);
                                   if (
                                     initInfo.isDouble &&
                                     initInfo.doubleCount < 3
@@ -10203,18 +10366,16 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                     );
                                     setRolled(false);
                                   } else {
-                                    // Иначе просто вернём ход
                                     setTurn(initInfo.fromIdx);
                                     setMessage(
                                       `Ход возвращён ${players[initInfo.fromIdx].name}.`,
                                     );
                                   }
                                 } else {
-                                  // Если по какой-то причине нет информации об инициаторе, просто продолжим
                                   advanceTurn();
                                 }
                               }}
-                              className="flex-1 rounded-lg bg-[#32786d] py-1.5 text-[9px] font-bold text-white hover:bg-[#266059] transition-colors"
+                              className="flex-1 rounded py-1.5 text-[12px] font-bold text-white bg-[#32786d] hover:bg-[#266059]"
                             >
                               Принять
                             </button>
@@ -10249,7 +10410,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                   advanceTurn();
                                 }
                               }}
-                              className="flex-1 rounded-lg bg-white/15 py-1.5 text-[9px] font-bold text-white hover:bg-white/20 transition-colors"
+                              className="flex-1 rounded py-1.5 text-[12px] font-bold text-white/60 border border-white/10 hover:border-white/20"
                             >
                               Отказаться
                             </button>
@@ -10260,197 +10421,185 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 </div>
               )}
 
-              {/* Inline trade (1.6) */}
+            {/* Inline trade (1.7) — квадратики логотипов вместо списка */}
               {trade && tradeTarget && (
                 <div className="shrink-0 mx-1.5 mb-1 rounded-xl border border-[#e7ba68]/30 bg-[#1a1729] overflow-hidden">
-                  <div className="flex items-center justify-between px-2 py-1.5 bg-[#29233e] border-b border-white/10">
-                    <span className="font-mono text-[13px] font-bold text-[#e7ba68] uppercase tracking-wide">
+                  <div className="flex items-center justify-between px-3 py-1.5 bg-[#29233e] border-b border-white/10">
+                    <span className="font-mono text-[12px] font-bold text-[#e7ba68] uppercase tracking-wide">
                       🤝 Договор
                     </span>
                     <button
                       onClick={() => setTrade(null)}
                       className="text-white/40 hover:text-white"
                     >
-                      <X size={10} />
+                      <X size={12} />
                     </button>
                   </div>
-                  <div className="grid grid-cols-2 gap-px bg-white/5 text-white">
-                    <div className="bg-[#1a1729] p-1.5">
-                      <div className="text-[13px] font-bold text-[#e96852] mb-1">
-                        {player.name}{" "}
+                  <div className="px-3 py-1 text-[11px] text-white/40 bg-[#0f0d1a] border-b border-white/5">
+                    Тыкай по своим полям — они пойдут в обмен. По полям соперника — то, что хочешь забрать.
+                  </div>
+                  <div className="grid grid-cols-2 gap-px bg-white/10">
+                    {/* Left — я предлагаю */}
+                    <div className="bg-[#1a1729] p-2">
+                      <div className="text-[11px] font-bold mb-1">
+                        <span className="text-[#e96852]">{player.name}</span>{" "}
                         <span className="text-white/40 font-normal">
                           предлагает
                         </span>
                       </div>
-                      <div className="flex items-center gap-1 mb-1">
-                        <span className="text-[13px] text-white/50">💵</span>
+                      <div className="flex items-center gap-1 mb-1.5">
+                        <span className="text-[11px] text-white/40">💵</span>
                         <input
-  type="number"
-  min={0}
-  value={trade.myMoney === 0 ? "" : trade.myMoney}
-  placeholder="0"
-  onFocus={(e) => e.target.select()}
-  onChange={(e) =>
-    setTrade({
-      ...trade,
-      myMoney: Math.max(0, Number(e.target.value) || 0),
-    })
-  }
-  className="w-full rounded bg-white/10 px-2 py-1.5 text-[13px] font-mono text-white border-none outline-none placeholder:text-white/70 placeholder:font-mono"
-/>
+                          type="number"
+                          min={0}
+                          value={trade.myMoney === 0 ? "" : trade.myMoney}
+                          placeholder="0"
+                          onFocus={(e) => e.target.select()}
+                          onChange={(e) =>
+                            setTrade({
+                              ...trade,
+                              myMoney: Math.max(0, Number(e.target.value) || 0),
+                            })
+                          }
+                          className="w-full rounded bg-white/10 px-1.5 py-1 text-[12px] font-mono text-white border-none outline-none placeholder:text-white/40"
+                        />
                       </div>
-                      <div className="space-y-0.5 max-h-40 overflow-y-auto">
-                        {myOwnedCards.map((ci) => (
-                          <label
-                            key={ci}
-                            className="flex items-center gap-2 cursor-pointer rounded px-1.5 py-0.5"
-                            style={{ backgroundColor: getCellGroup(ci)?.color || 'transparent' }}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={trade.myCards.includes(ci)}
-                              onChange={(e) =>
-                                setTrade({
-                                  ...trade,
-                                  myCards: e.target.checked
-                                    ? [...trade.myCards, ci]
-                                    : trade.myCards.filter((x) => x !== ci),
-                                })
-                              }
-                              className="accent-[#e96852] w-3.5 h-3.5"
-                            />
-                            <span className="text-[13px] truncate text-white">
-                              {CELL_LOGOS[ci] ?? ""} {boardCells[ci].name}
-                            </span>
-                          </label>
-                        ))}
-                        {myOwnedCards.length === 0 && (
-                          <div className="text-[11px] text-white/30 italic">
-                            Нет карточек
-                          </div>
-                        )}
-                      </div>
-                      <div className="mt-1 text-[13px] font-bold text-[#e96852]">
+                      <div className="mb-1.5 rounded bg-[#e96852]/15 border border-[#e96852]/40 px-2 py-0.5 text-[11px] font-bold text-[#ff8a75] text-center">
+                        Стоимость:{" "}
                         {(
                           trade.myMoney +
                           trade.myCards.reduce(
-                            (s, ci) => s + (boardCells[ci].price ?? 0),
+                            (s, ci) => s + (getCell(ci).price ?? 0),
                             0,
                           )
                         ).toLocaleString("ru-RU")}{" "}
                         К
                       </div>
+                      <div className="min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
+                        {trade.myCards.length === 0 ? (
+                          <div className="w-full text-center text-[9px] text-white/25 self-center py-3">
+                            Клик по своему полю
+                          </div>
+                        ) : (
+                          trade.myCards.map((ci) => (
+                            <TradeCardLogo key={ci} slotIndex={ci} />
+                          ))
+                        )}
+                      </div>
                     </div>
-                    <div className="bg-[#1a1729] p-1.5">
-                      <div
-                        className="text-[13px] font-bold mb-1"
-                        style={{ color: tradeTarget.color }}
-                      >
-                        {tradeTarget.name}{" "}
+                    {/* Right — соперник отдаёт */}
+                    <div className="bg-[#1a1729] p-2">
+                      <div className="text-[11px] font-bold mb-1">
+                        <span style={{ color: tradeTarget.color }}>
+                          {tradeTarget.name}
+                        </span>{" "}
                         <span className="text-white/40 font-normal">
                           отдаёт
                         </span>
                       </div>
-                      <div className="flex items-center gap-1 mb-1">
-                        <span className="text-[13px] text-white/50">💵</span>
+                      <div className="flex items-center gap-1 mb-1.5">
+                        <span className="text-[11px] text-white/40">💵</span>
                         <input
-  type="number"
-  min={0}
-  value={trade.theirMoney === 0 ? "" : trade.theirMoney}
-  placeholder="0"
-  onFocus={(e) => e.target.select()}
-  onChange={(e) =>
-    setTrade({
-      ...trade,
-      theirMoney: Math.max(0, Number(e.target.value) || 0),
-    })
-  }
-  className="w-full rounded bg-white/10 px-2 py-1.5 text-[13px] font-mono text-white border-none outline-none placeholder:text-white/70 placeholder:font-mono"
-/>
-                      </div>
-                      <div className="space-y-0.5 max-h-40 overflow-y-auto">
-                        {tradeTargetCards.map((ci) => (
-                          <label
-                            key={ci}
-                            className="flex items-center gap-2 cursor-pointer rounded px-1.5 py-0.5"
-                            style={{ backgroundColor: getCellGroup(ci)?.color || 'transparent' }}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={trade.theirCards.includes(ci)}
-                              onChange={(e) =>
-                                setTrade({
-                                  ...trade,
-                                  theirCards: e.target.checked
-                                    ? [...trade.theirCards, ci]
-                                    : trade.theirCards.filter((x) => x !== ci),
-                                })
-                              }
-                              className="accent-[#32786d] w-3.5 h-3.5"
-                            />
-                            <span className="text-[13px] truncate text-white">
-                              {CELL_LOGOS[ci] ?? ""} {boardCells[ci].name}
-                            </span>
-                          </label>
-                        ))}
-                        {tradeTargetCards.length === 0 && (
-                          <div className="text-[11px] text-white/30 italic">
-                            Нет карточек
-                          </div>
-                        )}
+                          type="number"
+                          min={0}
+                          value={trade.theirMoney === 0 ? "" : trade.theirMoney}
+                          placeholder="0"
+                          onFocus={(e) => e.target.select()}
+                          onChange={(e) =>
+                            setTrade({
+                              ...trade,
+                              theirMoney: Math.max(0, Number(e.target.value) || 0),
+                            })
+                          }
+                          className="w-full rounded bg-white/10 px-1.5 py-1 text-[12px] font-mono text-white border-none outline-none placeholder:text-white/40"
+                        />
                       </div>
                       <div
-                        className="mt-1 text-[13px] font-bold"
-                        style={{ color: tradeTarget.color }}
+                        className="mb-1.5 rounded border px-2 py-0.5 text-[11px] font-bold text-center"
+                        style={{
+                          backgroundColor: tradeTarget.color + "25",
+                          borderColor: tradeTarget.color + "66",
+                          color: tradeTarget.color,
+                        }}
                       >
+                        Стоимость:{" "}
                         {(
                           trade.theirMoney +
                           trade.theirCards.reduce(
-                            (s, ci) => s + (boardCells[ci].price ?? 0),
+                            (s, ci) => s + (getCell(ci).price ?? 0),
                             0,
                           )
                         ).toLocaleString("ru-RU")}{" "}
                         К
                       </div>
+                      <div className="min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
+                        {trade.theirCards.length === 0 ? (
+                          <div className="w-full text-center text-[9px] text-white/25 self-center py-3">
+                            Клик по полю соперника
+                          </div>
+                        ) : (
+                          trade.theirCards.map((ci) => (
+                            <TradeCardLogo key={ci} slotIndex={ci} />
+                          ))
+                        )}
+                      </div>
                     </div>
                   </div>
                   {(() => {
-                    const myTotal = trade.myMoney + trade.myCards.reduce((s, ci) => s + (boardCells[ci].price ?? 0), 0);
-                    const theirTotal = trade.theirMoney + trade.theirCards.reduce((s, ci) => s + (boardCells[ci].price ?? 0), 0);
-                    const overLimit = myTotal > 0 && theirTotal > 0 && (myTotal > theirTotal * 2 || theirTotal > myTotal * 2);
+                    const myTotal =
+                      trade.myMoney +
+                      trade.myCards.reduce(
+                        (s, ci) => s + (getCell(ci).price ?? 0),
+                        0,
+                      );
+                    const theirTotal =
+                      trade.theirMoney +
+                      trade.theirCards.reduce(
+                        (s, ci) => s + (getCell(ci).price ?? 0),
+                        0,
+                      );
+                    const overLimit =
+                      myTotal > 0 &&
+                      theirTotal > 0 &&
+                      (myTotal > theirTotal * 2 || theirTotal > myTotal * 2);
                     const notEnoughMy = trade.myMoney > player.money;
                     const notEnoughTheir = trade.theirMoney > tradeTarget.money;
-                    if (!overLimit && !notEnoughMy && !notEnoughTheir) return null;
+                    if (!overLimit && !notEnoughMy && !notEnoughTheir)
+                      return null;
                     return (
                       <div className="px-2 pb-1.5 bg-[#0f0d1a]">
                         {notEnoughMy && (
                           <div className="rounded bg-[#e96852]/20 border border-[#e96852]/40 px-2 py-1 text-[10px] font-bold text-[#ff8a75]">
-                            ❌ У вас недостаточно средств ({trade.myMoney.toLocaleString("ru-RU")} К &gt; {player.money.toLocaleString("ru-RU")} К)
+                            ❌ У вас недостаточно средств (
+                            {trade.myMoney.toLocaleString("ru-RU")} К &gt;{" "}
+                            {player.money.toLocaleString("ru-RU")} К)
                           </div>
                         )}
                         {notEnoughTheir && (
                           <div className="mt-1 rounded bg-[#e96852]/20 border border-[#e96852]/40 px-2 py-1 text-[10px] font-bold text-[#ff8a75]">
-                            ❌ У {tradeTarget.name} недостаточно средств ({trade.theirMoney.toLocaleString("ru-RU")} К &gt; {tradeTarget.money.toLocaleString("ru-RU")} К)
+                            ❌ У {tradeTarget.name} недостаточно средств
                           </div>
                         )}
                         {overLimit && (
                           <div className="mt-1 rounded bg-[#e96852]/20 border border-[#e96852]/40 px-2 py-1 text-[10px] font-bold text-[#ff8a75]">
-                            ⚠️ Разница в стоимости превышает лимит (максимум х2). Сейчас: {myTotal.toLocaleString("ru-RU")} К ↔ {theirTotal.toLocaleString("ru-RU")} К
+                            ⚠️ Разница в стоимости превышает лимит (максимум
+                            х2). Сейчас: {myTotal.toLocaleString("ru-RU")} К ↔{" "}
+                            {theirTotal.toLocaleString("ru-RU")} К
                           </div>
                         )}
                       </div>
                     );
                   })()}
-                  <div className="flex gap-1 p-1.5 bg-[#0f0d1a]">
+                  <div className="flex gap-1.5 p-2 bg-[#0f0d1a]">
                     <button
                       onClick={() => setTrade(null)}
-                      className="flex-1 rounded py-1 text-[13px] font-bold text-white/50 border border-white/10 hover:border-white/20"
+                      className="flex-1 rounded py-1.5 text-[12px] font-bold text-white/60 border border-white/10 hover:border-white/20"
                     >
                       Отмена
                     </button>
                     <button
                       onClick={proposeTrade}
-                      className="flex-1 rounded py-1 text-[13px] font-bold text-white bg-[#32786d] hover:bg-[#266059]"
+                      className="flex-1 rounded py-1.5 text-[12px] font-bold text-white bg-[#32786d] hover:bg-[#266059]"
                     >
                       Предложить
                     </button>
@@ -11109,7 +11258,6 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
   disabled:
     players[turn]?.id !== (currentUser?.id || "you") || // блокируем, если ход не твой
     rolled ||
-    inJail ||
     !!auction ||
     !!pendingAction,
                   },

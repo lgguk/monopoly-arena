@@ -6675,8 +6675,15 @@ resolveGameDesigns(cleanPlayers);
           setIsDoubleRoll(false);
           isDoubleRollRef.current = false;
           const cur = playersRef.current[activePlayerIdx];
+          // isMyTurn — тот, кто бросил. Только он пишет лог локально
+          // и эмитит его на сервер; остальные получат через broadcast.
+          // Без этого лог дублировался у всех (локально + broadcast от другого).
+          const isMyTurnForLog =
+            cur?.id === (currentUser?.id || "you");
           if (cur) {
-            addLog(`🚔 ${cur.name} — третий дубль подряд, отправляется в тюрьму!`);
+            if (isMyTurnForLog) {
+              addLog(`🚔 ${cur.name} — третий дубль подряд, отправляется в тюрьму!`);
+            }
             setPlayers((ps) =>
               ps.map((p, i) =>
                 i === activePlayerIdx

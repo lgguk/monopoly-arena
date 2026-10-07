@@ -306,7 +306,14 @@ type PendingAction =
       cellIndex: number;
     }
   | { type: "tax"; amount: number }
-  | { type: "chance"; amount: number; gain: boolean; desc: string }
+  | {
+      type: "chance";
+      amount: number;
+      gain: boolean;
+      desc: string;
+      chanceKind?: string;
+      chanceAmount?: number;
+    }
   | { type: "challenge"; newPos: number; desc: string }
   | { type: "gotojail" }
   | { type: "jackpot"; amount: number }
@@ -8612,7 +8619,12 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           CHANCE_EVENTS_DATA[
             Math.floor(Math.random() * CHANCE_EVENTS_DATA.length)
           ];
-        const aliveCount = players.filter((p) => !p.bankrupt).length;
+        // Через ref — state может быть stale в замыкании afterAnimRef.
+        // Иначе pay_each при aliveCount=1 получает totalAmt=0 и уходит
+        // в advanceTurn без окна и без списания (баг «корпоратив не сработал»).
+        const aliveCount = playersRef.current.filter(
+          (p) => p && !p.bankrupt,
+        ).length;
         const totalAmt =
           ev.kind === "birthday"
             ? ev.amount * (aliveCount - 1)
@@ -8646,10 +8658,38 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
             addLog(`💰 Все игроки получили по ${ev.amount.toLocaleString("ru-RU")} К`);
             advanceTurn(capturedTurn);
             break;
-          case "pay_each":
+          case "pay_each": {
             if (totalAmt <= 0) { advanceTurn(capturedTurn); break; }
-            setPendingAction({ type: "chance", amount: totalAmt, gain: false, desc });
+            const curMoney = cur.money ?? 0;
+            // Если денег хватает — списываем и начисляем каждому живому
+            // сопернику сразу, без окна подтверждения.
+            if (curMoney >= totalAmt) {
+              const perPlayer = ev.amount;
+              setPlayers((ps) =>
+                ps.map((p) => {
+                  if (p.id === cur.id)
+                    return { ...p, money: Math.max(0, p.money - totalAmt) };
+                  if (!p.bankrupt) return { ...p, money: p.money + perPlayer };
+                  return p;
+                }),
+              );
+              addLog(
+                `🎲 ${cur.name} оплатил корпоратив: −${totalAmt.toLocaleString("ru-RU")} К (по ${perPlayer.toLocaleString("ru-RU")} К каждому)`,
+              );
+              advanceTurn(capturedTurn);
+            } else {
+              // Не хватает — открываем окно «Заплатить / Сдаться».
+              setPendingAction({
+                type: "chance",
+                amount: totalAmt,
+                gain: false,
+                desc,
+                chanceKind: "pay_each",
+                chanceAmount: ev.amount,
+              });
+            }
             break;
+          }
           case "hotels":
             if (totalAmt <= 0) {
               addLog(`🚫 ${cur.name} — ничего не должен, так как нет филиалов и отелей.`);
@@ -8861,22 +8901,46 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         );
         advanceTurn();
         break;
-      case "chance":
+      case "chance": {
+        const ch = a as {
+          type: "chance";
+          amount: number;
+          gain: boolean;
+          desc: string;
+          chanceKind?: string;
+          chanceAmount?: number;
+        };
         setPlayers((ps) =>
-          ps.map((p, i) =>
-            i === turn
-              ? {
-                  ...p,
-                  money: Math.max(0, p.money + (a.gain ? a.amount : -a.amount)),
-                }
-              : p,
-          ),
+          ps.map((p) => {
+            if (p.id === player.id) {
+              return {
+                ...p,
+                money: Math.max(0, p.money + (ch.gain ? ch.amount : -ch.amount)),
+              };
+            }
+            // pay_each: каждому живому сопернику — по chanceAmount.
+            if (ch.chanceKind === "pay_each" && !p.bankrupt) {
+              return { ...p, money: p.money + (ch.chanceAmount || 0) };
+            }
+            return p;
+          }),
         );
-        addLog(
-          `🎲 Шанс: ${a.gain ? "+" : "-"}${a.amount.toLocaleString("ru-RU")} К`,
-        );
+        if (!ch.gain && ch.chanceKind !== "pay_each") {
+          // Всё, что ушло в банк (налог/штраф/коммунальный) — в джекпот.
+          setJackpot((j) => j + ch.amount);
+        }
+        if (ch.chanceKind === "pay_each") {
+          addLog(
+            `🎲 ${player.name} оплатил корпоратив: −${ch.amount.toLocaleString("ru-RU")} К`,
+          );
+        } else {
+          addLog(
+            `🎲 Шанс: ${ch.gain ? "+" : "-"}${ch.amount.toLocaleString("ru-RU")} К`,
+          );
+        }
         advanceTurn();
         break;
+      }
       case "gotojail":
         setPlayers((ps) =>
           ps.map((p, i) =>
@@ -11523,10 +11587,10 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   style={{ overflow: 'visible' }}
                 >
                   <defs>
-                    <filter id="flameBlurSoft"><feGaussianBlur stdDeviation="1.4" /></filter>
-                    <filter id="flameBlurMed"><feGaussianBlur stdDeviation="0.8" /></filter>
-                    <filter id="flameBlurSharp"><feGaussianBlur stdDeviation="0.4" /></filter>
-                    <filter id="flameBlurCrisp"><feGaussianBlur stdDeviation="0.12" /></filter>
+                    <filter id="flameBlurSoft" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="1.4" /></filter>
+                    <filter id="flameBlurMed" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="0.8" /></filter>
+                    <filter id="flameBlurSharp" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="0.4" /></filter>
+                    <filter id="flameBlurCrisp" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="0.12" /></filter>
                   </defs>
 
                   {/* Дым/жара — самый длинный, размытый, тёмно-красный. */}

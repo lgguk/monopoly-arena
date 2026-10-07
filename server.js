@@ -2944,8 +2944,8 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
   socket.on('trade-proposed', ({ roomId, initiatorId, trade }) => {
     socket.to(roomId).emit('trade-proposed-broadcast', { initiatorId, trade });
   });
-    socket.on('trade-resolved', ({ roomId, initiatorId }) => {
-    socket.to(roomId).emit('trade-resolved-broadcast', { initiatorId });
+    socket.on('trade-resolved', ({ roomId, initiatorId, restoreTurn }) => {
+    socket.to(roomId).emit('trade-resolved-broadcast', { initiatorId, restoreTurn });
   });
   // Клиент просит запустить таймер на новое ожидаемое действие.
   // Событие шлёт один клиент (тот, кто инициировал переход), сервер

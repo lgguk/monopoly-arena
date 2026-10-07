@@ -7044,6 +7044,15 @@ const timeLeftRef = useRef(45);
   const auctionDeclineRef = useRef<() => void>(() => {});
   const auctionRef = useRef<AuctionState | null>(null);
   const pendingActionRef = useRef<PendingAction | null>(null);
+    // Счётчик договоров, отправленных за текущий ход. Лимит — 2.
+  // Сбрасывается в advanceTurn, когда ход реально переходит к другому.
+  const tradesThisTurnRef = useRef(0);
+  const tradeInitiatorRef = useRef<{
+    id: string;
+    fromIdx: number;
+    isDouble: boolean;
+    doubleCount: number;
+  } | null>(null);
   const pendingTradeRef = useRef<{
     initiatorId: string;
     trade: TradeState;
@@ -7638,10 +7647,21 @@ resolveGameDesigns(cleanPlayers);
       }
     });
 
-    socket.on('trade-resolved-broadcast', ({ initiatorId }) => {
-      if (initiatorId === (currentUser?.id || "you")) {
-        setTrade(null);
-        setPendingTrade(null);
+    socket.on('trade-resolved-broadcast', ({ initiatorId, restoreTurn }: any) => {
+      // Договор закрыт (принят / отклонён / отменён / авто-отказ) —
+      // чистим у ВСЕХ. Раньше чистилось только у инициатора, и у target
+      // окно «принять / отказаться» оставалось висеть на экране.
+      setTrade(null);
+      setPendingTrade(null);
+      setTradeInitiator(null);
+      // Если это я — вернуть ход себе (и состояние дубля).
+      if (initiatorId === (currentUser?.id || "you") && restoreTurn) {
+        setTurn(restoreTurn.fromIdx);
+        if (restoreTurn.isDouble && restoreTurn.doubleCount < 3) {
+          setDoubleCount(restoreTurn.doubleCount);
+          setIsDoubleRoll(true);
+          setRolled(false);
+        }
       }
     });
 
@@ -7895,6 +7915,7 @@ resolveGameDesigns(cleanPlayers);
   useEffect(() => { auctionRef.current = auction; }, [auction]);
   useEffect(() => { pendingActionRef.current = pendingAction; }, [pendingAction]);
   useEffect(() => { pendingTradeRef.current = pendingTrade; }, [pendingTrade]);
+  useEffect(() => { tradeInitiatorRef.current = tradeInitiator; }, [tradeInitiator]);
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState<
     { from: string; text: string; timestamp: number }[]
@@ -8091,7 +8112,8 @@ const currentCellName = boardCells[player?.position ?? 0]?.name ?? "?";
     !!auction ||
     gameOver ||
     !!animPath ||
-    diceRolling;
+    diceRolling ||
+    !!pendingTrade;
     jailPaymentPending;
 
   const dynamicGroups = getDynamicGroups();
@@ -8278,6 +8300,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     // которые могли остаться от предыдущего хода (полоска договора).
     setPendingTrade(null);
     setTradeInitiator(null);
+    tradesThisTurnRef.current = 0;
 
     const next = nextAliveIndex(fromIdx);
     setTurn(next);
@@ -8306,6 +8329,27 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     const targetPlayer = allPlayers[index];
     if (!targetPlayer) return;
     if (targetPlayer.bankrupt) return; // уже выбыл
+
+    // Если выбывающий участвует в открытом договоре — отменяем его
+    // и сообщаем всем (у target / инициатора окно закроется через
+    // trade-resolved-broadcast).
+    {
+      const activeTrade = pendingTradeRef.current;
+      const activeInitiator = tradeInitiatorRef.current;
+      const isInitiator = activeInitiator?.id === targetPlayer.id;
+      const isTarget = activeTrade?.trade.targetId === targetPlayer.id;
+      if (activeTrade && (isInitiator || isTarget)) {
+        setPendingTrade(null);
+        setTradeInitiator(null);
+        tradesThisTurnRef.current = 0;
+        if (initialRoomId) {
+          socket.emit('trade-resolved', {
+            roomId: initialRoomId,
+            initiatorId: activeInitiator?.id,
+          });
+        }
+      }
+    }
 
     // Ежедневный квест "Сыграй 1 партию" — засчитываем только тому,
     // кто реально обанкротился внутри партии, а не вышел живым.
@@ -8359,6 +8403,27 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     const leaving = allPlayers[idx];
     if (leaving.bankrupt) return; // уже выбыл — не наш случай
 
+    // Если выходящий участвует в открытом договоре — отменяем его
+    // и сообщаем всем (у target / инициатора окно закроется через
+    // trade-resolved-broadcast).
+    {
+      const activeTrade = pendingTradeRef.current;
+      const activeInitiator = tradeInitiatorRef.current;
+      const isInitiator = activeInitiator?.id === playerId;
+      const isTarget = activeTrade?.trade.targetId === playerId;
+      if (activeTrade && (isInitiator || isTarget)) {
+        setPendingTrade(null);
+        setTradeInitiator(null);
+        tradesThisTurnRef.current = 0;
+        if (initialRoomId) {
+          socket.emit('trade-resolved', {
+            roomId: initialRoomId,
+            initiatorId: activeInitiator?.id,
+          });
+        }
+      }
+    }
+
     setPlayers((old) =>
       old.map((p, i) => (i === idx ? { ...p, bankrupt: true, leftAlive: true, money: 0 } : p)),
     );
@@ -8402,6 +8467,53 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
   const handleTimeout = (expiredPlayerId?: string) => {
     if (timeoutHandled.current || animPath || diceRolling) return;
+
+    // Авто-отказ по договору: таймер 30 сек истёк у принимающего.
+    // Возвращаем ход инициатору, запускаем у него новый таймер 30 сек.
+    // Проверяем ДО общей очистки trade/pendingTrade ниже — иначе
+    // окно просто снимется без возврата хода.
+    const incomingTrade = pendingTradeRef.current;
+    const incomingInitiator = tradeInitiatorRef.current;
+    const expiredId = expiredPlayerId || playersRef.current[turnRef.current]?.id;
+    if (
+      incomingTrade &&
+      incomingTrade.trade.targetId === expiredId &&
+      incomingInitiator
+    ) {
+      timeoutHandled.current = true;
+      const targetName =
+        playersRef.current.find((p) => p.id === expiredId)?.name || "?";
+      addLogRef.current(`⏰ ${targetName} — время на ответ по договору истекло. Авто-отказ.`);
+
+      // Возвращаем ход инициатору.
+      const { fromIdx, isDouble, doubleCount } = incomingInitiator;
+      setPendingTrade(null);
+      setTradeInitiator(null);
+      setTrade(null);
+      setTurn(fromIdx);
+      if (isDouble && doubleCount < 3) {
+        setDoubleCount(doubleCount);
+        setIsDoubleRoll(true);
+        setRolled(false);
+      }
+
+      // Сообщаем всем, что договор разрешён (broadcast закроет окно
+      // у инициатора и вернёт ему turn через restoreTurn).
+      if (initialRoomId) {
+        socket.emit('trade-resolved', {
+          roomId: initialRoomId,
+          initiatorId: incomingInitiator.id,
+          restoreTurn: { fromIdx, isDouble, doubleCount },
+        });
+        // Новый таймер 30 сек на инициатора.
+        socket.emit('timer-start', {
+          roomId: initialRoomId,
+          durationSec: 30,
+          playerId: playersRef.current[fromIdx]?.id,
+        });
+      }
+      return;
+    }
 
     // Таймер истёк — любое открытое окно договора отменяем. Иначе оно
     // висит поверх, пока параллельно стартует голосование.
@@ -9462,6 +9574,10 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
   const proposeTrade = () => {
     if (!trade || !tradeTarget) return;
+    if (tradesThisTurnRef.current >= 2) {
+      addLog("❌ Лимит: не более 2 договоров за ход.");
+      return;
+    }
     if (trade.myCards.length === 0 && trade.theirCards.length === 0) {
       addLog("❌ В классическом режиме запрещено менять деньги на деньги!");
       return;
@@ -9503,6 +9619,17 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     setPendingTrade({ initiatorId: player.id, trade });
     setTurn(targetIdx); // Принудительно переключаем ход
     socket.emit('trade-proposed', { roomId: initialRoomId, initiatorId: player.id, isDoubleRoll: isDoubleRoll, doubleCount: doubleCount, trade: { ...trade, initiatorId: player.id } });
+    tradesThisTurnRef.current += 1;
+
+    // Договор → таймер 30 сек на принимающего. Не ответил за 30 →
+    // авто-отказ, см. handleTimeout. Тот же интервал, что у аукциона.
+    if (initialRoomId) {
+      socket.emit('timer-start', {
+        roomId: initialRoomId,
+        durationSec: 30,
+        playerId: trade.targetId,
+      });
+    }
 
     setRolled(false); // Сбрасываем флаг броска, если был
     setMessage(
@@ -11018,15 +11145,15 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                 Стоимость:{" "}
                                 {myTotal.toLocaleString("ru-RU")} К
                               </div>
-                              {pendingTrade.trade.myMoney > 0 && (
-                                <div className="text-[11px] text-white/70 mb-1">
-                                  💵{" "}
-                                  {pendingTrade.trade.myMoney.toLocaleString(
-                                    "ru-RU",
-                                  )}{" "}
-                                  К
-                                </div>
-                              )}
+                              <div className="flex items-center gap-1.5 mb-1.5">
+                                <span className="shrink-0 text-[10px] font-bold uppercase tracking-wide text-white/45">
+                                  Доплата
+                                </span>
+                                <span className="min-w-0 flex-1 text-right text-[12px] font-mono text-white/85">
+                                  {pendingTrade.trade.myMoney.toLocaleString("ru-RU")}
+                                </span>
+                                <span className="shrink-0 text-[11px] text-white/50">К</span>
+                              </div>
                               <div className="min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
                                 {pendingTrade.trade.myCards.length === 0 ? (
                                   <div className="w-full text-center text-[9px] text-white/25 self-center py-3">
@@ -11060,15 +11187,15 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                 Стоимость:{" "}
                                 {theirTotal.toLocaleString("ru-RU")} К
                               </div>
-                              {pendingTrade.trade.theirMoney > 0 && (
-                                <div className="text-[11px] text-white/70 mb-1">
-                                  💵{" "}
-                                  {pendingTrade.trade.theirMoney.toLocaleString(
-                                    "ru-RU",
-                                  )}{" "}
-                                  К
-                                </div>
-                              )}
+                              <div className="flex items-center gap-1.5 mb-1.5">
+                                <span className="shrink-0 text-[10px] font-bold uppercase tracking-wide text-white/45">
+                                  Доплата
+                                </span>
+                                <span className="min-w-0 flex-1 text-right text-[12px] font-mono text-white/85">
+                                  {pendingTrade.trade.theirMoney.toLocaleString("ru-RU")}
+                                </span>
+                                <span className="shrink-0 text-[11px] text-white/50">К</span>
+                              </div>
                               <div className="min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
                                 {pendingTrade.trade.theirCards.length === 0 ? (
                                   <div className="w-full text-center text-[9px] text-white/25 self-center py-3">
@@ -11119,32 +11246,32 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                   `✅ ${target.name} принял договор с ${initiator.name}!`,
                                 );
 
-                                socket.emit('trade-resolved', { roomId: initialRoomId, initiatorId: tradeInitiator?.id });
+                                socket.emit('trade-resolved', {
+                                  roomId: initialRoomId,
+                                  initiatorId: tradeInitiator?.id,
+                                  restoreTurn: tradeInitiator
+                                    ? {
+                                        fromIdx: tradeInitiator.fromIdx,
+                                        isDouble: tradeInitiator.isDouble,
+                                        doubleCount: tradeInitiator.doubleCount,
+                                      }
+                                    : undefined,
+                                });
+                                if (initialRoomId && tradeInitiator) {
+                                  socket.emit('timer-start', {
+                                    roomId: initialRoomId,
+                                    durationSec: 30,
+                                    playerId: playersRef.current[tradeInitiator.fromIdx]?.id,
+                                  });
+                                }
 
-                                // Возвращаем ход инициатору с учётом дублей
-                                const initInfo = tradeInitiator;
+                                // Ход восстановит broadcast trade-resolved-broadcast
+                                // у инициатора через restoreTurn (или advanceTurn
+                                // на всякий случай, если tradeInitiator пуст).
+                                setImprovedGroupsThisTurn([]);
                                 setPendingTrade(null);
                                 setTradeInitiator(null);
-                                if (initInfo) {
-                                  setImprovedGroupsThisTurn([]);
-                                  if (
-                                    initInfo.isDouble &&
-                                    initInfo.doubleCount < 3
-                                  ) {
-                                    setTurn(initInfo.fromIdx);
-                                    setDoubleCount(initInfo.doubleCount);
-                                    setIsDoubleRoll(true);
-                                    setMessage(
-                                      `${players[initInfo.fromIdx].name}, дубль! Бросай кубики снова.`,
-                                    );
-                                    setRolled(false);
-                                  } else {
-                                    setTurn(initInfo.fromIdx);
-                                    setMessage(
-                                      `Ход возвращён ${players[initInfo.fromIdx].name}.`,
-                                    );
-                                  }
-                                } else {
+                                if (!tradeInitiator) {
                                   advanceTurn();
                                 }
                               }}
@@ -11157,6 +11284,27 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                 addLog(
                                   `❌ ${target.name} отказался от договора с ${initiator.name}.`,
                                 );
+                                // Сообщаем всем, что договор закрыт. broadcast
+                                // закроет окно у инициатора и восстановит ход
+                                // через restoreTurn.
+                                socket.emit('trade-resolved', {
+                                  roomId: initialRoomId,
+                                  initiatorId: tradeInitiator?.id,
+                                  restoreTurn: tradeInitiator
+                                    ? {
+                                        fromIdx: tradeInitiator.fromIdx,
+                                        isDouble: tradeInitiator.isDouble,
+                                        doubleCount: tradeInitiator.doubleCount,
+                                      }
+                                    : undefined,
+                                });
+                                if (initialRoomId && tradeInitiator) {
+                                  socket.emit('timer-start', {
+                                    roomId: initialRoomId,
+                                    durationSec: 30,
+                                    playerId: playersRef.current[tradeInitiator.fromIdx]?.id,
+                                  });
+                                }
                                 // Возвращаем ход инициатору с учётом дублей
                                 const initInfo = tradeInitiator;
                                 setPendingTrade(null);
@@ -11234,7 +11382,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                               myMoney: Math.max(0, Number(e.target.value) || 0),
                             })
                           }
-                          className="w-full rounded bg-white/10 px-1.5 py-1 text-[12px] font-mono text-white border-none outline-none placeholder:text-white/40"
+                          className="w-full rounded bg-white/10 px-1.5 py-1 text-[12px] font-mono text-white border-none outline-none placeholder:text-white/40 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                         />
                       </div>
                       <div className="mb-1.5 rounded bg-[#e96852]/15 border border-[#e96852]/40 px-2 py-0.5 text-[11px] font-bold text-[#ff8a75] text-center">
@@ -11284,7 +11432,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                               theirMoney: Math.max(0, Number(e.target.value) || 0),
                             })
                           }
-                          className="w-full rounded bg-white/10 px-1.5 py-1 text-[12px] font-mono text-white border-none outline-none placeholder:text-white/40"
+                        className="w-full rounded bg-white/10 px-1.5 py-1 text-[12px] font-mono text-white border-none outline-none placeholder:text-white/40 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                         />
                       </div>
                       <div

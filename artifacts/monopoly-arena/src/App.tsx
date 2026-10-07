@@ -6919,11 +6919,15 @@ function TradeCardLogo({ slotIndex }: { slotIndex: number }) {
         <img
           src={imageUrl}
           alt=""
+          draggable={false}
+          onDragStart={(e) => e.preventDefault()}
           style={{
             maxWidth: "90%",
             maxHeight: "90%",
             objectFit: "contain",
             transform: isTopBottom ? "rotate(90deg)" : "none",
+            pointerEvents: "none",
+            userSelect: "none",
           }}
         />
       ) : (
@@ -10276,7 +10280,11 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     backgroundColor: ownerPlayer
                       ? ownerPlayer.color + "B3"
                       : cellBg,
+                    userSelect: "none",
+                    WebkitUserSelect: "none",
                   }}
+                  draggable={false}
+                  onDragStart={(e) => e.preventDefault()}
                   className={`relative flex flex-col items-center justify-center overflow-visible cursor-default ${isHighlighted ? "ring-2 ring-primary ring-inset" : ""} ${isInTrade ? "ring-[3px] ring-[#ff5a00] ring-inset shadow-[inset_0_0_20px_rgba(255,90,0,0.85)]" : ""}`}
                   onClick={
                     cell.type === "property"
@@ -10497,6 +10505,8 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                         <img
                           src={imageUrl}
                           alt={cellName}
+                          draggable={false}
+                          onDragStart={(e) => e.preventDefault()}
                           style={{
                             maxWidth: "100%",
                             maxHeight: "100%",
@@ -10506,6 +10516,8 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                             transform: `scale(${design?.scale ?? 1})`,
                             transformOrigin: "center center",
                             filter: ownerPlayer ? "drop-shadow(0 1px 1.3px rgba(0,0,0,0.38)) drop-shadow(0 0 3px rgba(0,0,0,0.15))" : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
+                            pointerEvents: "none",
+                            userSelect: "none",
                           }}
                         />
                       </div>
@@ -10558,7 +10570,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     {playersHere.map((p) => (
                         <div
                     key={p.id}
-                    className="arena-chip flex w-[23px] h-[23px] items-center justify-center rounded-full"
+                    className="arena-chip flex w-[23px] h-[23px] lg:w-[24px] lg:h-[24px] items-center justify-center rounded-full"
                     style={{
                       position: "relative",
                       zIndex: p.id === movingPlayerId ? 2 : 1,
@@ -10575,7 +10587,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                         className="pointer-events-none absolute inset-0"
                         style={{ background: "radial-gradient(circle at 30% 25%, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0.15) 30%, transparent 55%)" }}
                       />
-                      <Crown size={12} style={{ color: "#faf0c8", position: "absolute" }} />
+                      <Crown size={12} style={{ color: "#faf0c8", position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)" }} />
                     </div>
                   </div>
     ))}
@@ -11635,6 +11647,19 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 <input
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
+                  onPaste={(e) => {
+                    // Запрещаем вставку картинок: clipboardData.items
+                    // содержит файл image/* — блокируем вставку целиком.
+                    const items = e.clipboardData?.items;
+                    if (items) {
+                      for (let i = 0; i < items.length; i++) {
+                        if (items[i].type.startsWith("image/")) {
+                          e.preventDefault();
+                          return;
+                        }
+                      }
+                    }
+                  }}
                   disabled={gameChatRateLimitedUntil > Date.now()}
                   placeholder={
                     gameChatRateLimitedUntil > Date.now()
@@ -11680,7 +11705,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 }}
               >
                 <div
-                  className="arena-chip flex w-[23px] h-[23px] items-center justify-center rounded-full"
+                  className="arena-chip flex w-[23px] h-[23px] lg:w-[24px] lg:h-[24px] items-center justify-center rounded-full"
                   style={{
                     background: "linear-gradient(135deg, #fbe6a0 0%, #e8c463 20%, #d4a647 50%, #b08a2d 80%, #8a6d1f 100%)",
                     padding: 2,
@@ -11695,7 +11720,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                       className="pointer-events-none absolute inset-0"
                       style={{ background: "radial-gradient(circle at 30% 25%, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0.15) 30%, transparent 55%)" }}
                     />
-                    <Crown size={12} style={{ color: "#faf0c8", position: "absolute" }} />
+                    <Crown size={12} style={{ color: "#faf0c8", position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)" }} />
                   </div>
                 </div>
               </div>
@@ -11724,7 +11749,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 }}
               >
                 <div
-                  className="arena-chip flex w-[23px] h-[23px] items-center justify-center rounded-full"
+                  className="arena-chip flex w-[23px] h-[23px] lg:w-[24px] lg:h-[24px] items-center justify-center rounded-full"
                   style={{
                     background: "linear-gradient(135deg, #fbe6a0 0%, #e8c463 20%, #d4a647 50%, #b08a2d 80%, #8a6d1f 100%)",
                     padding: 2,
@@ -11739,7 +11764,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                       className="pointer-events-none absolute inset-0"
                       style={{ background: "radial-gradient(circle at 30% 25%, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0.15) 30%, transparent 55%)" }}
                     />
-                    <Crown size={12} style={{ color: "#faf0c8", position: "absolute" }} />
+                    <Crown size={12} style={{ color: "#faf0c8", position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)" }} />
                   </div>
                 </div>
               </div>
@@ -11832,7 +11857,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
                 {/* Фишка игрока — летит вместе с пламенем */}
                 <div
-                  className="arena-chip absolute z-[110] flex w-[23px] h-[23px] items-center justify-center rounded-full"
+                  className="arena-chip absolute z-[110] flex w-[23px] h-[23px] lg:w-[24px] lg:h-[24px] items-center justify-center rounded-full"
                   style={{
                     left: `${from.x}%`,
                     top: `${from.y}%`,
@@ -11858,7 +11883,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                       className="pointer-events-none absolute inset-0"
                       style={{ background: "radial-gradient(circle at 30% 25%, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0.15) 30%, transparent 55%)" }}
                     />
-                    <Crown size={12} style={{ color: "#faf0c8", position: "absolute" }} />
+                    <Crown size={12} style={{ color: "#faf0c8", position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)" }} />
                   </div>
                 </div>
               </div>

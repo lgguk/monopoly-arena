@@ -8182,20 +8182,28 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       (key) => mortgagesRef.current[Number(key)] <= nextGlobalTurn,
     );
     if (expired.length > 0) {
-      const newOwners = { ...ownersRef.current };
-      const newMortgages = { ...mortgagesRef.current };
-      expired.forEach((key) => {
-        const idx = Number(key);
-        if (newOwners[idx]) {
+      const expiredSet = new Set(expired.map((k) => Number(k)));
+      // Логируем вне сеттера — сайд-эффекты внутри setState не рекомендуются.
+      expiredSet.forEach((idx) => {
+        if (ownersRef.current[idx]) {
           addLog(
             `🏚 Залог на «${boardCells[idx].name}» истек. Поле возвращено в банк.`,
           );
-          delete newOwners[idx];
-          delete newMortgages[idx];
         }
       });
-      setOwners(newOwners);
-      setMortgages(newMortgages);
+      // Обновляем через функцию — иначе затираем свежий setOwners
+      // (например, только что купленное поле ещё не в ownersRef.current,
+      // и апдейт через ref его бы стёр — баг с пропажей Google).
+      setOwners((oldOwners) => {
+        const next = { ...oldOwners };
+        expiredSet.forEach((idx) => { delete next[idx]; });
+        return next;
+      });
+      setMortgages((oldMortgages) => {
+        const next = { ...oldMortgages };
+        expiredSet.forEach((idx) => { delete next[idx]; });
+        return next;
+      });
     }
 
     // Если это дубль (1-й или 2-й), мы не переключаем ход, а даём бросать снова тому же игроку
@@ -8726,19 +8734,12 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         }, 1200);
         break;
       case "jail":
-        // 1.7.1: landing on Jail cell = same as gotojail
-        addLog(
-          `🔒 ${cur.name} попал на «Тюрьма» — задержан! До ${modeConfig.jailAttempts} попыт${modeConfig.jailAttempts === 1 ? "ки" : "ок"} дубля или выкуп 500 К.`,
-        );
-        setPlayers((ps) =>
-          ps.map((p, i) =>
-            i === capturedTurn
-              ? { ...p, position: 10, jailTurns: modeConfig.jailAttempts, jailAttempts: 0 }
-              : p,
-          ),
-        );
-        addLog(`🔒 ${cur.name} отправлен в тюрьму (до ${modeConfig.jailAttempts} попыт${modeConfig.jailAttempts === 1 ? "ки" : "ок"} дубля)`);
-        advanceTurn(capturedTurn, true);
+        // Посадка на клетку №10 — это «Отдых», не тюрьма. Игрок просто
+        // стоит здесь один ход и передаёт ход дальше. jailTurns не
+        // выставляем — иначе игрок реально попадёт в тюрьму, чего быть
+        // не должно (в тюрьму отправляет только клетка №30 «В тюрьму»).
+        addLog(`🌴 ${cur.name} решил отдохнуть на природе`);
+        advanceTurn(capturedTurn);
         break;
       case "jackpot": {
         // Защита от undefined в настройках
@@ -9458,8 +9459,11 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         addLog(
           `🎲 ${player.name} вышел из тюрьмы! Дубль! Двигается на ${steps} → «${getCell(np).name}»`,
         );
-          const path: number[] = [10];
+        const path: number[] = [10];
         for (let i = 1; i <= steps; i++) path.push((10 + i) % 40);
+        // Ставим movingPlayerIdRef до setAnimPath — иначе летящая фишка
+        // берёт предыдущего movingPlayer (чужой цвет + чужие координаты).
+        movingPlayerIdRef.current = playerId;
         afterAnimRef.current = () => processLanding(np, 10, capturedTurn);
         setAnimStep(0);
         setAnimPath(path);
@@ -9543,7 +9547,8 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
             const path: number[] = [10];
       for (let i = 1; i <= steps; i++) path.push((10 + i) % 40);
-      
+      // См. rollJail — тот же сброс movingPlayerIdRef.
+      movingPlayerIdRef.current = playersRef.current[capturedTurn]?.id || player.id;
       afterAnimRef.current = () => {
         setPlayers((prevPlayers) =>
           prevPlayers.map((p, i) =>
@@ -10267,7 +10272,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                             objectFit: "contain",
                             transform: `scale(${design?.scale ?? 1})`,
                             transformOrigin: "center center",
-                            filter: ownerPlayer ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(0,0,0,0.15))" : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
+                            filter: ownerPlayer ? "drop-shadow(0 1px 1.3px rgba(0,0,0,0.38)) drop-shadow(0 0 3px rgba(0,0,0,0.15))" : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
                           }}
                         />
                       </div>
@@ -10285,7 +10290,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                     : "18px",
                               lineHeight: 1,
                               marginBottom: "1px",
-                              filter: ownerPlayer ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(0,0,0,0.15))" : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
+                              filter: ownerPlayer ? "drop-shadow(0 1px 1.3px rgba(0,0,0,0.38)) drop-shadow(0 0 3px rgba(0,0,0,0.15))" : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
                             }}
                           >
                             {logo}
@@ -10302,7 +10307,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                     ? "17px"
                                     : "20px",
                               lineHeight: 1,
-                              filter: ownerPlayer ? "drop-shadow(0 1px 2px rgba(0,0,0,0.47)) drop-shadow(0 0 3px rgba(0,0,0,0.15))" : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
+                              filter: ownerPlayer ? "drop-shadow(0 1px 1.3px rgba(0,0,0,0.38)) drop-shadow(0 0 3px rgba(0,0,0,0.15))" : "drop-shadow(0 1px 1px rgba(0,0,0,0.07))",
                             }}
                           >
                             {specialIcon}

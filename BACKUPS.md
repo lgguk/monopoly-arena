@@ -1,3 +1,12 @@
+## 590b4e5 — feat(jail): анимация третьего дубля → тюрьма видна всем
+
+- Игрок бросает третий дубль подряд → фишка летит по диагонали с ТЕКУЩЕЙ позиции (Адидас, Nike и т.д.) в клетку №10 «Тюрьма».
+- Активный клиент: setDiagonalAnim({ from: currentPos, to: 10, playerId }) + socket.emit('jail-animation').
+- Наблюдатели: jail-animation-broadcast → та же анимация, через 1200 мс setPlayers(position: 10, jailTurns, jailAttempts: 0).
+- jailTurns = modeConfig.jailAttempts (реально в тюрьму, не в «Отдых»).
+- setSyncNudge — страховочный снапшот, как в case «gotojail».
+- Файл: artifacts/monopoly-arena/src/App.tsx (блок if (isThirdDouble) в socket.on('server-roll-result')).
+
 # Точки возврата Monopoly Arena
 
 ## Текущая рабочая версия

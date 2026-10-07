@@ -8671,11 +8671,20 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         const aliveCount = playersRef.current.filter(
           (p) => p && !p.bankrupt,
         ).length;
+        // hotels: платим только за СВОИ филиалы/отели (по ownersRef).
+        // Через refs — функция вызывается в afterAnimRef (замыкание на
+        // момент броска), где state может быть устаревшим.
+        const myHotelsCount =
+          ev.kind === "hotels"
+            ? Object.entries(improvementsRef.current)
+                .filter(([ci]) => ownersRef.current[Number(ci)] === cur.id)
+                .reduce((s, [, v]) => s + (Number(v) || 0), 0)
+            : 0;
         const totalAmt =
           ev.kind === "birthday"
             ? ev.amount * (aliveCount - 1)
             : ev.kind === "hotels"
-              ? ev.amount * Object.values(improvements).reduce((s, v) => s + v, 0)
+              ? ev.amount * myHotelsCount
               : ev.kind === "pay_each"
                 ? ev.amount * (aliveCount - 1)
                 : ev.kind === "mass_gain" || ev.kind === "mass_lose"

@@ -1,3 +1,9 @@
+## dd4e5ce — fix: договор с залогом, кнопка улучшения, чистка gotojail
+
+- **Договор обмена:** оценка карточки теперь учитывает залог. Хелпер getCardTradeValue(cellIdx) — если поле в залоге, берёт залоговую стоимость (getMortgage, 50%), иначе — обычную цену. Заменено во всех 8 местах: proposeTrade (myVal/theirVal), модалка pendingTrade (myTotal/theirTotal), inline-договор в JSX (блоки Стоимость + валидация overLimit).
+- **Чистка:** удалена мёртвая ветка case «gotojail» в confirmAction — setPendingAction({ type: «gotojail» }) нигде не вызывается. В processLanding case «gotojail» остался (это проверка типа клетки №30).
+- Файл: artifacts/monopoly-arena/src/App.tsx.
+
 ## 590b4e5 — feat(jail): анимация третьего дубля → тюрьма видна всем
 
 - Игрок бросает третий дубль подряд → фишка летит по диагонали с ТЕКУЩЕЙ позиции (Адидас, Nike и т.д.) в клетку №10 «Тюрьма».

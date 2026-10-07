@@ -7409,8 +7409,14 @@ resolveGameDesigns(cleanPlayers);
       const isDoubles = d1 === d2;
 
             doRollAnimation(d1, d2, () => {
+        // Чей это бросок — мой или соперника. Счётчик дублей и правило
+        // «третий дубль» касаются ТОЛЬКО бросающего. Без этой проверки
+        // чужие дубли инкрементировали мой doubleCountRef (он локальный
+        // на клиент), и мой первый дубль в свой ход засчитывался как третий.
+        const isMyTurn =
+          playersRef.current[activePlayerIdx]?.id === (currentUser?.id || "you");
         // Третий дубль подряд — в тюрьму без движения.
-        const isThirdDouble = isDoubles && doubleCountRef.current >= 2;
+        const isThirdDouble = isMyTurn && isDoubles && doubleCountRef.current >= 2;
         if (isThirdDouble) {
           doubleCountRef.current = 0;
           setDoubleCount(0);
@@ -7440,12 +7446,15 @@ resolveGameDesigns(cleanPlayers);
 
         // Счётчик дублей обновляем СИНХРОННО через ref —
         // advanceTurn ниже читает его, а не устаревший state.
-        if (isDoubles) {
-          doubleCountRef.current += 1;
-          setDoubleCount(doubleCountRef.current);
-        } else {
-          doubleCountRef.current = 0;
-          setDoubleCount(0);
+        // Только на клиенте того, кто бросает (см. выше про isMyTurn).
+        if (isMyTurn) {
+          if (isDoubles) {
+            doubleCountRef.current += 1;
+            setDoubleCount(doubleCountRef.current);
+          } else {
+            doubleCountRef.current = 0;
+            setDoubleCount(0);
+          }
         }
 
                 const path: number[] = [oldPos];
@@ -7455,8 +7464,6 @@ resolveGameDesigns(cleanPlayers);
         movingPlayerIdRef.current = playerId;
         setAnimStep(0);
         setAnimPath(path);
-
-         const isMyTurn = playersRef.current[activePlayerIdx]?.id === (currentUser?.id || "you");
 
         if (isMyTurn) {
           // ЛОГ ДОБАВЛЯЕТСЯ ТОЛЬКО ТЕМ, КТО БРОСАЕТ
@@ -7507,8 +7514,15 @@ resolveGameDesigns(cleanPlayers);
       // Если ход перешёл к другому игроку — сбрасываем историю улучшений
       // этого хода. Без этого improvedGroupsThisTurn остаётся старым
       // (от моего прошлого хода), и кнопка «Улучшить» блокируется.
+      // Заодно обнуляем счётчик дублей — иначе у наблюдателя копится
+      // сумма с чужих дублей, и его первый дубль ложно срабатывает
+      // как «третий».
       if (data.turn !== turnRef.current) {
         setImprovedGroupsThisTurn([]);
+        doubleCountRef.current = 0;
+        setDoubleCount(0);
+        isDoubleRollRef.current = false;
+        setIsDoubleRoll(false);
       }
       setTurn(data.turn);
       setGlobalTurnCounter(data.globalTurnCounter);

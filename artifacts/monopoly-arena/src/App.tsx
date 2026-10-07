@@ -7416,6 +7416,12 @@ resolveGameDesigns(cleanPlayers);
         const isMyTurn =
           playersRef.current[activePlayerIdx]?.id === (currentUser?.id || "you");
         // Третий дубль подряд — в тюрьму без движения.
+        // Анимация: диагональный полёт фишки с ТЕКУЩЕЙ позиции (где выпал
+        // третий дубль) в клетку 10. Тот же паттерн, что и у клетки №30
+        // «В тюрьму»: активный клиент запускает анимацию у себя и эмитит
+        // jail-animation, наблюдатели ловят jail-animation-broadcast и
+        // воспроизводят ту же последовательность (см. useEffect с
+        // socket.on('jail-animation-broadcast', ...)).
         const isThirdDouble = isMyTurn && isDoubles && doubleCountRef.current >= 2;
         if (isThirdDouble) {
           doubleCountRef.current = 0;
@@ -7423,24 +7429,43 @@ resolveGameDesigns(cleanPlayers);
           setIsDoubleRoll(false);
           isDoubleRollRef.current = false;
           const cur = playersRef.current[activePlayerIdx];
-          // isMyTurn — тот, кто бросил. Только он пишет лог локально
-          // и эмитит его на сервер; остальные получат через broadcast.
-          // Без этого лог дублировался у всех (локально + broadcast от другого).
-          const isMyTurnForLog =
-            cur?.id === (currentUser?.id || "you");
           if (cur) {
+            // isMyTurn — тот, кто бросил. Только он пишет лог локально
+            // и эмитит его на сервер; остальные получат через broadcast.
+            const isMyTurnForLog = cur.id === (currentUser?.id || "you");
+            const fromPos = cur.position ?? 0;
             if (isMyTurnForLog) {
               addLog(`🚔 ${cur.name} — третий дубль подряд, отправляется в тюрьму!`);
             }
-            setPlayers((ps) =>
-              ps.map((p, i) =>
-                i === activePlayerIdx
-                  ? { ...p, position: 10, jailTurns: modeConfig.jailAttempts, jailAttempts: 0 }
-                  : p,
-              ),
-            );
+            // Запускаем диагональную анимацию от текущей позиции к 10.
+            setDiagonalAnim({ from: fromPos, to: 10, playerId: cur.id });
+            // Сообщаем наблюдателям — они запустят ту же анимацию.
+            if (initialRoomId) {
+              socket.emit('jail-animation', {
+                roomId: initialRoomId,
+                playerId: cur.id,
+                from: fromPos,
+                to: 10,
+              });
+            }
+            // Через 1200 мс (длительность анимации) — телепортируем
+            // в тюрьму, убираем анимацию и передаём ход.
+            window.setTimeout(() => {
+              setPlayers((ps) =>
+                ps.map((p, i) =>
+                  i === activePlayerIdx
+                    ? { ...p, position: 10, jailTurns: modeConfig.jailAttempts, jailAttempts: 0 }
+                    : p,
+                ),
+              );
+              setDiagonalAnim(null);
+              setSyncNudge((n) => n + 1);
+              window.setTimeout(() => advanceTurn(activePlayerIdx, true), 200);
+            }, 1200);
+          } else {
+            // Страховка: cur нет — всё равно передаём ход.
+            window.setTimeout(() => advanceTurn(activePlayerIdx, true), 400);
           }
-          window.setTimeout(() => advanceTurn(activePlayerIdx, true), 400);
           return;
         }
 

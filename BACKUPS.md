@@ -1,3 +1,21 @@
+## c2ea566 — feat(trade): блокировка броска, таймер 30с, авто-отказ, лимит 2/ход
+
+- **Bug 1 (броски во время договора):** в busy добавлено `|| !!pendingTrade`. Кнопка «Бросить кубики» блокируется у обоих — и у target, и у инициатора.
+- **Bug 2 (таймер на договор):**
+  - proposeTrade → timer-start 30 сек на target.
+  - handleTimeout (новая ветка в начале): timer-expired у target + активный pendingTrade → авто-отказ. Возврат хода инициатору (setTurn/setDoubleCount/setIsDoubleRoll если дубль), эмит trade-resolved с restoreTurn + timer-start 30 сек на инициатора.
+  - trade-resolved-broadcast принимает restoreTurn и восстанавливает ход у инициатора.
+- **Bug 3 (лимит 2 договора за ход):** tradesThisTurnRef (useRef). Проверка в proposeTrade (>= 2 → лог + return), инкремент при отправке, сброс в advanceTurn.
+- **Bug 4 (спиннеры у input[type=number] в окне договора):** классы [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none на оба инпута (myMoney, theirMoney).
+- **Bug 5 (остаток окна у target после отказа):**
+  - trade-resolved-broadcast чистит trade/pendingTrade/tradeInitiator у ВСЕХ (было только у инициатора).
+  - у кнопки «Отказаться» не было socket.emit('trade-resolved') — окно у инициатора висело. Теперь эмитит с payload restoreTurn + timer-start 30 на инициатора.
+  - у «Принять» убран дублирующий локальный setTurn/setDoubleCount/setIsDoubleRoll (их ставит broadcast restoreTurn).
+- **Выход/сдача во время договора:** в bankruptPlayer и handleVoluntaryLeave отмена договора + trade-resolved если выбывающий initiator или target.
+- **server.js:** trade-resolved пробрасывает restoreTurn в trade-resolved-broadcast.
+- **Новые refs:** tradeInitiatorRef (через useEffect), tradesThisTurnRef.
+- **Файлы:** artifacts/monopoly-arena/src/App.tsx, server.js.
+
 ## 190b8b0 — fix(chance): hotels — платим только за свои филиалы
 
 - **Баг:** в событии Шанса «коммунальный сбор» (kind: hotels) игрок платил 500 × ВСЕ улучшения на доске, включая чужие филиалы. По лору — должен платить только за свои.

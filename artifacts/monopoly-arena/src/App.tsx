@@ -7090,6 +7090,13 @@ const timeLeftRef = useRef(45);
   const rent = basePrice * 0.1 * multiplier * modeConfig.rentMultiplier;
   return Math.round(rent / 10) * 10;
 };
+  // Оценка поля для договора обмена. Если поле в залоге — берём залоговую
+  // стоимость (getMortgage, 50%), иначе — обычную цену поля.
+  const getCardTradeValue = (cellIdx: number): number => {
+    const isMortgaged =
+      mortgages[cellIdx] !== undefined && mortgages[cellIdx] > globalTurnCounter;
+    return isMortgaged ? getMortgage(cellIdx) : (getCell(cellIdx).price ?? 0);
+  };
 
   const [dice, setDice] = useState<[number, number]>([2, 3]);
   const [targetDice, setTargetDice] = useState<[number, number]>([2, 3]);
@@ -8980,17 +8987,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         advanceTurn();
         break;
       }
-      case "gotojail":
-        setPlayers((ps) =>
-          ps.map((p, i) =>
-            i === turn
-              ? { ...p, position: 10, jailTurns: modeConfig.jailAttempts, jailAttempts: 0 }
-              : p,
-          ),
-        );
-        addLog(`🔒 ${player.name} отправлен в тюрьму (до ${modeConfig.jailAttempts} попыт${modeConfig.jailAttempts === 1 ? "ки" : "ок"} дубля)`);
-        advanceTurn();
-        break;
+  
       case "jackpot": {
         const amt = a.amount;
         if (amt > 0) {
@@ -9297,10 +9294,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       return;
     }
     const cost = getImproveCost(cellIdx);
-    if (player.money < cost) {
-      addLog("❌ Недостаточно средств для улучшения!");
-      return;
-    }
+    if (player.money < cost) return;
     const lvl = improvements[cellIdx] ?? 0;
     if (lvl >= 5) {
       addLog("ℹ️ Каксимальное улучшение!");
@@ -9473,10 +9467,10 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     }
     const myVal =
       trade.myMoney +
-      trade.myCards.reduce((s, ci) => s + (boardCells[ci].price ?? 0), 0);
+      trade.myCards.reduce((s, ci) => s + getCardTradeValue(ci), 0);
     const theirVal =
       trade.theirMoney +
-      trade.theirCards.reduce((s, ci) => s + (boardCells[ci].price ?? 0), 0);
+      trade.theirCards.reduce((s, ci) => s + getCardTradeValue(ci), 0);
     if (myVal > theirVal * 2 || theirVal > myVal * 2) {
       addLog(
         "❌ Договор: разница в стоимости предложений слишком велика (макс 2×).",
@@ -10978,13 +10972,13 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                       const myTotal =
                         pendingTrade.trade.myMoney +
                         pendingTrade.trade.myCards.reduce(
-                          (s, ci) => s + (getCell(ci).price ?? 0),
+                          (s, ci) => s + getCardTradeValue(ci),
                           0,
                         );
                       const theirTotal =
                         pendingTrade.trade.theirMoney +
                         pendingTrade.trade.theirCards.reduce(
-                          (s, ci) => s + (getCell(ci).price ?? 0),
+                          (s, ci) => s + getCardTradeValue(ci),
                           0,
                         );
                       return (
@@ -11239,7 +11233,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                         {(
                           trade.myMoney +
                           trade.myCards.reduce(
-                            (s, ci) => s + (getCell(ci).price ?? 0),
+                            (s, ci) => s + getCardTradeValue(ci),
                             0,
                           )
                         ).toLocaleString("ru-RU")}{" "}
@@ -11296,7 +11290,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                         {(
                           trade.theirMoney +
                           trade.theirCards.reduce(
-                            (s, ci) => s + (getCell(ci).price ?? 0),
+                            (s, ci) => s + getCardTradeValue(ci),
                             0,
                           )
                         ).toLocaleString("ru-RU")}{" "}
@@ -11319,13 +11313,13 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     const myTotal =
                       trade.myMoney +
                       trade.myCards.reduce(
-                        (s, ci) => s + (getCell(ci).price ?? 0),
+                        (s, ci) => s + getCardTradeValue(ci),
                         0,
                       );
                     const theirTotal =
                       trade.theirMoney +
                       trade.theirCards.reduce(
-                        (s, ci) => s + (getCell(ci).price ?? 0),
+                        (s, ci) => s + getCardTradeValue(ci),
                         0,
                       );
                     const overLimit =
@@ -12226,7 +12220,8 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                           getGroupIdx(selectedCell),
                         ) ||
                         (improvements[selectedCell] ?? 0) >= 5 ||
-                        isMortgaged
+                        isMortgaged ||
+                        player.money < getImproveCost(selectedCell)
                       }
                       className="flex-1 rounded-lg bg-[#32786d] py-[4px] font-bold text-white disabled:opacity-40 hover:bg-[#266059] transition-colors"
                       style={{ fontSize: "11px", lineHeight: "11px" }}

@@ -1,3 +1,13 @@
+## f31c539 — fix(trade): ownersDelta + moneyDelta в broadcast, restoreTurn всем
+
+- **Диагноз:** turn в проекте живёт только на клиентах (сервер его не хранит). После `trade-resolved` restoreTurn применялся только у инициатора. У третьего игрока C оставался turn=targetIdx (прилетел из sync A→B). Любой следующий sync от C откатывал turn у A и B — кнопка «Бросить кубики» у инициатора оставалась заблокированной, поле не перекрашивалось.
+- **Fix 1:** `ownersDelta` + `moneyDelta` теперь передаются в `trade-resolved` и пробрасываются сервером в `trade-resolved-broadcast`. В broadcast применяются у всех клиентов (setOwners/setPlayers). Раньше target применял их только локально, инициатор и C ничего не получали.
+- **Fix 2:** `restoreTurn` теперь применяется ВСЕМ клиентам (не только инициатору). Восстанавливает setTurn + setDoubleCount + setIsDoubleRoll + setRolled(false).
+- **Fix 3:** accept/decline читают `tradeInitiatorRef.current` (ref), а не state — защита от null из-за re-render.
+- **Fix 4:** `setSyncNudge` вызывается в accept/decline и в broadcast — форсирует отправку снапшота после операции (suppression-окно < 250 мс иначе глушит sync).
+- **server.js:** `trade-resolved` пробрасывает ownersDelta и moneyDelta в broadcast.
+- **Файлы:** artifacts/monopoly-arena/src/App.tsx, server.js.
+
 ## a385219 — ui: запрет drag/select на клетках стола, запрет вставки картинок в игровой чат
 
 - **Drag/select на клетках стола:** на контейнере клетки в boardCells.map добавлены `userSelect: "none"`, `WebkitUserSelect: "none"`, `draggable={false}`, `onDragStart={e => e.preventDefault()}`. Запрет распространяется на все текстовые и эмодзи-иконки: 🚀 (Старт), 💸 (Налог), 🎲 (Шанс), ⚡ (Испытание), 🔒 (Тюрьма), 👮 (В тюрьму), 🎰 (Джекпот), звёзды улучшений, цифры в полосках цены. Раньше их можно было выделить и перетащить.

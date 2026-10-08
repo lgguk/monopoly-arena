@@ -2168,6 +2168,71 @@ function isVipActive(): boolean {
   return new Date(vipUntil) > new Date();
 }
 
+// Кастомный селект. Нативный <select> не скругляется (системный рендер
+// списка), поэтому рисуем свой: кнопка + absolute-список со скруглёнными
+// углами. ChevronDown внутри кнопки — позиционируется относительно
+// обёртки, стрелка не улетает. Закрытие по клику вне.
+function SoftSelect<T extends string | number>({
+  value,
+  onChange,
+  options,
+  disabled = false,
+}: {
+  value: T;
+  onChange: (v: T) => void;
+  options: { value: T; label: string; disabled?: boolean }[];
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const onClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+  const current = options.find((o) => o.value === value);
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => !disabled && setOpen((v) => !v)}
+        disabled={disabled}
+        className="flex w-full items-center justify-between gap-2 rounded-xl border border-input bg-background px-3 py-2.5 text-left text-sm font-normal outline-none disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        <span className="truncate">{current?.label ?? ""}</span>
+        <ChevronDown
+          size={14}
+          className={`shrink-0 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`}
+        />
+      </button>
+      {open && (
+        <div className="absolute left-0 right-0 top-full z-30 mt-1 overflow-hidden rounded-xl border border-input bg-card shadow-lg">
+          {options.map((o) => (
+            <button
+              key={String(o.value)}
+              type="button"
+              disabled={o.disabled}
+              onClick={() => {
+                onChange(o.value);
+                setOpen(false);
+              }}
+              className={`block w-full px-3 py-2 text-left text-sm transition-colors ${
+                o.value === value
+                  ? "bg-primary/10 font-bold"
+                  : "hover:bg-muted"
+              } disabled:cursor-not-allowed disabled:opacity-40`}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Dashboard({
   onTab,
   onOpenFriendChat,
@@ -2223,7 +2288,7 @@ function Dashboard({
   const [createMode, setCreateMode] = useState<LobbyMode>("Классический");
   const [createPlayers, setCreatePlayers] = useState(4);
   const [createJackpot, setCreateJackpot] = useState(true);
-  const [createTeleport, setCreateTeleport] = useState(true);
+  const [createTeleport] = useState(false);
   const [createPassword, setCreatePassword] = useState("");
   const [findMode, setFindMode] = useState<"Все" | LobbyMode>("Все");
   const [findNotice, setFindNotice] = useState("");
@@ -2504,7 +2569,6 @@ function Dashboard({
       setCreateMode("Классический");
       setCreatePlayers(4);
       setCreateJackpot(true);
-      setCreateTeleport(true);
       setCreatePassword("");
     }
   }, [createOpen, playerName]);
@@ -3233,6 +3297,15 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
                       <span className="rounded-lg bg-muted px-4 py-2 text-xs font-bold text-muted-foreground">
                         Ваше лобби
                       </span>
+                    ) : (room.playerNames ?? []).includes(playerName || "") ? (
+                      <button
+                        onClick={() => {
+                          socket.emit('leave-room', { roomId: room.id });
+                        }}
+                        className="rounded-lg border border-input bg-card px-4 py-2 text-xs font-bold text-muted-foreground hover:bg-muted"
+                      >
+                        Покинуть
+                      </button>
                     ) : (
                       <button
                         onClick={() => {
@@ -3241,12 +3314,8 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
                           // авторизации через Home.
                           if (!player?.id) {
                             if (room.password) {
-                              // Парольная — просто авторизация, после
-                              // входа игрок кликнет снова и введёт пароль.
                               onJoinGame();
                             } else {
-                              // Открытая — Home запомнит roomId и эмитит
-                              // join-room сразу после авторизации.
                               onJoinGame(room.id);
                             }
                             return;
@@ -3289,7 +3358,7 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
         <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-[#29233e]/60 px-4 pb-4 pt-16 backdrop-blur-sm sm:pt-20">
           <form
             onSubmit={createRoom}
-            className="my-4 w-full max-w-lg rounded-2xl border border-card-border bg-card p-6 shadow-2xl"
+            className="my-4 w-full max-w-lg relative rounded-2xl border border-card-border bg-card p-6 shadow-2xl"
           >
             <div className="flex items-start justify-between">
               <div>
@@ -3321,72 +3390,96 @@ if (!isVip && (mode !== "Классический" || createPassword.trim() !== 
               />
             </label>
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
-              <select
-                value={createMode}
-                onChange={(event) => {
-                  const val = event.target.value as LobbyMode;
-                  if (val !== "Классический" && !isVipActive()) {
-                    setNotice("❌ Быстрая игра и Дуэль доступны только с VIP-статусом.");
-                    setTimeout(() => setNotice(""), 10000);
-                    return;
-                  }
-                  setCreateMode(val);
-                  if (val === "Дуэль") setCreatePlayers(2);
-                }}
-                className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal"
-              >
-                <option>Классический</option>
-                <option disabled={!isVipActive()}>
-                  {isVipActive() ? "Быстрая" : "Быстрая (только VIP)"}
-                </option>
-                <option disabled={!isVipActive()}>
-                  {isVipActive() ? "Дуэль" : "Дуэль (только VIP)"}
-                </option>
-              </select>
+              <div className="text-xs font-bold">
+                Режим игры
+                <div className="group mt-2">
+                  <SoftSelect
+                    value={createMode}
+                    onChange={(val) => {
+                      if (val !== "Классический" && !isVipActive()) {
+                        setNotice("❌ Быстрая игра и Дуэль доступны только с VIP-статусом.");
+                        setTimeout(() => setNotice(""), 10000);
+                        return;
+                      }
+                      setCreateMode(val);
+                      if (val === "Дуэль") setCreatePlayers(2);
+                      else if (val === "Быстрая" && createPlayers < 3) setCreatePlayers(3);
+                    }}
+                    options={[
+                      { value: "Классический", label: "Классический" },
+                      {
+                        value: "Быстрая",
+                        label: isVipActive() ? "Быстрая" : "Быстрая (только VIP)",
+                        disabled: !isVipActive(),
+                      },
+                      {
+                        value: "Дуэль",
+                        label: isVipActive() ? "Дуэль" : "Дуэль (только VIP)",
+                        disabled: !isVipActive(),
+                      },
+                    ]}
+                  />
+                  {/* Tooltip с описанием всех режимов. Абсолютный, поверх
+                      всего окна (z-60). pt-2 сохраняет hover при движении
+                      мыши от селекта к tooltip. */}
+                  <div className="absolute left-full top-28 z-[60] ml-3 hidden group-hover:block w-[280px]">
+                    <div className="rounded-xl border border-card-border bg-card p-3 text-[13px] leading-relaxed text-foreground shadow-2xl">
+                      <div className="mb-1 font-bold text-primary">🎩 Классический</div>
+                      <ul className="mb-2 list-disc pl-4 text-muted-foreground">
+                        <li>Стартовый капитал 15 000 К</li>
+                        <li>Аренда ×1, 3 попытки выхода из тюрьмы</li>
+                        <li>Проход Старта +2 000, клетка Старт +3 000</li>
+                        <li>Ход 45 сек</li>
+                      </ul>
+                      <div className="mb-1 font-bold text-primary">⚡ Быстрая (VIP)</div>
+                      <ul className="mb-2 list-disc pl-4 text-muted-foreground">
+                        <li>Стартовый капитал 10 000 К</li>
+                        <li>Аренда ×1.5, 1 попытка выхода из тюрьмы</li>
+                        <li>Проход Старта +3 000, клетка Старт +4 500</li>
+                        <li>Ход 30 сек</li>
+                      </ul>
+                      <div className="mb-1 font-bold text-primary">🥊 Дуэль (VIP)</div>
+                      <ul className="list-disc pl-4 text-muted-foreground">
+                        <li>Игра 1 на 1 по правилам Быстрой</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              </div>
               <label className="text-xs font-bold">
                 Количество игроков
-                <select
-                  value={createMode === "Дуэль" ? 2 : createPlayers}
-                  onChange={(event) =>
-                    setCreatePlayers(Number(event.target.value))
-                  }
-                  disabled={createMode === "Дуэль"}
-                  className="mt-2 w-full rounded-xl border border-input bg-background px-3 py-2.5 text-sm font-normal disabled:opacity-50"
-                >
-                  {createMode === "Дуэль" ? (
-                    <option value={2}>2 игрока (1×1)</option>
-                  ) : (
-                    [2, 3, 4, 5].map((count) => (
-                      <option key={count} value={count}>
-                        {count} игрока
-                      </option>
-                    ))
-                  )}
-                </select>
+                <div className="mt-2">
+                  <SoftSelect
+                    value={createMode === "Дуэль" ? 2 : createPlayers}
+                    onChange={(v) => setCreatePlayers(Number(v))}
+                    disabled={createMode === "Дуэль"}
+                    options={
+                      createMode === "Дуэль"
+                        ? [{ value: 2, label: "2 игрока (1×1)" }]
+                        : createMode === "Быстрая"
+                          ? [3, 4, 5].map((c) => ({ value: c, label: `${c} игрока` }))
+                          : [2, 3, 4, 5].map((c) => ({ value: c, label: `${c} игрока` }))
+                    }
+                  />
+                </div>
               </label>
             </div>
             <div className="mt-5">
               <div className="text-xs font-bold">Бонусы стола</div>
-              <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                {(
-                  [
-                    ["jackpot", "Джекпот", createJackpot, setCreateJackpot],
-                    ["teleport", "Телепорт", createTeleport, setCreateTeleport],
-                  ] as [string, string, boolean, (v: boolean) => void][]
-                ).map(([key, label, checked, setChecked]) => (
-                  <label
-                    key={key}
-                    className="flex cursor-pointer items-center gap-2 rounded-xl bg-muted p-3 text-xs font-bold"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={(event) => setChecked(event.target.checked)}
-                      className="accent-[#e96852]"
-                    />
-                    {label}
-                  </label>
-                ))}
+              <div className="mt-2 grid gap-2">
+                <label
+                  className="flex cursor-not-allowed items-center gap-2 rounded-xl bg-muted p-3 text-xs font-bold opacity-60"
+                  title="Бонус временно отключён"
+                >
+                  <input
+                    type="checkbox"
+                    checked={createJackpot}
+                    onChange={() => {}}
+                    disabled
+                    className="accent-[#e96852]"
+                  />
+                  Джекпот
+                </label>
               </div>
             </div>
             <label className="mt-4 block text-xs font-bold">
@@ -7533,6 +7626,7 @@ resolveGameDesigns(cleanPlayers);
 
           socket.on('update-remote-state', (data) => {
       if (data.senderId === (currentUser?.id || "you")) return;
+      console.log('[sync←]', new Date().toISOString().slice(11,23), 'from=' + data.senderId, 'turn=' + data.turn, 'owners=' + Object.keys(data.owners || {}).length);
 
       // ВАЖНО! Сравниваем данные...
       const stateString = JSON.stringify(data);
@@ -7576,8 +7670,19 @@ resolveGameDesigns(cleanPlayers);
       setRolled(data.rolled ?? false); 
       setIsDoubleRoll(data.isDoubleRoll ?? false); 
       
-      if (data.auction) setAuction(data.auction);
-      else setAuction(null); 
+      // Применяем чужой auction только если я в списке участников.
+      // Без этого у наблюдателя (не участника аукциона) могло висеть
+      // окно с чужими кнопками, а после завершения — заново открываться
+      // прилетевшим с задержкой sync'ом. Баг проявлялся на 3+ игроках.
+      if (
+        data.auction &&
+        Array.isArray(data.auction.participants) &&
+        data.auction.participants.some((pid: string) => pid === (currentUser?.id || "you"))
+      ) {
+        setAuction(data.auction);
+      } else {
+        setAuction(null);
+      }
     });
     socket.on('timer-start', (data: any) => {
       if (!data || typeof data.endsAt !== 'number') return;
@@ -7641,6 +7746,11 @@ resolveGameDesigns(cleanPlayers);
     socket.on('trade-proposed-broadcast', (data) => {
       const initiatorId = data.initiatorId;
       const trade = data.trade;
+      // Игнорируем broadcast, если я не target этого договора.
+      // Без этой проверки третий игрок (не участник) тоже получал
+      // setPendingTrade + setTurn(свой_индекс) — мигал кнопками броска
+      // и считал, что ход его. Баг проявлялся только при 3+ игроках.
+      if (!trade || trade.targetId !== (currentUser?.id || "you")) return;
       const targetIdx = playersRef.current.findIndex(p => p.id === (currentUser?.id || "you"));
       const initiatorIdx = playersRef.current.findIndex(p => p.id === initiatorId);
       if (targetIdx !== -1 && initiatorIdx !== -1) {
@@ -7651,22 +7761,42 @@ resolveGameDesigns(cleanPlayers);
       }
     });
 
-    socket.on('trade-resolved-broadcast', ({ initiatorId, restoreTurn }: any) => {
-      // Договор закрыт (принят / отклонён / отменён / авто-отказ) —
-      // чистим у ВСЕХ. Раньше чистилось только у инициатора, и у target
-      // окно «принять / отказаться» оставалось висеть на экране.
+    socket.on('trade-resolved-broadcast', ({ initiatorId, restoreTurn, ownersDelta, moneyDelta }: any) => {
+      // Применяем дельты от инициатора принятия — иначе у второй стороны
+      // owners и money остаются старыми (баг: у друга поле покрасилось,
+      // у меня — нет). Дельта-подход безопаснее полного owners:
+      // применяем только изменённые клетки, остальные не трогаем.
+      if (ownersDelta && typeof ownersDelta === "object") {
+        setOwners((prev) => ({ ...prev, ...ownersDelta }));
+      }
+      if (moneyDelta && typeof moneyDelta === "object") {
+        setPlayers((ps) =>
+          ps.map((p) =>
+            moneyDelta[p.id] !== undefined
+              ? { ...p, money: Number(moneyDelta[p.id]) }
+              : p,
+          ),
+        );
+      }
       setTrade(null);
       setPendingTrade(null);
       setTradeInitiator(null);
-      // Если это я — вернуть ход себе (и состояние дубля).
-      if (initiatorId === (currentUser?.id || "you") && restoreTurn) {
+      // Применяем restoreTurn ВСЕМ клиентам, а не только инициатору.
+      // Иначе у третьего игрока C остаётся turn, который прилетел из
+      // sync A→target (turn=targetIdx), и любой последующий sync от C
+      // откатывает turn у A и B. Симптом: после договора кнопка броска
+      // у инициатора остаётся заблокированной.
+      if (restoreTurn) {
         setTurn(restoreTurn.fromIdx);
         if (restoreTurn.isDouble && restoreTurn.doubleCount < 3) {
           setDoubleCount(restoreTurn.doubleCount);
           setIsDoubleRoll(true);
-          setRolled(false);
         }
+        setRolled(false);
       }
+      // Форсируем sync — suppression сейчас активна, и без nudge
+      // изменения owners / turn не улетят третьему игроку.
+      setSyncNudge((n) => n + 1);
     });
 
     // 🌟 ВАЖНО: Тотальная очистка всех сокетов при размонтировании
@@ -9925,6 +10055,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       const syncSkins = JSON.stringify(globalCustomSkins).length;
       console.warn(`⚠️ sync: ${syncTotal}B | players: ${syncPlayers}B | skins: ${syncSkins}B — выше нормы`);
     }
+    console.log('[sync→]', new Date().toISOString().slice(11,23), 'turn=' + syncPayload.turn, 'owners=' + Object.keys(syncPayload.owners).length, 'me=' + (currentUser?.id || "you"));
     socket.emit('sync-game-state', syncPayload);
     }, [turn, owners, improvements, jackpot, mortgages, gameOver, reward, auction, rolled, isDoubleRoll, syncNudge]);
 
@@ -10608,7 +10739,9 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
               </div>
 
               {/* Action window */}
-              {(pendingAction || auction || pendingTrade) && (
+              {(pendingAction ||
+                (auction && auction.participants.some((pid) => pid === (currentUser?.id || "you"))) ||
+                pendingTrade) && (
                 <div className="shrink-0 mx-1.5 mt-1.5 rounded-xl bg-[#1e1b2e] border border-white/20 p-2.5 shadow-xl">
                   {pendingAction?.type === "buy" &&
                     players[turn]?.id === (currentUser?.id || "you") && // <--- Проверка: видит только активный игрок
@@ -11001,7 +11134,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                         </>
                       );
                     })()}
-                  {auction && (
+                  {auction && auction.participants.some((pid) => pid === (currentUser?.id || "you")) && (
                     <>
                       <div className="text-[10px] font-bold text-[#e7ba68] uppercase tracking-widest mb-1">
                         🔨 Аукцион — {CELL_LOGOS[auction.cellIndex] ?? ""} «
@@ -11224,33 +11357,33 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                           <div className="flex gap-1.5 p-2 bg-[#0f0d1a]">
                             <button
                               onClick={() => {
-                                // Применить сделку
-                                const nOwners = { ...owners };
+                                // Считаем дельты ДО локального setOwners/setPlayers.
+                                const ownersDelta: Record<number, string> = {};
                                 pendingTrade.trade.myCards.forEach((ci) => {
-                                  nOwners[ci] = pendingTrade.trade.targetId;
+                                  ownersDelta[ci] = pendingTrade.trade.targetId;
                                 });
                                 pendingTrade.trade.theirCards.forEach((ci) => {
-                                  nOwners[ci] = initiator.id;
+                                  ownersDelta[ci] = initiator.id;
                                 });
-                                setOwners(nOwners);
+                                const initiatorNewMoney =
+                                  initiator.money -
+                                  pendingTrade.trade.myMoney +
+                                  pendingTrade.trade.theirMoney;
+                                const targetNewMoney =
+                                  target.money -
+                                  pendingTrade.trade.theirMoney +
+                                  pendingTrade.trade.myMoney;
+                                const moneyDelta: Record<string, number> = {
+                                  [initiator.id]: initiatorNewMoney,
+                                  [target.id]: targetNewMoney,
+                                };
+
+                                // Локально применяем у себя (target).
+                                setOwners((prev) => ({ ...prev, ...ownersDelta }));
                                 setPlayers((ps) =>
                                   ps.map((p) => {
-                                    if (p.id === initiator.id)
-                                      return {
-                                        ...p,
-                                        money:
-                                          p.money -
-                                          pendingTrade.trade.myMoney +
-                                          pendingTrade.trade.theirMoney,
-                                      };
-                                    if (p.id === target.id)
-                                      return {
-                                        ...p,
-                                        money:
-                                          p.money -
-                                          pendingTrade.trade.theirMoney +
-                                          pendingTrade.trade.myMoney,
-                                      };
+                                    if (moneyDelta[p.id] !== undefined)
+                                      return { ...p, money: moneyDelta[p.id] };
                                     return p;
                                   }),
                                 );
@@ -11258,32 +11391,33 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                   `✅ ${target.name} принял договор с ${initiator.name}!`,
                                 );
 
+                                const initInfo = tradeInitiatorRef.current;
                                 socket.emit('trade-resolved', {
                                   roomId: initialRoomId,
-                                  initiatorId: tradeInitiator?.id,
-                                  restoreTurn: tradeInitiator
+                                  initiatorId: initInfo?.id,
+                                  restoreTurn: initInfo
                                     ? {
-                                        fromIdx: tradeInitiator.fromIdx,
-                                        isDouble: tradeInitiator.isDouble,
-                                        doubleCount: tradeInitiator.doubleCount,
+                                        fromIdx: initInfo.fromIdx,
+                                        isDouble: initInfo.isDouble,
+                                        doubleCount: initInfo.doubleCount,
                                       }
                                     : undefined,
+                                  ownersDelta,
+                                  moneyDelta,
                                 });
-                                if (initialRoomId && tradeInitiator) {
+                                if (initialRoomId && initInfo) {
                                   socket.emit('timer-start', {
                                     roomId: initialRoomId,
                                     durationSec: 30,
-                                    playerId: playersRef.current[tradeInitiator.fromIdx]?.id,
+                                    playerId: playersRef.current[initInfo.fromIdx]?.id,
                                   });
                                 }
 
-                                // Ход восстановит broadcast trade-resolved-broadcast
-                                // у инициатора через restoreTurn (или advanceTurn
-                                // на всякий случай, если tradeInitiator пуст).
                                 setImprovedGroupsThisTurn([]);
                                 setPendingTrade(null);
                                 setTradeInitiator(null);
-                                if (!tradeInitiator) {
+                                setSyncNudge((n) => n + 1);
+                                if (!initInfo) {
                                   advanceTurn();
                                 }
                               }}
@@ -11296,50 +11430,29 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                 addLog(
                                   `❌ ${target.name} отказался от договора с ${initiator.name}.`,
                                 );
-                                // Сообщаем всем, что договор закрыт. broadcast
-                                // закроет окно у инициатора и восстановит ход
-                                // через restoreTurn.
+                                const initInfo = tradeInitiatorRef.current;
                                 socket.emit('trade-resolved', {
                                   roomId: initialRoomId,
-                                  initiatorId: tradeInitiator?.id,
-                                  restoreTurn: tradeInitiator
+                                  initiatorId: initInfo?.id,
+                                  restoreTurn: initInfo
                                     ? {
-                                        fromIdx: tradeInitiator.fromIdx,
-                                        isDouble: tradeInitiator.isDouble,
-                                        doubleCount: tradeInitiator.doubleCount,
+                                        fromIdx: initInfo.fromIdx,
+                                        isDouble: initInfo.isDouble,
+                                        doubleCount: initInfo.doubleCount,
                                       }
                                     : undefined,
                                 });
-                                if (initialRoomId && tradeInitiator) {
+                                if (initialRoomId && initInfo) {
                                   socket.emit('timer-start', {
                                     roomId: initialRoomId,
                                     durationSec: 30,
-                                    playerId: playersRef.current[tradeInitiator.fromIdx]?.id,
+                                    playerId: playersRef.current[initInfo.fromIdx]?.id,
                                   });
                                 }
-                                // Возвращаем ход инициатору с учётом дублей
-                                const initInfo = tradeInitiator;
                                 setPendingTrade(null);
                                 setTradeInitiator(null);
-                                if (initInfo) {
-                                  if (
-                                    initInfo.isDouble &&
-                                    initInfo.doubleCount < 3
-                                  ) {
-                                    setTurn(initInfo.fromIdx);
-                                    setDoubleCount(initInfo.doubleCount);
-                                    setIsDoubleRoll(true);
-                                    setMessage(
-                                      `${players[initInfo.fromIdx].name}, дубль! Бросай кубики снова.`,
-                                    );
-                                    setRolled(false);
-                                  } else {
-                                    setTurn(initInfo.fromIdx);
-                                    setMessage(
-                                      `Ход возвращён ${players[initInfo.fromIdx].name}.`,
-                                    );
-                                  }
-                                } else {
+                                setSyncNudge((n) => n + 1);
+                                if (!initInfo) {
                                   advanceTurn();
                                 }
                               }}

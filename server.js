@@ -740,8 +740,8 @@ async function finalizeGame(roomId) {
       coins = isVip ? Math.round(reward.coins * 1.2) : reward.coins;
 
       // Дроп — только в полной партии, шанс 25%.
-      const realItems = marketItems.filter(i => i.isActive !== false);
-      if (Math.random() < 0.25 && realItems.length > 0) {
+      const realItems = marketItems.filter(i => i.isActive === true);
+      if (Math.random() < 0.10 && realItems.length > 0) {
         const drop = realItems[Math.floor(Math.random() * realItems.length)];
         if (drop.category === 'vip') {
           const days = Number(drop.vipDuration) || 7;
@@ -2678,6 +2678,11 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     const room = rooms.find(r => r.id === roomId);
     if (!room) return socket.emit('join-error', 'Комната не найдена');
     if (room.password && room.password !== password) return socket.emit('join-error', 'Неверный пароль');
+    // Если этот socket уже в комнате (повторный клик «Присоединиться»),
+    // не увеличиваем счётчик — просто подтверждаем.
+    if (room.playerSockets && room.playerSockets[socket.id]) {
+      return socket.emit('joined-room', room);
+    }
     if (room.players >= room.maxPlayers) return socket.emit('join-error', 'Комната заполнена');
     if (room.hostId === socket.id) return socket.emit('join-error', 'Вы не можете присоединиться к своему лобби');
 
@@ -2872,6 +2877,22 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     console.log(`Лобби ${roomId} удалено хостом`);
   });
 
+  // Выход из лобби (до старта партии). Игрок сам решил уйти.
+  socket.on('leave-room', ({ roomId }) => {
+    const room = rooms.find(r => r.id === roomId);
+    if (!room || room.started) return;
+    const name = room.playerSockets?.[socket.id];
+    if (!name) return;
+    delete room.playerSockets[socket.id];
+    if (room.playerNames) {
+      const idx = room.playerNames.indexOf(name);
+      if (idx !== -1) room.playerNames.splice(idx, 1);
+    }
+    room.players = Math.max(0, room.players - 1);
+    socket.leave(roomId);
+    io.emit('update-rooms', rooms);
+  });
+
   socket.on('chat-message', (msg, callback) => {
     if (!msg || typeof msg.text !== 'string' || !msg.text.trim()) {
       return callback?.({ ok: false, error: 'invalid' });
@@ -2944,8 +2965,13 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
   socket.on('trade-proposed', ({ roomId, initiatorId, trade }) => {
     socket.to(roomId).emit('trade-proposed-broadcast', { initiatorId, trade });
   });
-    socket.on('trade-resolved', ({ roomId, initiatorId, restoreTurn }) => {
-    socket.to(roomId).emit('trade-resolved-broadcast', { initiatorId, restoreTurn });
+    socket.on('trade-resolved', ({ roomId, initiatorId, restoreTurn, ownersDelta, moneyDelta }) => {
+    socket.to(roomId).emit('trade-resolved-broadcast', {
+      initiatorId,
+      restoreTurn,
+      ownersDelta,
+      moneyDelta,
+    });
   });
   // Клиент просит запустить таймер на новое ожидаемое действие.
   // Событие шлёт один клиент (тот, кто инициировал переход), сервер

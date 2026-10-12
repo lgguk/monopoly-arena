@@ -2537,6 +2537,7 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       targetId: vote.targetId,
       targetName,
       yes, total, kicked,
+      votes: vote.votes, // передаём, чтобы клиенты построили детальный лог
     });
 
     // После голосования клиенты сами сделают advanceTurn и пришлют
@@ -2940,6 +2941,43 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     );
   });
 
+  // Диагностический сбор логов с клиентов. Включается флагом
+  // localStorage["arena-debug-logs"]="1". Сервер пишет всё в файл
+  // /tmp/arena-logs.txt. После теста смотреть: cat /tmp/arena-logs.txt
+  const DEBUG_LOG_FILE = '/root/monopoly-arena/arena-debug/live.txt';
+  const DEBUG_MARKER = '/root/monopoly-arena/arena-debug/on';
+  socket.on('client-log', ({ userId, message, timestamp }) => {
+    try {
+      // Пишем только если включён маркер-файл. Включение из VS Code:
+      //   touch /root/monopoly-arena/arena-debug/on
+      // Выключение:
+      //   rm /root/monopoly-arena/arena-debug/on
+      if (!fs.existsSync(DEBUG_MARKER)) return;
+      const t = new Date(timestamp || Date.now()).toISOString().slice(11, 23);
+      const line = `[${t}][${userId || '?'}] ${String(message).slice(0, 500)}\n`;
+      fs.appendFile(DEBUG_LOG_FILE, line, () => {});
+    } catch {}
+  });
+
+  // Переподключившийся / вернувшийся во вкладку клиент просит прислать
+  // ему актуальное transient-состояние: vote-state (хранится на сервере)
+  // и auction/sync (живут только на клиентах).
+  socket.on('request-live-state', ({ roomId }) => {
+    if (!roomId) return;
+    const room = gameRooms[roomId];
+    // 1) Активное голосование — отдаём сразу запросившему.
+    if (room && room.vote) {
+      socket.emit('vote-state', {
+        targetId: room.vote.targetId,
+        reason: room.vote.reason,
+        votes: room.vote.votes,
+        endsAt: room.vote.endsAt,
+      });
+    }
+    // 2) Просим остальных прислать их snapshot (auction и пр.).
+    socket.to(roomId).emit('request-live-state-broadcast');
+  });
+
   // Обработчик игрового лога (чтобы все видели действия друг друга)
   socket.on('game-log-add', (data) => {
     if (!data.roomId || !data.entry) return;
@@ -2962,8 +3000,13 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     if (!data || !data.roomId || !data.playerId) return;
     socket.to(data.roomId).emit('jail-animation-broadcast', data);
   });
-  socket.on('trade-proposed', ({ roomId, initiatorId, trade }) => {
-    socket.to(roomId).emit('trade-proposed-broadcast', { initiatorId, trade });
+  socket.on('trade-proposed', ({ roomId, initiatorId, trade, isDoubleRoll, doubleCount }) => {
+    socket.to(roomId).emit('trade-proposed-broadcast', {
+      initiatorId,
+      trade,
+      isDoubleRoll,
+      doubleCount,
+    });
   });
     socket.on('trade-resolved', ({ roomId, initiatorId, restoreTurn, ownersDelta, moneyDelta }) => {
     socket.to(roomId).emit('trade-resolved-broadcast', {

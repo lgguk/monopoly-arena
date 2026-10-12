@@ -7121,6 +7121,12 @@ const timeLeftRef = useRef(45);
   const gameOverRef = useRef(false);
   const isRemoteUpdate = useRef(false);
   const lastReceivedStateRef = useRef("");
+  // Хеш последнего ОТПРАВЛЕННОГО sync (без senderId). Нужен, чтобы
+  // не спамить одинаковыми снапшотами: при критичном стейте (аукцион,
+  // окно действия, договор) suppression выключен, и без этой защиты
+  // A и B зациклено пересылали друг другу одинаковые payload'ы —
+  // в логах 6+ sync за 100 мс, каждый раз затирая turn у соседа.
+  const lastSentSyncHashRef = useRef("");
   const remoteAppliedAtRef = useRef(0);
   const movingPlayerIdRef = useRef<string | null>(null);
   const rolledRef = useRef(false); // <--- ДОБАВЛЕНО
@@ -7144,6 +7150,16 @@ const timeLeftRef = useRef(45);
     // Счётчик договоров, отправленных за текущий ход. Лимит — 2.
   // Сбрасывается в advanceTurn, когда ход реально переходит к другому.
   const tradesThisTurnRef = useRef(0);
+  // Защита от затирания turn'а устаревшими sync'ами. Мы сами ставим turn
+  // при accept/decline/advanceTurn/proposeTrade/broadcast — и на 800 мс
+  // блокируем применение чужого turn. Иначе ре-транслируемое эхо от
+  // другого клиента со старым turn возвращает ход не тому игроку.
+  const lastLocalTurnChangeAtRef = useRef(0);
+  const TURN_LOCK_MS = 800;
+  const setTurnLocked = (v: number) => {
+    lastLocalTurnChangeAtRef.current = Date.now();
+    setTurn(v);
+  };
   const tradeInitiatorRef = useRef<{
     id: string;
     fromIdx: number;
@@ -7396,6 +7412,25 @@ resolveGameDesigns(cleanPlayers);
     // Подписываемся на события сервера строго один раз при монтировании
     socket.on('update-game-players', handlePlayersUpdate);
     socket.on('game-chat-message-broadcast', handleBroadcastMessage);
+
+    // Просим остальных прислать актуальный snapshot при заходе и при
+    // возврате во вкладку. Закрывает: (1) реконнект — игрок не знает
+    // про активный vote-state или auction; (2) свернул/развернул вкладку
+    // — transient state (окно аукциона, голосования) не восстановился.
+    socket.emit('request-live-state', { roomId: initialRoomId });
+
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        socket.emit('request-live-state', { roomId: initialRoomId });
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+
+    socket.on('request-live-state-broadcast', () => {
+      // Отвечаем: сбрасываем анти-эхо и форсим отправку снапшота.
+      lastSentSyncHashRef.current = "";
+      setSyncNudge((n) => n + 1);
+    });
 
     // Анимация испытания у наблюдателей: получаем {playerId, from, to}
     // и воспроизводим ту же последовательность, что активный игрок.
@@ -7663,7 +7698,13 @@ resolveGameDesigns(cleanPlayers);
         isDoubleRollRef.current = false;
         setIsDoubleRoll(false);
       }
-      setTurn(data.turn);
+      // Применяем чужой turn только если мы сами не меняли его
+      // последние TURN_LOCK_MS мс. Иначе эхо-sync от других клиентов
+      // перезатрёт свежий turn устаревшим. Баг: после accept/decline
+      // ход «возвращался» не тому игроку.
+      if (Date.now() - lastLocalTurnChangeAtRef.current > TURN_LOCK_MS) {
+        setTurn(data.turn);
+      }
       setGlobalTurnCounter(data.globalTurnCounter);
       setJackpot(data.jackpot);
       setMortgages(data.mortgages || {});
@@ -7718,8 +7759,19 @@ resolveGameDesigns(cleanPlayers);
 
     socket.on('vote-resolved', (data: any) => {
       setVote(null);
+      // Собираем детальный лог: как голосовал каждый игрок + итог.
+      // Формат: «Онлиап решил Оставить Кек, Лев решил Исключить Кек.»
+      const voters = data.votes || {};
+      const voteParts = Object.entries(voters).map(([uid, val]) => {
+        const p = playersRef.current.find(x => x.id === uid);
+        const name = p?.name || uid;
+        const decision = val === 'yes' ? 'Исключить' : 'Оставить';
+        return `${name} решил ${decision}`;
+      });
+      const detail = voteParts.length > 0 ? ` ${voteParts.join(', ')}.` : '';
+      const verdict = data.kicked ? 'исключён' : 'оставлен';
       addLogRef.current(
-        `🗳 Голосование: ${data.yes}/${data.total} за исключение. ${data.targetName} ${data.kicked ? 'исключён' : 'оставлен'}.`,
+        `🗳 Голосование за ${data.targetName}:${detail} Итог: ${data.targetName} ${verdict}.`,
       );
       if (data.kicked) {
         const idx = playersRef.current.findIndex(p => p.id === data.targetId);
@@ -7756,16 +7808,18 @@ resolveGameDesigns(cleanPlayers);
       if (targetIdx !== -1 && initiatorIdx !== -1) {
         setTradeInitiator({ id: initiatorId, fromIdx: initiatorIdx, isDouble: data.isDoubleRoll, doubleCount: data.doubleCount });
         setPendingTrade({ initiatorId, trade });
-        setTurn(targetIdx);
+        setTurnLocked(targetIdx);
         setRolled(false);
       }
     });
 
     socket.on('trade-resolved-broadcast', ({ initiatorId, restoreTurn, ownersDelta, moneyDelta }: any) => {
-      // Применяем дельты от инициатора принятия — иначе у второй стороны
-      // owners и money остаются старыми (баг: у друга поле покрасилось,
-      // у меня — нет). Дельта-подход безопаснее полного owners:
-      // применяем только изменённые клетки, остальные не трогаем.
+      lastSentSyncHashRef.current = "";
+      console.log('[trade-resolved-broadcast]',
+        'initiatorId=' + initiatorId,
+        'restoreTurn=' + JSON.stringify(restoreTurn),
+        'me=' + (currentUser?.id || "you"),
+      );
       if (ownersDelta && typeof ownersDelta === "object") {
         setOwners((prev) => ({ ...prev, ...ownersDelta }));
       }
@@ -7781,21 +7835,21 @@ resolveGameDesigns(cleanPlayers);
       setTrade(null);
       setPendingTrade(null);
       setTradeInitiator(null);
-      // Применяем restoreTurn ВСЕМ клиентам, а не только инициатору.
-      // Иначе у третьего игрока C остаётся turn, который прилетел из
-      // sync A→target (turn=targetIdx), и любой последующий sync от C
-      // откатывает turn у A и B. Симптом: после договора кнопка броска
-      // у инициатора остаётся заблокированной.
-      if (restoreTurn) {
-        setTurn(restoreTurn.fromIdx);
-        if (restoreTurn.isDouble && restoreTurn.doubleCount < 3) {
-          setDoubleCount(restoreTurn.doubleCount);
-          setIsDoubleRoll(true);
+      // turn восстанавливаем по ID инициатора, а не по fromIdx из payload.
+      // Порядок массива players у разных клиентов может отличаться, из-за
+      // чего fromIdx (индекс на стороне target'а) мог указывать не на того
+      // игрока. initiatorId — глобально уникален, работает всегда.
+      if (restoreTurn && initiatorId) {
+        const idx = playersRef.current.findIndex(p => p.id === initiatorId);
+        if (idx !== -1) {
+          setTurnLocked(idx);
+          if (restoreTurn.isDouble && restoreTurn.doubleCount < 3) {
+            setDoubleCount(restoreTurn.doubleCount);
+            setIsDoubleRoll(true);
+          }
+          setRolled(false);
         }
-        setRolled(false);
       }
-      // Форсируем sync — suppression сейчас активна, и без nudge
-      // изменения owners / turn не улетят третьему игроку.
       setSyncNudge((n) => n + 1);
     });
 
@@ -7803,6 +7857,8 @@ resolveGameDesigns(cleanPlayers);
         return () => {
       socket.off('update-game-players', handlePlayersUpdate);
       socket.off('game-chat-message-broadcast', handleBroadcastMessage);
+      document.removeEventListener("visibilitychange", onVisibility);
+      socket.off('request-live-state-broadcast');
       socket.off('challenge-animation-broadcast');
       socket.off('jail-animation-broadcast');
       socket.off('server-roll-result');
@@ -8437,7 +8493,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     tradesThisTurnRef.current = 0;
 
     const next = nextAliveIndex(fromIdx);
-    setTurn(next);
+    setTurnLocked(next);
     
     setRolled(false);
     setImprovedGroupsThisTurn([]);
@@ -8619,14 +8675,17 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         playersRef.current.find((p) => p.id === expiredId)?.name || "?";
       addLogRef.current(`⏰ ${targetName} — время на ответ по договору истекло. Авто-отказ.`);
 
-      // Возвращаем ход инициатору.
-      const { fromIdx, isDouble, doubleCount } = incomingInitiator;
+      // Возвращаем ход инициатору по его ID, а не by fromIdx —
+      // порядок массива у разных клиентов может отличаться.
+      const initiatorIdx = playersRef.current.findIndex(p => p.id === incomingInitiator.id);
       setPendingTrade(null);
       setTradeInitiator(null);
       setTrade(null);
-      setTurn(fromIdx);
-      if (isDouble && doubleCount < 3) {
-        setDoubleCount(doubleCount);
+      if (initiatorIdx !== -1) {
+        setTurnLocked(initiatorIdx);
+      }
+      if (incomingInitiator.isDouble && incomingInitiator.doubleCount < 3) {
+        setDoubleCount(incomingInitiator.doubleCount);
         setIsDoubleRoll(true);
         setRolled(false);
       }
@@ -8637,13 +8696,17 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         socket.emit('trade-resolved', {
           roomId: initialRoomId,
           initiatorId: incomingInitiator.id,
-          restoreTurn: { fromIdx, isDouble, doubleCount },
+          restoreTurn: {
+            fromIdx: initiatorIdx,
+            isDouble: incomingInitiator.isDouble,
+            doubleCount: incomingInitiator.doubleCount,
+          },
         });
         // Новый таймер 30 сек на инициатора.
         socket.emit('timer-start', {
           roomId: initialRoomId,
           durationSec: 30,
-          playerId: playersRef.current[fromIdx]?.id,
+          playerId: incomingInitiator.id,
         });
       }
       return;
@@ -9751,7 +9814,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 
     // Отправляем предложение и переключаем ход на получателя
     setPendingTrade({ initiatorId: player.id, trade });
-    setTurn(targetIdx); // Принудительно переключаем ход
+    setTurnLocked(targetIdx); // Принудительно переключаем ход
     socket.emit('trade-proposed', { roomId: initialRoomId, initiatorId: player.id, isDoubleRoll: isDoubleRoll, doubleCount: doubleCount, trade: { ...trade, initiatorId: player.id } });
     tradesThisTurnRef.current += 1;
 
@@ -10049,6 +10112,16 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         globalCustomSkins: globalCustomSkins,
         timeLeft: timeLeft
     };
+    // Анти-эхо: если payload (без senderId) не изменился с прошлого раза —
+    // не отправляем. Убирает ping-pong A→B→A→B идентичными данными.
+    // Без этого при критичном стейте (договор/аукцион) suppression отключён,
+    // и клиенты зациклено пересылают друг другу одинаковые снапшоты,
+    // затирая turn друг у друга.
+    const { senderId: _ignored, ...hashablePayload } = syncPayload;
+    const payloadHash = JSON.stringify(hashablePayload);
+    if (lastSentSyncHashRef.current === payloadHash) return;
+    lastSentSyncHashRef.current = payloadHash;
+
     const syncTotal = JSON.stringify(syncPayload).length;
     if (syncTotal > 50000) {
       const syncPlayers = JSON.stringify(playersRef.current).length;
@@ -11391,7 +11464,8 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                   `✅ ${target.name} принял договор с ${initiator.name}!`,
                                 );
 
-                                const initInfo = tradeInitiatorRef.current;
+                                const initInfo = tradeInitiatorRef.current || tradeInitiator;
+                                console.log('[trade-accept]', 'initInfo=' + JSON.stringify(initInfo));
                                 socket.emit('trade-resolved', {
                                   roomId: initialRoomId,
                                   initiatorId: initInfo?.id,
@@ -11406,20 +11480,37 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                   moneyDelta,
                                 });
                                 if (initialRoomId && initInfo) {
+                                  // playerId берём напрямую из initInfo.id —
+                                  // надёжнее, чем playersRef.current[fromIdx]
+                                  // (fromIdx может быть неточным).
                                   socket.emit('timer-start', {
                                     roomId: initialRoomId,
                                     durationSec: 30,
-                                    playerId: playersRef.current[initInfo.fromIdx]?.id,
+                                    playerId: initInfo.id,
                                   });
                                 }
 
                                 setImprovedGroupsThisTurn([]);
                                 setPendingTrade(null);
                                 setTradeInitiator(null);
-                                setSyncNudge((n) => n + 1);
-                                if (!initInfo) {
-                                  advanceTurn();
+                                // Локально тоже возвращаем ход инициатору.
+                                // Broadcast до нас самих НЕ долетает (мы его
+                                // эмитили), а sync улетит всем с текущим
+                                // turn=targetIdx и затрёт turn у инициатора.
+                                if (initInfo) {
+                                  const idx = playersRef.current.findIndex(p => p.id === initInfo.id);
+                                  if (idx !== -1) {
+                                    setTurnLocked(idx);
+                                    if (initInfo.isDouble && initInfo.doubleCount < 3) {
+                                      setDoubleCount(initInfo.doubleCount);
+                                      setIsDoubleRoll(true);
+                                    }
+                                    setRolled(false);
+                                  }
+                                } else {
+                                  console.warn('[trade-accept] initInfo пуст — ход не передан');
                                 }
+                                setSyncNudge((n) => n + 1);
                               }}
                               className="flex-1 rounded py-1.5 text-[12px] font-bold text-white bg-[#32786d] hover:bg-[#266059]"
                             >
@@ -11430,7 +11521,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                 addLog(
                                   `❌ ${target.name} отказался от договора с ${initiator.name}.`,
                                 );
-                                const initInfo = tradeInitiatorRef.current;
+                                const initInfo = tradeInitiatorRef.current || tradeInitiator;
                                 socket.emit('trade-resolved', {
                                   roomId: initialRoomId,
                                   initiatorId: initInfo?.id,
@@ -11446,15 +11537,25 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                   socket.emit('timer-start', {
                                     roomId: initialRoomId,
                                     durationSec: 30,
-                                    playerId: playersRef.current[initInfo.fromIdx]?.id,
+                                    playerId: initInfo.id,
                                   });
                                 }
                                 setPendingTrade(null);
                                 setTradeInitiator(null);
-                                setSyncNudge((n) => n + 1);
-                                if (!initInfo) {
-                                  advanceTurn();
+                                if (initInfo) {
+                                  const idx = playersRef.current.findIndex(p => p.id === initInfo.id);
+                                  if (idx !== -1) {
+                                    setTurnLocked(idx);
+                                    if (initInfo.isDouble && initInfo.doubleCount < 3) {
+                                      setDoubleCount(initInfo.doubleCount);
+                                      setIsDoubleRoll(true);
+                                    }
+                                    setRolled(false);
+                                  }
+                                } else {
+                                  console.warn('[trade-decline] initInfo пуст — ход не передан');
                                 }
+                                setSyncNudge((n) => n + 1);
                               }}
                               className="flex-1 rounded py-1.5 text-[12px] font-bold text-white/60 border border-white/10 hover:border-white/20"
                             >
@@ -16081,7 +16182,64 @@ function AccessGate({ children }: { children: ReactNode }) {
   );
 }
 
+// Диагностика: перехватывает console.log и шлёт меченые строки
+// ([sync...], [trade...], [challenge...]) на сервер для сбора.
+// Включается флагом в localStorage:
+//   localStorage.setItem("arena-debug-logs", "1")
+// Отключается:
+//   localStorage.removeItem("arena-debug-logs")
+// По умолчанию выключено — никакого оверхеда в проде.
+function useDebugLogRelay() {
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    // Перехват всегда включён на клиенте. Сервер сам решит,
+    // писать в файл или нет (по маркеру /tmp/arena-debug-logs-on).
+    // Так включение/выключение идёт с сервера — F12 на телефоне не нужен.
+
+    const origLog = console.log.bind(console);
+    const origWarn = console.warn.bind(console);
+
+    const isTracked = (msg: string) =>
+      msg.startsWith("[sync") ||
+      msg.startsWith("[trade") ||
+      msg.startsWith("[challenge");
+
+    const relay = (msg: string) => {
+      if (!isTracked(msg)) return;
+      let uid = "anon";
+      try {
+        const u = JSON.parse(localStorage.getItem("arena-session-user") || "{}");
+        uid = u?.id || "anon";
+      } catch {}
+      socket.emit("client-log", { userId: uid, message: msg, timestamp: Date.now() });
+    };
+
+    const wrap = (orig: typeof console.log) => (...args: any[]) => {
+      orig(...args);
+      try {
+        const msg = args
+          .map((a) =>
+            typeof a === "string"
+              ? a
+              : (() => { try { return JSON.stringify(a); } catch { return String(a); } })()
+          )
+          .join(" ");
+        relay(msg);
+      } catch {}
+    };
+
+    console.log = wrap(origLog);
+    console.warn = wrap(origWarn);
+
+    return () => {
+      console.log = origLog;
+      console.warn = origWarn;
+    };
+  }, []);
+}
+
 function App() {
+  useDebugLogRelay();
   // Флаг «уже входил в приложение». Если нет — показываем лендинг,
   // если да — сразу игру (без повторного просмотра лендинга).
   // Google/Яндекс заходят без флага → видят лендинг → индексируют.

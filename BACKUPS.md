@@ -1,3 +1,24 @@
+## 1d4c47d — fix(sync): turn-lock 800ms, request-live-state, лог голосования, votes в payload
+
+Большой пакет по синхронизации и восстановлению состояния. Закрывает три класса проблем.
+
+**1. Защита turn'а от эха (`setTurnLocked`).**
+- Причина: после accept/decline инициатор ставил turn локально, но через 100–200 мс приходил эхо-sync от другого клиента с устаревшим turn и перезатирал его. Ход «возвращался» не тому игроку.
+- Fix: `lastLocalTurnChangeAtRef` + `TURN_LOCK_MS = 800`. `setTurnLocked(v)` фиксирует момент локального изменения, в `update-remote-state` чужой turn применяется только если лок не активен.
+- Заменено 7 вызовов `setTurn` на `setTurnLocked` в: advanceTurn, proposeTrade, trade-proposed-broadcast, trade-resolved-broadcast, accept, decline, handleTimeout (авто-отказ).
+
+**2. `request-live-state` при реконнекте / возврате вкладки.**
+- Причина: transient-состояния (активное голосование на сервере, окно аукциона на клиентах) не восстанавливались после засыпания вкладки или разрыва сокета.
+- server.js: обработчик `request-live-state` отдаёт запросившему текущий `room.vote` (если есть) и ретранслирует `request-live-state-broadcast` остальным.
+- App.tsx: при монтировании эмитим `request-live-state`, слушаем `visibilitychange` (на возврате в видимую вкладку — снова эмит). На `request-live-state-broadcast` сбрасываем `lastSentSyncHashRef` и форсим `setSyncNudge` — снапшот улетает всем.
+
+**3. Детальный лог голосования.**
+- Причина: в логе было «0/2 за исключение» — непонятно, кто как голосовал. И votes вообще не передавались с сервера.
+- server.js: `vote-resolved` теперь содержит `votes: vote.votes`.
+- App.tsx: лог строит строчки вида «Онлиап решил Оставить, Лев решил Исключить. Итог: Кек оставлен.»
+
+**Файлы:** artifacts/monopoly-arena/src/App.tsx, server.js.
+
 ## f31c539 — fix(trade): ownersDelta + moneyDelta в broadcast, restoreTurn всем
 
 - **Диагноз:** turn в проекте живёт только на клиентах (сервер его не хранит). После `trade-resolved` restoreTurn применялся только у инициатора. У третьего игрока C оставался turn=targetIdx (прилетел из sync A→B). Любой следующий sync от C откатывал turn у A и B — кнопка «Бросить кубики» у инициатора оставалась заблокированной, поле не перекрашивалось.

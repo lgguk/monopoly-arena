@@ -2981,8 +2981,12 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
   // Обработчик игрового лога (чтобы все видели действия друг друга)
   socket.on('game-log-add', (data) => {
     if (!data.roomId || !data.entry) return;
-    // socket.to(roomId) отправляет всем в комнате, КРОМЕ отправителя (убирает дубли)
-    socket.to(data.roomId).emit('game-log-add-broadcast', data.entry);
+    // Присваиваем единый серверный timestamp и рассылаем ВСЕМ, включая
+    // отправителя. Раньше sender писал лог локально со своим timestamp,
+    // остальные — с broadcast; при параллельных событиях порядок
+    // разъезжался. Теперь у всех один источник времени.
+    const entry = { ...data.entry, timestamp: Date.now() };
+    io.to(data.roomId).emit('game-log-add-broadcast', entry);
   });
 
   // Анимация испытания: активный игрок попал на клетку «Испытание»,

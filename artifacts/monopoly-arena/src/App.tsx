@@ -7145,6 +7145,7 @@ const timeLeftRef = useRef(45);
   const handleVoluntaryLeaveRef = useRef<(playerId: string) => void>(() => {});
   const addLogRef = useRef<(entry: string, type?: "default" | "special") => void>(() => {});
   const auctionDeclineRef = useRef<() => void>(() => {});
+  const auctionRaiseRef = useRef<() => void>(() => {});
   const auctionRef = useRef<AuctionState | null>(null);
   const pendingActionRef = useRef<PendingAction | null>(null);
     // Счётчик договоров, отправленных за текущий ход. Лимит — 2.
@@ -7759,20 +7760,21 @@ resolveGameDesigns(cleanPlayers);
 
     socket.on('vote-resolved', (data: any) => {
       setVote(null);
-      // Собираем детальный лог: как голосовал каждый игрок + итог.
-      // Формат: «Онлиап решил Оставить Кек, Лев решил Исключить Кек.»
+      // Голосование стреляет на ВСЕХ клиентах. Если писать через addLog,
+      // каждый клиент эмитит game-log-add → сервер рассылает всем → 3
+      // одинаковых сообщения. Поэтому пишем ЛОКАЛЬНО через setLog.
       const voters = data.votes || {};
-      const voteParts = Object.entries(voters).map(([uid, val]) => {
+      const voteParts: string[] = [];
+      Object.entries(voters).forEach(([uid, val]) => {
         const p = playersRef.current.find(x => x.id === uid);
         const name = p?.name || uid;
-        const decision = val === 'yes' ? 'Исключить' : 'Оставить';
-        return `${name} решил ${decision}`;
+        const stance = val === 'yes' ? 'за исключение' : 'против';
+        voteParts.push(`${name} — ${stance}`);
       });
-      const detail = voteParts.length > 0 ? ` ${voteParts.join(', ')}.` : '';
+      const votesLine = voteParts.length > 0 ? voteParts.join(', ') : 'никто не голосовал';
       const verdict = data.kicked ? 'исключён' : 'оставлен';
-      addLogRef.current(
-        `🗳 Голосование за ${data.targetName}:${detail} Итог: ${data.targetName} ${verdict}.`,
-      );
+      const text = `🗳 Голосование за ${data.targetName}: ${votesLine}. ${data.targetName} ${verdict}.`;
+      setLog((old) => [...old, { text, type: "default" as const, timestamp: Date.now() }].slice(-50));
       if (data.kicked) {
         const idx = playersRef.current.findIndex(p => p.id === data.targetId);
         if (idx !== -1 && !playersRef.current[idx].bankrupt) {
@@ -8725,7 +8727,30 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       const currentBidderId = auction.participants[auction.currentIdx];
       if (currentBidderId === (currentUser?.id || "you")) {
         timeoutHandled.current = true;
-        auctionDeclineRef.current();
+        const bidder = playersRef.current.find(p => p.id === currentBidderId);
+        const isObligatedWinner =
+          auction.participants.length === 1 &&
+          auction.highBidder === currentBidderId;
+        if (isObligatedWinner && bidder) {
+          // Единственный участник с выигравшей ставкой. Отказаться не может.
+          if (bidder.money >= auction.price) {
+            addLogRef.current(
+              `⏰ ${bidder.name} — авто-выкуп поля за ${auction.price.toLocaleString("ru-RU")} К.`,
+            );
+            auctionRaiseRef.current();
+          } else {
+            addLogRef.current(
+              `💀 ${bidder.name} — не смог выкупить поле на аукционе. Банкрот.`,
+            );
+            const myIdx = playersRef.current.findIndex(p => p.id === currentBidderId);
+            setAuction(null);
+            if (myIdx !== -1) {
+              bankruptPlayerRef.current(myIdx, 'не смог выкупить поле на аукционе');
+            }
+          }
+        } else {
+          auctionDeclineRef.current();
+        }
       }
       return;
     }
@@ -9213,12 +9238,12 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
         (j) => j - entryFee + (entryFee - prize < 0 ? 0 : entryFee - prize),
       );
       addLog(
-        `🎰 ${player.name} угадал! Поставил на ${pickedText}. Выиграл ${prize.toLocaleString("ru-RU")} К! (ставка ${entryFee.toLocaleString("ru-RU")} К)`,
+        `🎰 ${player.name} угадал! Поставил на ${pickedText}. Выиграл ${prize.toLocaleString("ru-RU")} К! (ставка ${entryFee.toLocaleString("ru-RU")} К). Было загадано число ${secret}.`,
       );
     } else {
       playJackpotLoseSound();
       addLog(
-        `🎰 ${player.name} — неудача :( Поставил на ${pickedText}. Проиграл ${entryFee.toLocaleString("ru-RU")} К.`,
+        `🎰 ${player.name} — неудача :( Поставил на ${pickedText}. Проиграл ${entryFee.toLocaleString("ru-RU")} К. Было загадано число ${secret}.`,
       );
     }
     advanceTurn();
@@ -10042,6 +10067,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
     handleVoluntaryLeaveRef.current = handleVoluntaryLeave;
     addLogRef.current = addLog;
     auctionDeclineRef.current = auctionDecline;
+    auctionRaiseRef.current = auctionRaise;
   });
 
   const cellGridPos = (index: number) => ({
@@ -11268,11 +11294,27 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                           // Игрок уже делал ставку и остался один — обязан выкупить.
                           // Отказаться нельзя: иначе это не аукцион.
                           if (isObligatedWinner) {
+                            const shortfall = Math.max(0, auction.price - (currentBidder?.money || 0));
+                            const totalAssets = getPlayerTotalAssets(
+                              currentBidderId, players, owners, improvements,
+                            );
+                            const percentLoss = totalAssets > 0
+                              ? Math.min(100, Math.round((shortfall / totalAssets) * 100))
+                              : 100;
                             return (
                               <div>
                                 <div className="text-[10px] text-white/60 mb-1.5 text-center">
                                   Ваша ставка победила — вы обязаны выкупить поле.
                                 </div>
+                                {!canAfford && (
+                                  <div className="mb-2 rounded-lg bg-[#e96852]/15 border border-[#e96852]/40 px-2.5 py-2 text-[10px] leading-snug text-[#ff8a75]">
+                                    <div className="font-bold mb-0.5">
+                                      ⚠️ Не хватает {shortfall.toLocaleString("ru-RU")} К
+                                    </div>
+                                    Продайте/заложите поле или улучшение, обменяйте предметы. Это ~{percentLoss}% ваших активов (всего {totalAssets.toLocaleString("ru-RU")} К).
+                                    Если не выкупите до конца таймера — банкрот.
+                                  </div>
+                                )}
                                 <button
                                   onClick={auctionRaise}
                                   disabled={!canAfford}
@@ -11280,6 +11322,20 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                 >
                                   Выкупить за {auction.price.toLocaleString("ru-RU")} К
                                 </button>
+                                {!canAfford && (
+                                  <button
+                                    onClick={() => {
+                                      const myIdx = playersRef.current.findIndex(p => p.id === currentBidderId);
+                                      setAuction(null);
+                                      if (myIdx !== -1) {
+                                        bankruptPlayerRef.current(myIdx, 'не смог выкупить поле на аукционе');
+                                      }
+                                    }}
+                                    className="mt-1.5 w-full rounded-lg border border-[#e96852]/40 bg-white/5 py-1.5 text-[11px] font-bold text-[#ff8a75] hover:bg-[#e96852]/15 transition-colors"
+                                  >
+                                    🏳️ Сдаться (обанкротиться)
+                                  </button>
+                                )}
                               </div>
                             );
                           }

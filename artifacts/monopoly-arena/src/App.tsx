@@ -7483,6 +7483,9 @@ resolveGameDesigns(cleanPlayers);
         jailAttempts: Number(data.jailAttempts) || 3,
         passStartBonus: Number(data.passStartBonus) || 2000,
         landStartBonus: Number(data.landStartBonus) || 3000,
+        jackpot: !!data.jackpot,
+        teleport: !!data.teleport,
+        hostName: data.hostName || "Игрок",
       });
       // Стартовый таймер сразу под режим
       if (typeof data.turnDurationSec === "number") {
@@ -7982,6 +7985,9 @@ resolveGameDesigns(cleanPlayers);
     jailAttempts: number;
     passStartBonus: number;
     landStartBonus: number;
+    jackpot: boolean;
+    teleport: boolean;
+    hostName: string;
   }>(() => {
     // Fallback из localStorage — если room-settings ещё не пришли.
     // При создании лобби host сохраняет туда maxPlayers, при join
@@ -8000,6 +8006,9 @@ resolveGameDesigns(cleanPlayers);
       jailAttempts: 3,
       passStartBonus: 2000,
       landStartBonus: 3000,
+      jackpot: false,
+      teleport: false,
+      hostName: "Игрок",
     };
   });
 
@@ -10245,24 +10254,32 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           </button>
         </div>
 
-        <div className="mb-3 font-mono text-[10px] uppercase leading-relaxed tracking-[.10em] text-primary">
-          <div>живая партия</div>
-          <div>стол #{initialRoomId?.replace('#', '')}</div>
+        <div className="mb-3 font-mono text-[10px] leading-relaxed tracking-[.10em] text-primary">
+          <div className="break-words">Комната {modeConfig.hostName}</div>
+          <div>#{initialRoomId?.replace('#', '')}</div>
         </div>
 
         <h2 className="mb-4 font-display text-lg font-bold leading-tight text-[#f7f0e3]">
-          Пятничный клуб
+          {modeConfig.mode === "Классический"
+            ? "Классика"
+            : modeConfig.mode === "Дуэль"
+              ? "1×1"
+              : "Быстрая"}
         </h2>
 
-        <div className="space-y-2">
-          <div className="rounded-lg bg-[#f3e7c8] px-3 py-2 text-center">
-            <div className="font-mono text-[10px] text-[#7a5c1e]">ДЖЕКПОТ</div>
-            <div className="text-lg">🎰</div>
-          </div>
-          <div className="rounded-lg bg-[#f3e7c8] px-3 py-2 text-center">
-            <div className="font-mono text-[10px] text-[#7a5c1e]">ТЕЛЕПОРТ</div>
-            <div className="text-lg">🌀</div>
-          </div>
+        <div className="flex flex-wrap gap-2">
+          {modeConfig.jackpot && (
+            <div className="rounded-lg bg-[#f3e7c8] px-2 py-1.5 text-center">
+              <div className="font-mono text-[9px] leading-tight text-[#7a5c1e]">ДЖЕКПОТ</div>
+              <div className="text-base leading-tight">🎰</div>
+            </div>
+          )}
+          {modeConfig.teleport && (
+            <div className="rounded-lg bg-[#f3e7c8] px-2 py-1.5 text-center">
+              <div className="font-mono text-[9px] leading-tight text-[#7a5c1e]">ТЕЛЕПОРТ</div>
+              <div className="text-base leading-tight">🌀</div>
+            </div>
+          )}
         </div>
 
         {/* Игроки в drawer — скрыто, теперь список в правой панели */}
@@ -10323,25 +10340,31 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
       <div className="hidden absolute left-0 top-0 z-10 h-full w-[108px] px-3 py-3 bg-foreground text-border border-t-[#29233e] border-r-
       [#29233e] border-b-[#29233e] border-l-[#29233e] pl-[135px] pr-[135px] justify-center items-center flex-col text-center gap-[14px] 
       rounded-tl-[4px] rounded-tr-[4px] rounded-br-[4px] rounded-bl-[4px] lg:flex">
-        <div className="font-mono text-[10px] uppercase leading-relaxed tracking-[.10em] text-primary text-left border-t-[0px] border-r-[0px] 
+        <div className="font-mono text-[10px] leading-relaxed tracking-[.10em] text-primary text-left border-t-[0px] border-r-[0px] 
         border-b-[0px] border-l-[0px] pt-[0px] pb-[0px] mt-[0px] mb-[0px]">
-          <span className="block whitespace-nowrap">живая партия</span>
-<span className="block whitespace-nowrap">стол #{initialRoomId?.replace('#', '')}</span>
+          <span className="block break-words">Комната {modeConfig.hostName}</span>
+<span className="block whitespace-nowrap">#{initialRoomId?.replace('#', '')}</span>
         </div>
         <h1 className="font-display text-[15px] font-bold leading-tight text-border">
-          Пятничный клуб
+          {modeConfig.mode === "Классический"
+            ? "Классика"
+            : modeConfig.mode === "Дуэль"
+              ? "1×1"
+              : "Быстрая"}
         </h1>
-        <div className="mt-1 flex flex-col gap-1 items-center">
-          {/* Джекпот */}
-          <div className="rounded-lg bg-[#f3e7c8] px-1.5 py-1 text-center">
-            <div className="font-mono text-[9px] text-[#7a5c1e]">ДЖЕКПОТ</div>
-            <div className="text-[14px]">🎰</div>
-          </div>
-          {/* Телепорт (всегда показываем как часть интерфейса) */}
-          <div className="rounded-lg bg-[#f3e7c8] px-1.5 py-1 text-center">
-            <div className="font-mono text-[9px] text-[#7a5c1e]">ТЕЛЕПОРТ</div>
-            <div className="text-[14px]">🌀</div>
-          </div>
+        <div className="mt-1 flex flex-wrap gap-1 items-start justify-start">
+          {modeConfig.jackpot && (
+            <div className="rounded-lg bg-[#f3e7c8] px-1.5 py-1 text-center">
+              <div className="font-mono text-[9px] leading-tight text-[#7a5c1e]">ДЖЕКПОТ</div>
+              <div className="text-[14px] leading-tight">🎰</div>
+            </div>
+          )}
+          {modeConfig.teleport && (
+            <div className="rounded-lg bg-[#f3e7c8] px-1.5 py-1 text-center">
+              <div className="font-mono text-[9px] leading-tight text-[#7a5c1e]">ТЕЛЕПОРТ</div>
+              <div className="text-[14px] leading-tight">🌀</div>
+            </div>
+          )}
         </div>
       </div>
       {/* Board + Right panel — shared centered container */}

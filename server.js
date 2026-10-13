@@ -2668,7 +2668,13 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
     turnDurationSec: getTurnDuration(mode),
   };
     rooms.push(newRoom);
-    roomMeta[newRoom.id] = { mode, maxPlayers };
+    roomMeta[newRoom.id] = {
+      mode,
+      maxPlayers,
+      jackpot: !!roomData.jackpot,
+      teleport: !!roomData.teleport,
+      hostName: roomData.host || "Игрок",
+    };
     socket.emit('room-created', newRoom);
     socket.join(newRoom.id);
     io.emit('update-rooms', rooms);
@@ -2723,6 +2729,9 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       const meta = roomMeta[roomId];
       gameRooms[roomId].mode = meta?.mode || "Классический";
       gameRooms[roomId].maxPlayers = meta?.maxPlayers || 2;
+      gameRooms[roomId].jackpot = !!meta?.jackpot;
+      gameRooms[roomId].teleport = !!meta?.teleport;
+      gameRooms[roomId].hostName = meta?.hostName || "Игрок";
     }
     const roomMode = gameRooms[roomId].mode;
     const fast = isFastMode(roomMode);
@@ -2738,6 +2747,9 @@ socket.on('get-admin-cases', () => socket.emit('admin-cases-updated', adminCases
       jailAttempts: fast ? 1 : 3,
       passStartBonus: fast ? 3000 : 2000,
       landStartBonus: fast ? 4500 : 3000,
+      jackpot: !!gameRooms[roomId].jackpot,
+      teleport: !!gameRooms[roomId].teleport,
+      hostName: gameRooms[roomId].hostName || "Игрок",
     });
 
     // Сначала ищем игрока по УНИКАЛЬНОМУ id (не по socketId!) — это нужно для переподключения

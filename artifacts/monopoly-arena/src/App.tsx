@@ -7005,7 +7005,7 @@ function TradeCardLogo({ slotIndex }: { slotIndex: number }) {
   const logo = CELL_LOGOS[slotIndex];
   return (
     <div
-      className="flex h-[53px] w-[63px] shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white shadow-sm"
+      className="flex h-[37px] w-[44px] lg:h-[53px] lg:w-[63px] shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white shadow-sm"
       title={getCell(slotIndex).name}
     >
       {imageUrl ? (
@@ -7950,11 +7950,16 @@ resolveGameDesigns(cleanPlayers);
   // На мобиле играть можно только в ландшафтной ориентации —
   // в портрете стол не помещается. Показываем заглушку с просьбой повернуть.
   const [isPortraitMobile, setIsPortraitMobile] = useState(false);
+  // Узкий экран (<1024px) в любой ориентации — мобила/планшет.
+  // Используется для адаптации мелких элементов интерфейса: кубиков
+  // в логах, шрифта чата.
+  const [isCompactScreen, setIsCompactScreen] = useState(false);
   useEffect(() => {
     const check = () => {
       const isPortrait = window.matchMedia("(orientation: portrait)").matches;
       const isSmall = window.innerWidth < 1024;
       setIsPortraitMobile(isPortrait && isSmall);
+      setIsCompactScreen(isSmall);
     };
     check();
     window.addEventListener("resize", check);
@@ -8340,12 +8345,15 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
 };
 
     const addLog = (entry: string, type: "default" | "special" = "default") => {
-    const logEntry = { text: entry, type, timestamp: Date.now() };
-    setLog((old) => [...old, logEntry].slice(-50));
-    
-    // Если это мультиплеер, отправляем лог на сервер, чтобы его увидели другие игроки
+    // Мультиплеер: только эмитим на сервер. Ответ придёт всем (включая нас)
+    // через game-log-add-broadcast с единым серверным timestamp —
+    // у всех одинаковый порядок, нет дублей и рассинхрона времени.
     if (initialRoomId) {
-      socket.emit('game-log-add', { roomId: initialRoomId, entry: logEntry });
+      socket.emit('game-log-add', { roomId: initialRoomId, entry: { text: entry, type } });
+    } else {
+      // Соло: сервера нет, пишем локально.
+      const logEntry = { text: entry, type, timestamp: Date.now() };
+      setLog((old) => [...old, logEntry].slice(-50));
     }
   };
 
@@ -11430,7 +11438,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                 </span>
                                 <span className="shrink-0 text-[11px] text-white/50">К</span>
                               </div>
-                              <div className="min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
+                              <div className="min-h-[36px] lg:min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
                                 {pendingTrade.trade.myCards.length === 0 ? (
                                   <div className="w-full text-center text-[9px] text-white/25 self-center py-3">
                                     —
@@ -11472,7 +11480,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                                 </span>
                                 <span className="shrink-0 text-[11px] text-white/50">К</span>
                               </div>
-                              <div className="min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
+                              <div className="min-h-[36px] lg:min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
                                 {pendingTrade.trade.theirCards.length === 0 ? (
                                   <div className="w-full text-center text-[9px] text-white/25 self-center py-3">
                                     —
@@ -11680,7 +11688,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                         ).toLocaleString("ru-RU")}{" "}
                         К
                       </div>
-                      <div className="min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
+                      <div className="min-h-[36px] lg:min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
                         {trade.myCards.length === 0 ? (
                           <div className="w-full text-center text-[9px] text-white/25 self-center py-3">
                             Клик по своему полю
@@ -11737,7 +11745,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                         ).toLocaleString("ru-RU")}{" "}
                         К
                       </div>
-                      <div className="min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
+                      <div className="min-h-[36px] lg:min-h-[52px] rounded bg-white/5 p-1 flex flex-wrap gap-1 items-start">
                         {trade.theirCards.length === 0 ? (
                           <div className="w-full text-center text-[9px] text-white/25 self-center py-3">
                             Клик по полю соперника
@@ -11811,7 +11819,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   </div>
                 </div>
               )}
-              <div className="min-h-0 min-w-0 flex-1 relative overflow-hidden p-1.5 pt-1 text-[14px] lg:text-[12px]">
+              <div className="min-h-0 min-w-0 flex-1 relative overflow-hidden p-1.5 pt-1 text-[15px] lg:text-[12px]">
                 {/* Сами логи чата (объединенный и отсортированный поток) */}
                 <div
                   ref={logContainerRef}
@@ -11860,7 +11868,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                             {parts.map((part, idx) => {
                               const val = DICE_FACE_INDEX[part];
                               if (val) {
-                                return <DiceFace key={idx} value={val} size={18} />;
+                                return <DiceFace key={idx} value={val} size={isCompactScreen ? 13 : 18} />;
                               }
                               return (
                                 <span key={idx}>

@@ -7910,6 +7910,8 @@ resolveGameDesigns(cleanPlayers);
     y: number;
   } | null>(null);
   const [showRating, setShowRating] = useState(false);
+  const [confirmExit, setConfirmExit] = useState(false);
+  const [confirmSurrender, setConfirmSurrender] = useState(false);
   const [trade, setTrade] = useState<TradeState | null>(null);
   const [pendingTrade, setPendingTrade] = useState<{
     initiatorId: string;
@@ -12272,20 +12274,15 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 const myId = currentUser?.id || "you";
                 const me = players.find(p => p.id === myId);
 
-                if (!me) { onExit(); return; }
-
-                // Игрок УЖЕ выбыл (банкрот) — показываем модалку с наградой, потом выходим
-                if (me.bankrupt && !me.leftAlive) {
+                // Игрок УЖЕ выбыл (банкрот) — кнопка ведёт на показ награды,
+                // подтверждение не нужно.
+                if (me && me.bankrupt && !me.leftAlive) {
                   if (initialRoomId) socket.emit('leave-game', { roomId: initialRoomId, userId: myId });
-                  // Награды начисляет сервер. Клиент просто ждёт game-rewards
-                  // и покажет модалку через подписку socket.on('game-rewards').
                   return;
                 }
 
-                // Игрок ЖИВОЙ — выходим без награды
-                if (initialRoomId) socket.emit('leave-game', { roomId: initialRoomId, userId: myId });
-                handleVoluntaryLeave(myId);
-                onExit();
+                // Живой игрок — сначала подтверждение, чтобы не выйти случайно.
+                setConfirmExit(true);
               }}
               className="mt-1.5 flex w-full items-center justify-center gap-1.5 rounded-lg border border-input py-1.5 text-xs font-bold text-muted-foreground hover:bg-muted lg:mt-2 lg:rounded-xl lg:py-2"
             >
@@ -12511,12 +12508,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     hidden: tp.id !== (currentUser?.id || "you"),
                     action: () => {
                       setPlayerHover(null);
-                      const myIdx = players.findIndex(
-                        (pl) => pl.id === (currentUser?.id || "you"),
-                      );
-                      if (myIdx !== -1) {
-                        bankruptPlayer(myIdx, "добровольная сдача");
-                      }
+                      setConfirmSurrender(true);
                     },
                   },
 ].filter(item => !item.hidden).map(({ icon, label, action, disabled }) => (
@@ -12804,6 +12796,80 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
             >
               Вернуться в клуб
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Confirm exit modal */}
+      {confirmExit && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#29233e]/60 p-5">
+          <div className="w-full max-w-sm rounded-2xl border border-card-border bg-card p-6 text-center shadow-2xl">
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-[#f6dfd7] text-primary">
+              <LogOut size={22} />
+            </div>
+            <h2 className="mt-3 font-display text-xl font-bold">
+              Покинуть партию?
+            </h2>
+            <p className="mt-2 text-xs leading-5 text-muted-foreground">
+              Если вы выйдете живым — награду за партию вы не получите.
+            </p>
+            <div className="mt-5 flex gap-2">
+              <button
+                onClick={() => setConfirmExit(false)}
+                className="flex-1 rounded-xl border border-input py-2.5 text-xs font-bold text-muted-foreground hover:bg-muted"
+              >
+                Остаться
+              </button>
+              <button
+                onClick={() => {
+                  const myId = currentUser?.id || "you";
+                  setConfirmExit(false);
+                  if (initialRoomId) socket.emit('leave-game', { roomId: initialRoomId, userId: myId });
+                  handleVoluntaryLeave(myId);
+                  onExit();
+                }}
+                className="flex-1 rounded-xl bg-primary py-2.5 text-xs font-bold text-primary-foreground hover:brightness-95"
+              >
+                Да, покинуть
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Confirm surrender modal */}
+      {confirmSurrender && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#29233e]/60 p-5">
+          <div className="w-full max-w-sm rounded-2xl border border-card-border bg-card p-6 text-center shadow-2xl">
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-[#f6dfd7] text-xl">
+              🏳️
+            </div>
+            <h2 className="mt-3 font-display text-xl font-bold">Сдаться?</h2>
+            <p className="mt-2 text-xs leading-5 text-muted-foreground">
+              Вы обанкротитесь и выйдете из партии. Награда начислена не будет.
+            </p>
+            <div className="mt-5 flex gap-2">
+              <button
+                onClick={() => setConfirmSurrender(false)}
+                className="flex-1 rounded-xl border border-input py-2.5 text-xs font-bold text-muted-foreground hover:bg-muted"
+              >
+                Остаться
+              </button>
+              <button
+                onClick={() => {
+                  setConfirmSurrender(false);
+                  const myIdx = players.findIndex(
+                    (pl) => pl.id === (currentUser?.id || "you"),
+                  );
+                  if (myIdx !== -1) {
+                    bankruptPlayer(myIdx, "добровольная сдача");
+                  }
+                }}
+                className="flex-1 rounded-xl bg-primary py-2.5 text-xs font-bold text-primary-foreground hover:brightness-95"
+              >
+                Да, сдаться
+              </button>
+            </div>
           </div>
         </div>
       )}

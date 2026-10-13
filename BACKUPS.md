@@ -1,3 +1,19 @@
+## b8129f0 — feat(lobby-panel): реальные данные лобби в панели партии (хост, режим, бейджи)
+
+**server.js:**
+- `roomMeta[roomId]` в `create-room` теперь хранит `jackpot`, `teleport`, `hostName` (имя хоста из `roomData.host`).
+- При `enter-game-room` эти поля пробрасываются в `gameRooms[roomId]`.
+- В `room-settings` добавлены `jackpot`, `teleport`, `hostName`.
+
+**App.tsx:**
+- Тип `modeConfig` расширен: `jackpot: boolean`, `teleport: boolean`, `hostName: string`.
+- Дефолты в `useState`: `jackpot: false`, `teleport: false`, `hostName: "Игрок"`.
+- Handler `room-settings` читает новые поля.
+- Мобильный drawer и ПК Room info strip переписаны:
+  - вместо «живая партия / стол #XXX» → «Комната {hostName} / #{roomId}»;
+  - вместо «Пятничный клуб» → название режима («Классика» / «Быстрая» / «1×1»);
+  - бейджи «ДЖЕКПОТ» / «ТЕЛЕПОРТ» показываются только если реально включены, отрисованы компактными квадратиками; на мобиле прижаты влево.
+
 ## 383712f — ui(trade): подписи в договоре +2pt, светлее подсказка в inline-trade
 
 **App.tsx:**

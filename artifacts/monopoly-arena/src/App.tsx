@@ -12475,7 +12475,8 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
               className="fixed z-50 w-44 rounded-xl border border-card-border bg-card shadow-2xl overflow-hidden"
               style={{
                 left: Math.max(4, playerHover.x - 180),
-                top: playerHover.y,
+                top: isCompactScreen ? "50%" : playerHover.y,
+                transform: isCompactScreen ? "translateY(-50%)" : undefined,
               }}
               onClick={(e) => e.stopPropagation()}
             >
@@ -12483,10 +12484,10 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                 <div className="flex items-center gap-2">
                   <Avatar initials={tp.initials} color={tp.color} size="sm" avatar={tp.avatar} />
                   <div>
-                    <div className="text-[11px] font-bold truncate">
+                    <div className="text-[15px] font-bold truncate">
                       {tp.name}
                     </div>
-                    <div className="text-[9px] text-muted-foreground">
+                    <div className="text-[13px] text-muted-foreground">
                       {tp.money.toLocaleString("ru-RU")} К
                     </div>
                   </div>
@@ -12546,7 +12547,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                   <button
                     key={label}
                     onClick={disabled ? undefined : action}
-                    className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[11px] font-medium transition-colors text-left ${disabled ? "opacity-35 cursor-not-allowed" : "hover:bg-muted"}`}
+                    className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-[15px] font-medium transition-colors text-left ${disabled ? "opacity-35 cursor-not-allowed" : "hover:bg-muted"}`}
                   >
                     <span>{icon}</span>
                     {label}
@@ -12578,12 +12579,22 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
           const isMortgaged =
             mortgages[selectedCell] !== undefined &&
             mortgages[selectedCell] > globalTurnCounter;
-          const left = Math.min(selectedPos.x + 14, window.innerWidth - 212);
-          const top = Math.min(selectedPos.y - 20, window.innerHeight - 360);
+          const left = isCompactScreen
+            ? "50%"
+            : Math.min(selectedPos.x + 14, window.innerWidth - 212);
+          const top = isCompactScreen
+            ? "50%"
+            : Math.min(selectedPos.y - 20, window.innerHeight - 360);
           return (
             <div
-              className="fixed z-50 w-52 rounded-xl border border-card-border bg-card shadow-2xl overflow-hidden"
-              style={{ left, top }}
+              className="fixed z-50 w-[104px] lg:w-52 rounded-xl border border-card-border bg-card shadow-2xl overflow-hidden"
+              style={{
+                left,
+                top,
+                transform: isCompactScreen
+                  ? "translate(-50%, -50%) scale(1.15)"
+                  : undefined,
+              }}
               onClick={(e) => e.stopPropagation()}
             >
               <div

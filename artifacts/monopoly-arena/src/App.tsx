@@ -11408,7 +11408,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                               🤝 Предложение договора
                             </span>
                           </div>
-                          <div className="px-3 py-1.5 text-[10px] text-white/70 bg-[#0f0d1a] border-b border-white/5">
+                          <div className="px-3 py-1.5 text-[12px] text-white/70 bg-[#0f0d1a] border-b border-white/5">
                             <span className="font-bold text-white">
                               {initiator.name}
                             </span>{" "}
@@ -11417,7 +11417,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                           <div className="grid grid-cols-2 gap-px bg-white/10">
                             {/* Left — инициатор отдаёт тебе */}
                             <div className="bg-[#1a1729] p-2">
-                              <div className="text-[11px] font-bold mb-1">
+                              <div className="text-[13px] font-bold mb-1">
                                 <span className="text-[#32786d]">
                                   {initiator.name}
                                 </span>{" "}
@@ -11452,7 +11452,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                             </div>
                             {/* Right — ты отдаёшь */}
                             <div className="bg-[#1a1729] p-2">
-                              <div className="text-[11px] font-bold mb-1">
+                              <div className="text-[13px] font-bold mb-1">
                                 <span style={{ color: target.color }}>
                                   Ты
                                 </span>{" "}
@@ -11648,13 +11648,13 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                       <X size={12} />
                     </button>
                   </div>
-                  <div className="px-3 py-1 text-[11px] text-white/40 bg-[#0f0d1a] border-b border-white/5">
+                  <div className="px-3 py-1 text-[11px] text-white/70 bg-[#0f0d1a] border-b border-white/5">
                     Тыкай по своим полям — они пойдут в обмен. По полям соперника — то, что хочешь забрать.
                   </div>
                   <div className="grid grid-cols-2 gap-px bg-white/10">
                     {/* Left — я предлагаю */}
                     <div className="bg-[#1a1729] p-2">
-                      <div className="text-[11px] font-bold mb-1">
+                      <div className="text-[13px] font-bold mb-1">
                         <span className="text-[#e96852]">{player.name}</span>{" "}
                         <span className="text-white/40 font-normal">
                           предлагает
@@ -11702,7 +11702,7 @@ const monopolyGroups = dynamicGroups.map((group, gIdx) => ({
                     </div>
                     {/* Right — соперник отдаёт */}
                     <div className="bg-[#1a1729] p-2">
-                      <div className="text-[11px] font-bold mb-1">
+                      <div className="text-[13px] font-bold mb-1">
                         <span style={{ color: tradeTarget.color }}>
                           {tradeTarget.name}
                         </span>{" "}
